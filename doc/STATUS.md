@@ -1,8 +1,9 @@
 # librime-next 现状总结
 
 > 2026-10-25 实际部署验证后整理。验证方式：用真实源布局
-> （`C:/code/Weasel-Next/Rime-Next`）跑单方案 `luna_pinyin_simp` 的
-> `SchemaUpdate` 部署，与 `fixtures/build-20261023-current` 里的原版编译产物对比。
+> （`C:/code/Weasel-Next/Rime-Next`）跑全量 `deploy_workspace()`（19 方案 69 产物），
+> 单方案 `luna_pinyin_simp` 的 `SchemaUpdate` 部署，并与 `fixtures/build-20261023-current`
+> 的原版编译产物做语义 diff。
 
 ---
 
@@ -30,6 +31,30 @@
 
 `__include: luna_pinyin.schema:/` 的依赖解析也通了——自动编译了 luna_pinyin 的 table + reverse 三件套中的两件。
 
+### 语义 diff 结果（我们的产物 vs 原版 `-current` fixture）
+
+用 `schema_diff` 工具对 `luna_pinyin_simp.schema.yaml` 做递归 JSON 语义对比：
+
+- 顶层 14 个 key 全部一致（custom_phrase / engine / filters / grammar / key_binder / menu / punctuator / recognizer / reverse_lookup / schema / simplifier / speller / switches / translator）
+- **递归差异：0**（忽略 `__build_info`）
+- translator 字段（dictionary / preedit_format / prism）逐字一致
+- engine 组件数一致（filters 2 / processors 8 / segmentors 5 / translators 4）
+
+结论：LRN config 层编译行为与 C++ 原版**语义完全等价**。
+
+> 注：早期用 `build-20261023`（非 `-current`）fixture 对比时出现 punctuator 差异，
+> 已查明是**数据演进**（fixture symbols mtime = 2026-10-09 旧版，当前 symbols.yaml mtime = 2026-10-16 新版），
+> 新版 symbols.yaml 设计上把符号表也留在 punctuator.symbols 里供 recognizer 取用，非移植缺陷。
+
+### 全量部署测试（deploy_workspace）
+
+沙箱跑完整 `deploy_workspace()`，19 个方案全部成功，3分31秒产出 69 个文件、212MB：
+
+- 方案目录 19 个（含 luna_pinyin / stroke / tiger_sentence / wubi86 / yuhao×2 / yuling×6 / yustar×7）
+- 每个方案按系列文件夹布局：`build/<方案>/<方案>.{table,reverse,prism}.bin` + `<方案>.schema.yaml`
+- `build/default.yaml` 同步写入
+- 对比 fixture 基线（2026-10-23 的 15 方案 30 文件），当前数据目录已增至 19 方案，产物数量随之增加
+
 测试基线：`cargo test` → lib 238 + lever 8 + config 2 + engine e2e 6 + key_event 3 + 1，**258 过 / 0 败**。
 
 ---
@@ -40,7 +65,7 @@
 |---|---|---|
 | **语言** | C++（yaml-cpp / boost） | Rust（serde_json / 零依赖 YAML 解析） |
 | **YAML 输出格式** | yaml-cpp `EmitScalar` 规则（流式映射、特定缩进） | 自己的 `to_yaml_string`（格式不同但语义等价） |
-| **`__build_info`** | 编译产物里有 `__build_info/timestamps`（mtime 记录） | **没写**——产物比原版大 1,327 B（43,308 vs 41,981） |
+| **`__build_info`** | 编译产物里有 `__build_info/timestamps`（mtime 记录） | ✅ 已写（`plugins.rs` 的 `BuildInfoPlugin`，`with_core_plugins()` 已装配；2026-10-25 复核实测产物尾部有 `__build_info`。早前"没写"系**过时记录**） |
 | **目录布局** | 扁平 `build/<id>.bin` | **系列文件夹**：`build/<id>/<id>.bin`，id 点号 = 文件夹层级，零扁平回退 |
 | **toml_lite** | upstream 已删（改用 ConfigItem API） | 自己实现极简 TOML 解析器读 `schema.toml` |
 | **部署线程** | `std::async` 起工作线程 | **同步**执行（`StartWork` 跑完才返回） |
@@ -72,17 +97,21 @@
 
 | 差异 | 说明 |
 |---|---|
-| **`__build_info` 缺失** | 编译产物没写 `__build_info/timestamps`，`ConfigNeedsUpdate` 的 mtime 比对无法工作（增量更新失效，每次都全量重编译） |
+| **~~`__build_info` 缺失~~（已澄清）** | 2026-10-25 复核实测产物**有** `__build_info/timestamps`（rime_version=1.17.0 + 全部资源 mtime），`ConfigNeedsUpdate` 的 mtime 比对链路完整；此条系早期误记 |
 | **YAML 输出格式不同** | 文本层面差异大（702 行 vs 425 行），语义层面基本等价（schema 配置、engine 组件列表一致） |
 
 ---
 
 ## 四、下一步优先级
 
-1. **`__build_info` 写入** —— 让 `ConfigNeedsUpdate` 的 mtime 比对能工作，增量更新才有意义
-2. **gear 补 Recognizer / KeyBinder** —— 让非拼音方案（五笔/双拼）能跑
-3. **#20 组件移植** —— 让引擎能动态创建组件（替换 rime.dll 的最终闸门）
-4. **#19 dict corrector** —— 纠错功能
+> 2026-10-25 复核：`__build_info` 实测已在写（见上），第 1 项完成；真实方案组件用量普查：
+> processors 需 `ascii_composer/recognizer/key_binder/speller/punctuator/navigator/selector/express_editor`、
+> segmentors 需 `fallback/ascii/abc/punct/matcher`、translators 需
+> `punct/table/script/reverse_lookup`、filters 需 `uniquifier/simplifier/single_char`（30 个方案去重统计）。
+
+1. ~~**`__build_info` 写入**~~ ✅ 已在写（此前记录有误）
+2. **#20 组件机制 + gear 补齐** —— Registry/动态装配是底座，然后按上面的组件清单逐个移植（Recognizer / KeyBinder 优先）
+3. **#19 dict corrector** —— 纠错功能
 
 ---
 
