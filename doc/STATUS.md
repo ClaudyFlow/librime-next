@@ -15,7 +15,7 @@
 | `algo/` | ✅ | 公式、编码器、文法规则、拼写器（纯算法） |
 | `dict/` | ✅ 表面全 | prism / table / reverse / marisa / DictCompiler 三件套产出 |
 | `lever/` | ✅ 11/11 | installation_update / config_file_update / schema_update / workspace_update / cleanup_trash / prebuild_all_schemas / backup_config_files / detect_modifications / user_dict_upgrade / user_dict_sync / clean_old_log_files |
-| `engine/` | ◐ 部分 | Session / Context / Composition / Menu + Speller + Selector + Translator；**缺** Recognizer / KeyBinder |
+| `engine/` | ◐ 部分（2026-10-26 大幅推进） | 四类组件**全部按配置动态装配**：processor（ascii_composer / recognizer / key_binder / speller / punctuator / selector / navigator / editor）、segmentor（ascii / matcher / abc / punct / fallback）、translator（punct / script）、filter（uniquifier / single_char）；compose 已是 C++ 的 `CalculateSegmentation` + `TranslateSegments` 真模型。**仍缺** table_translator（形码）、simplifier（依赖转换表）、lua_processor / lua_translator / lua_filter、UserDb、commit_history |
 | `c_api` | ✅ ABI 闭环 | `rime_get_api()` 导出，`RimeApi` 字段与原版 `rime_api.h` 逐字对齐（`data_size=804` 精确吻合），11 项 ABI 检查全过 |
 
 ### 实测部署结果（luna_pinyin_simp）
