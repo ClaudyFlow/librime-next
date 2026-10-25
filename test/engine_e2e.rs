@@ -228,3 +228,21 @@ fn engine_per_syllable_confirmation() {
 
     assert_eq!(session.take_commit().as_deref(), Some("你好"));
 }
+
+#[test]
+fn key_binder_forwards_control_h_as_backspace() {
+    // 真实方案里有 `{accept: "Control+h", send: BackSpace, when: composing}`：
+    // key_binder 命中后把 BackSpace 塞回处理器链，等于"用 Ctrl+H 当退格"。
+    // 这条端到端断言同时证明了三件事：绑定读到、转发生效、datordeleted 真的发生了。
+    let mut session = Session::create(&build_dir(), "luna_pinyin_simp");
+    type_ascii(&mut session, "nihao");
+
+    let control_mask = librime_next::engine::key_event::K_CONTROL_MASK;
+    assert!(
+        session.process_key(b'h' as u32, control_mask),
+        "Control+h 应被 key_binder 消费"
+    );
+
+    let ctx = session.context().expect("应有上下文");
+    assert_eq!(ctx.input, "niha", "Control+h 应等价退格，删掉最后一个字符");
+}

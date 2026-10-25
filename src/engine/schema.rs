@@ -83,6 +83,22 @@ impl Schema {
         }
     }
 
+    /// 测试专用：给定配置树构造方案对象（给组件单测喂真实的 `switches` / `key_binder`）。
+    #[cfg(test)]
+    pub fn from_config_for_test(config: serde_json::Value) -> Schema {
+        let page_size = config
+            .pointer("/menu/page_size")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(5) as usize;
+        Schema {
+            schema_id: String::new(),
+            schema_name: String::new(),
+            config,
+            page_size,
+            select_keys: String::new(),
+        }
+    }
+
     pub fn get_string(&self, path: &str) -> Option<String> {
         self.config.pointer(path).and_then(|v| v.as_str()).map(str::to_string)
     }

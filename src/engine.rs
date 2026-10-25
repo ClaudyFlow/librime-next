@@ -28,6 +28,7 @@ pub mod runtime;
 pub mod schema;
 pub mod segmentation;
 pub mod session;
+pub mod switches;
 
 pub use candidate::{Candidate, Page};
 pub use composition::Composition;

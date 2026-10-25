@@ -39,10 +39,16 @@ fn real_schema_assembles_processors_from_config() {
         names.contains(&"recognizer"),
         "应有 recognizer，实际 {names:?}"
     );
-    // key_binder / punctuator 还没移植：被跳过，但链条不能断
+    // punctuator 还没移植：被跳过，但链条不能断
     assert!(
-        !names.contains(&"key_binder") && !names.contains(&"punctuator"),
+        !names.contains(&"punctuator"),
         "未移植组件不该混进名单：{names:?}"
+    );
+    // processor 名单与方案配置同序：ascii_composer → recognizer → key_binder → speller …
+    assert_eq!(
+        names.first().copied(),
+        Some("ascii_composer"),
+        "名单头应是 ascii_composer：{names:?}"
     );
 
     // 分段器名单同样来自配置（真实 luna_pinyin_simp 的 `engine/segmentors`

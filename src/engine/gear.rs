@@ -24,6 +24,7 @@ pub mod editor;
 pub mod fallback_segmentor;
 pub mod filter;
 pub mod matcher;
+pub mod key_binder;
 pub mod key_binding;
 pub mod navigator;
 pub mod processor;

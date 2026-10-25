@@ -33,6 +33,7 @@ use crate::engine::gear::abc_segmentor::AbcSegmentor;
 use crate::engine::gear::ascii_composer::AsciiComposer;
 use crate::engine::gear::editor::Editor;
 use crate::engine::gear::fallback_segmentor::FallbackSegmentor;
+use crate::engine::gear::key_binder::KeyBinder;
 use crate::engine::gear::filter::{Filter, SingleCharFilter, Uniquifier};
 use crate::engine::gear::matcher::Matcher;
 use crate::engine::gear::navigator::Navigator;
@@ -285,6 +286,7 @@ pub fn create_processor(ticket: &Ticket) -> Option<Box<dyn Processor + Send + Sy
         "ascii_composer" => Some(Box::new(AsciiComposer::new(ticket.config))),
         "express_editor" => Some(Box::new(Editor::express(ticket.config))),
         "fluid_editor" | "fluency_editor" => Some(Box::new(Editor::fluid(ticket.config))),
+        "key_binder" => Some(Box::new(KeyBinder::new(ticket.config))),
         "navigator" => Some(Box::new(Navigator::new(ticket.config))),
         "recognizer" => Some(Box::new(Recognizer::new(ticket.config, &ticket.name_space))),
         "selector" => Some(Box::new(Selector)),

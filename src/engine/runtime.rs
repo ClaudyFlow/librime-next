@@ -40,6 +40,8 @@ pub struct Engine {
     processors: Vec<ComponentEntry<Box<dyn Processor + Send + Sync>>>,
     segmentors: Vec<ComponentEntry<Box<dyn Segmentor + Send + Sync>>>,
     filters: Vec<ComponentEntry<Box<dyn Filter + Send + Sync>>>,
+    /// 组件请求引擎代转的按键队列（见 [`Engine::enqueue_synthetic_key`]）。
+    synthetic_queue: Vec<KeyEvent>,
     build_dir: std::path::PathBuf,
 }
 
@@ -54,6 +56,7 @@ impl Engine {
             processors: Vec::new(),
             segmentors: Vec::new(),
             filters: Vec::new(),
+            synthetic_queue: Vec::new(),
             build_dir: build_dir.to_path_buf(),
         };
         engine.initialize_components();
@@ -143,18 +146,47 @@ impl Engine {
     /// 时重算 —— 与 C++ 行为一致。
     pub fn process_key(&mut self, key: &KeyEvent) -> bool {
         let input_before = self.context.input.clone();
-        // 把 processors 取出到局部，避免「遍历 self.processors 同时把 &mut self 传进去」的借用冲突
+        let mut result = self.run_processor_chain(key);
+        // 组字状态可能改变了 option（如 AsciiComposer 切 ascii_mode），重算启用条件
+        self.refresh_component_conditions();
+        // 组件代转的按键（key_binder 的 send / send_sequence）：此时处理器列表已归位
+        while let Some(synthetic) = self.synthetic_queue.pop() {
+            if self.run_processor_chain(&synthetic) {
+                result = true;
+            }
+            self.refresh_component_conditions();
+        }
+        if self.context.input != input_before {
+            self.compose();
+        }
+        result
+    }
+
+    /// C++ `ConcreteEngine::ProcessSyntheticKey`：由组件（如 key_binder 的 `send:`）
+    /// 请求引擎代转的按键。
+    ///
+    /// **这里偏离了 C++ 的调用时机**：C++ 是在 `ProcessKeyEvent` 里同步递归调回去的。
+    /// Rust 侧做不到 —— 遍历 `self.processors` 时为了把 `&mut self` 交给组件，
+    /// 必须先把列表 `mem::take` 出来，嵌套调用看到的就会是空链表（实测踩过：
+    /// `Ctrl+H → BackSpace` 转发后什么都没发生）。
+    ///
+    /// 于是改成**排队**：组件登记按键，主循环结束后由 [`Engine::process_key`]
+    /// 逐条重放。行为等价 —— 原处理器链在 key_binder 返回 `Accepted` 时就停了，
+    /// 不存在"转发赶不上后续处理器"的差别。
+    pub fn enqueue_synthetic_key(&mut self, key: KeyEvent) {
+        self.synthetic_queue.push(key);
+    }
+
+    /// 跑一遍处理器链（[`Engine::process_key`] 与合成按键重放共用）。
+    fn run_processor_chain(&mut self, key: &KeyEvent) -> bool {
         let mut processors = std::mem::take(&mut self.processors);
         let mut result = false;
-        for entry in &mut processors {
+        for entry in processors.iter_mut() {
             if !entry.is_enabled() {
                 continue;
             }
             match entry.component.process_key_event(self, key) {
-                ProcessResult::Rejected => {
-                    result = false;
-                    break;
-                }
+                ProcessResult::Rejected => break,
                 ProcessResult::Accepted => {
                     result = true;
                     break;
@@ -163,12 +195,28 @@ impl Engine {
             }
         }
         self.processors = processors;
-        // 组字状态可能改变了 option（如 AsciiComposer 切 ascii_mode），重算启用条件
-        self.refresh_component_conditions();
-        if self.context.input != input_before {
-            self.compose();
-        }
         result
+    }
+
+    /// C++ `ConcreteEngine::ApplySchema`：换方案并重装配组件。
+    pub fn apply_schema(&mut self, schema_id: &str) -> bool {
+        match Schema::open(&self.build_dir, schema_id) {
+            Some(schema) => {
+                self.schema = schema;
+                self.initialize_components();
+                self.context.clear();
+                true
+            }
+            None => {
+                eprintln!("[engine] unknown schema: {schema_id}");
+                false
+            }
+        }
+    }
+
+    /// 设定开关（给组件之外的调用方复用）。
+    pub fn set_option(&mut self, name: &str, value: bool) {
+        self.context.set_option(name, value);
     }
 
     /// C++ `ConcreteEngine::Compose`：caret 感知的重算入口。
@@ -351,6 +399,7 @@ impl Engine {
             processors: Vec::new(),
             segmentors: Vec::new(),
             filters: Vec::new(),
+            synthetic_queue: Vec::new(),
             build_dir: std::path::PathBuf::new(),
         }
     }

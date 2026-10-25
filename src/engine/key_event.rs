@@ -221,6 +221,32 @@ impl KeyEvent {
     /// * 长度为 1 → 直接把该字符当键码；
     /// * 否则按 `+` 切分，**除最后一段外都必须是修饰键名**（认不出就失败），
     ///   最后一段是键名（查不到也失败）。
+    /// C++ `KeySequence::Parse`：一串按键，逐字符读；`{...}` 里的是多字符键名
+    /// （如 `{Control+space}`）。遇到不认识的键整串作废。
+    pub fn parse_sequence(repr: &str) -> Vec<KeyEvent> {
+        let mut out = Vec::new();
+        let bytes = repr.as_bytes();
+        let mut i = 0usize;
+        while i < repr.len() {
+            let (token, next) = if bytes[i] == b'{' && i + 1 < repr.len() {
+                match repr[i + 1..].find('}') {
+                    Some(j) => (&repr[i + 1..i + 1 + j], i + 1 + j + 1),
+                    None => return Vec::new(),
+                }
+            } else {
+                // 多字节字符整体作为一个键（保留 u8 遍历，避免 panic）
+                let ch_len = repr[i..].chars().next().map_or(1, |c| c.len_utf8());
+                (&repr[i..i + ch_len], i + ch_len)
+            };
+            match KeyEvent::parse(token) {
+                Some(k) => out.push(k),
+                None => return Vec::new(),
+            }
+            i = next;
+        }
+        out
+    }
+
     pub fn parse(repr: &str) -> Option<KeyEvent> {
         if repr.is_empty() {
             return None;
