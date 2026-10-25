@@ -14,8 +14,12 @@ use std::path::Path;
 use crate::dict::dictionary::Dictionary;
 use crate::engine::composition::Composition;
 use crate::engine::context::Context;
+use crate::engine::gear::abc_segmentor::AbcSegmentor;
+use crate::engine::gear::fallback_segmentor::FallbackSegmentor;
+use crate::engine::gear::matcher::Matcher;
 use crate::engine::gear::processor::{ProcessResult, Processor};
 use crate::engine::gear::registry::{ComponentEntry, install_engine_components};
+use crate::engine::gear::segmentor::Segmentor;
 use crate::engine::gear::selector::Selector;
 use crate::engine::gear::speller::Speller;
 use crate::engine::gear::translator::{ScriptTranslator, Translator};
@@ -33,6 +37,7 @@ pub struct Engine {
     pub context: Context,
     translators: Vec<ComponentEntry<Box<dyn Translator + Send + Sync>>>,
     processors: Vec<ComponentEntry<Box<dyn Processor + Send + Sync>>>,
+    segmentors: Vec<ComponentEntry<Box<dyn Segmentor + Send + Sync>>>,
     build_dir: std::path::PathBuf,
 }
 
@@ -45,6 +50,7 @@ impl Engine {
             context: Context::new(),
             translators: Vec::new(),
             processors: Vec::new(),
+            segmentors: Vec::new(),
             build_dir: build_dir.to_path_buf(),
         };
         engine.initialize_components();
@@ -54,7 +60,7 @@ impl Engine {
     /// C++ `ConcreteEngine::InitializeComponents`：读 `engine/processors` 与
     /// `engine/translators`，按名单逐个构造。
     fn initialize_components(&mut self) {
-        let (processors, translators) =
+        let (processors, segmentors, translators) =
             install_engine_components(&self.schema.config, &self.build_dir);
         if translators.is_empty() {
             // 方案没列 `engine/translators`（或列表里全是还没移植的 translator）：
@@ -85,6 +91,26 @@ impl Engine {
         } else {
             self.processors = processors;
         }
+        if segmentors.is_empty() {
+            // 回退：方案没列 `engine/segmentors`（测试环境 / 极简方案）。
+            // 顺序照抄 librime 的默认名单：abc → matcher → fallback。
+            self.segmentors.push(ComponentEntry::new(
+                Box::new(AbcSegmentor::new(&self.schema.config))
+                    as Box<dyn Segmentor + Send + Sync>,
+                "abc_segmentor",
+            ));
+            self.segmentors.push(ComponentEntry::new(
+                Box::new(Matcher::new(&self.schema.config, "recognizer"))
+                    as Box<dyn Segmentor + Send + Sync>,
+                "matcher",
+            ));
+            self.segmentors.push(ComponentEntry::new(
+                Box::new(FallbackSegmentor::new()) as Box<dyn Segmentor + Send + Sync>,
+                "fallback_segmentor",
+            ));
+        } else {
+            self.segmentors = segmentors;
+        }
         self.refresh_component_conditions();
     }
 
@@ -92,6 +118,12 @@ impl Engine {
     fn refresh_component_conditions(&mut self) {
         let ctx = &self.context;
         for entry in &mut self.processors {
+            entry.refresh(ctx);
+        }
+        for entry in &mut self.segmentors {
+            entry.refresh(ctx);
+        }
+        for entry in &mut self.translators {
             entry.refresh(ctx);
         }
     }
@@ -132,41 +164,116 @@ impl Engine {
         result
     }
 
-    /// 重算组合（对照 `ConcreteEngine::Compose` + `TranslateSegments`）。
+    /// C++ `ConcreteEngine::Compose`：caret 感知的重算入口。
     ///
-    /// 简化模型：单段覆盖整段 `input`；菜单由所有 `Translator::Query` 铺平、排序、去重。
+    /// 三处必须与 C++ 一致：
+    /// 1. 参与组合的是 **caret 之前**的活动输入；
+    /// 2. caret 落在已确认段首尾且后面还有字符时，改用**整串** reset（给光标前后一起重算的机会）；
+    /// 3. `reset` 是**差量**的 —— 已确认段（`status >= Selected`）不会被后续编辑推翻。
     pub fn compose(&mut self) {
         let input = self.context.input.clone();
-        self.context.composition.reset(&input);
-        self.context.composition.segmentation.segments.clear();
+        let caret = self.context.caret_pos.min(input.len());
+        {
+            let comp = &mut self.context.composition;
+            comp.reset(input.get(..caret).unwrap_or(&input));
+            if caret < input.len() && caret == comp.segmentation.confirmed_position() {
+                comp.reset(&input);
+            }
+        }
         if input.is_empty() {
-            self.context
-                .composition
-                .segmentation
+            let comp = &mut self.context.composition;
+            comp.segmentation.segments.clear();
+            comp.segmentation
                 .segments
                 .push(Segmentation::segment_zero(0));
             return;
         }
-        let mut seg = Segmentation::segment_zero(input.len());
-        let mut menu = Menu::new();
-        let mut translators = std::mem::take(&mut self.translators);
-        for entry in &translators {
-            if !entry.is_enabled() {
-                continue;
+        self.calculate_segmentation(caret);
+        self.translate_segments();
+    }
+
+    /// C++ `CalculateSegmentation`：让每个 segmentor 依次 `Proceed`，跑完一轮 `Forward`。
+    fn calculate_segmentation(&mut self, caret_pos: usize) {
+        // 同样的借用规避：把组件列表取到局部再遍历
+        let segmentors = std::mem::take(&mut self.segmentors);
+        {
+            let segs = &mut self.context.composition.segmentation;
+            while !segs.has_finished() {
+                let start_pos = segs.current_start();
+                for entry in &segmentors {
+                    if !entry.is_enabled() {
+                        continue;
+                    }
+                    if !entry.component.proceed(segs) {
+                        break;
+                    }
+                }
+                // 没有任何推进 → 收手，否则死循环
+                if start_pos == segs.current_end() {
+                    break;
+                }
+                // caret 之后只允许多一段
+                if start_pos >= caret_pos {
+                    break;
+                }
+                if !segs.has_finished() {
+                    segs.forward();
+                }
             }
-            for c in entry.component.query(&input, 0) {
-                menu.add(c);
+            if !segs.segments.is_empty()
+                && !segs
+                    .segments
+                    .last()
+                    .map_or(false, |s| s.has_tag("placeholder"))
+            {
+                segs.trim();
+            }
+            if !segs.segments.is_empty()
+                && segs
+                    .segments
+                    .last()
+                    .map_or(false, |s| s.status >= SegStatus::Selected)
+            {
+                segs.forward();
             }
         }
+        self.segmentors = segmentors;
+    }
+
+    /// C++ `TranslateSegments`：逐段取子串喂给每个 translator，候选偏移回绝对位置。
+    fn translate_segments(&mut self) {
+        let translators = std::mem::take(&mut self.translators);
+        let input = self.context.composition.segmentation.input.clone();
+        let segs = &mut self.context.composition.segmentation.segments;
+        for seg in segs.iter_mut() {
+            if seg.status >= SegStatus::Guess {
+                continue;
+            }
+            let len = seg.end.saturating_sub(seg.start);
+            let Some(text) = input.get(seg.start..seg.start + len) else {
+                continue;
+            };
+            if text.is_empty() {
+                continue;
+            }
+            let mut menu = Menu::new();
+            for entry in &translators {
+                if !entry.is_enabled() {
+                    continue;
+                }
+                for mut c in entry.component.query(text, seg.start) {
+                    // translator 返回的是**相对本段**的位置，这里还原成绝对偏移
+                    c.start += seg.start;
+                    c.end += seg.start;
+                    menu.add(c);
+                }
+            }
+            menu.prepare();
+            seg.menu = Some(menu);
+            seg.status = SegStatus::Guess;
+            seg.selected_index = 0;
+        }
         self.translators = translators;
-        menu.prepare();
-        seg.menu = Some(menu);
-        seg.status = SegStatus::Guess;
-        self.context
-            .composition
-            .segmentation
-            .segments
-            .push(seg);
     }
 
     /// 已装配的 processor 名单（诊断用：验证 `engine/processors` 真的被读进来了）。
@@ -177,6 +284,11 @@ impl Engine {
     /// 已装配的 translator 名单。
     pub fn translator_names(&self) -> Vec<&str> {
         self.translators.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    /// 已装配的 segmentor 名单。
+    pub fn segmentor_names(&self) -> Vec<&str> {
+        self.segmentors.iter().map(|e| e.name.as_str()).collect()
     }
 
     pub fn schema_id(&self) -> &str {
@@ -199,6 +311,7 @@ impl Engine {
             context: Context::new(),
             translators: Vec::new(),
             processors: Vec::new(),
+            segmentors: Vec::new(),
             build_dir: std::path::PathBuf::new(),
         }
     }

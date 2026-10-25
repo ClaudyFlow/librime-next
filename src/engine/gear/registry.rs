@@ -29,10 +29,15 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::engine::context::Context;
+use crate::engine::gear::abc_segmentor::AbcSegmentor;
 use crate::engine::gear::ascii_composer::AsciiComposer;
 use crate::engine::gear::editor::Editor;
+use crate::engine::gear::fallback_segmentor::FallbackSegmentor;
+use crate::engine::gear::matcher::Matcher;
 use crate::engine::gear::navigator::Navigator;
 use crate::engine::gear::processor::Processor;
+use crate::engine::gear::recognizer::Recognizer;
+use crate::engine::gear::segmentor::Segmentor;
 use crate::engine::gear::selector::Selector;
 use crate::engine::gear::speller::Speller;
 use crate::engine::gear::translator::{ScriptTranslator, Translator};
@@ -271,8 +276,19 @@ pub fn create_processor(ticket: &Ticket) -> Option<Box<dyn Processor + Send + Sy
         "express_editor" => Some(Box::new(Editor::express(ticket.config))),
         "fluid_editor" | "fluency_editor" => Some(Box::new(Editor::fluid(ticket.config))),
         "navigator" => Some(Box::new(Navigator::new(ticket.config))),
+        "recognizer" => Some(Box::new(Recognizer::new(ticket.config, &ticket.name_space))),
         "selector" => Some(Box::new(Selector)),
         "speller" => Some(Box::new(Speller::new(ticket.config))),
+        _ => None,
+    }
+}
+
+/// C++ `gears_module.cc` 的 segmentor 部分（当前已移植的那些）。
+pub fn create_segmentor(ticket: &Ticket) -> Option<Box<dyn Segmentor + Send + Sync>> {
+    match ticket.klass.as_str() {
+        "abc_segmentor" => Some(Box::new(AbcSegmentor::new(ticket.config))),
+        "matcher" => Some(Box::new(Matcher::new(ticket.config, &ticket.name_space))),
+        "fallback_segmentor" => Some(Box::new(FallbackSegmentor::new())),
         _ => None,
     }
 }
@@ -331,6 +347,7 @@ pub fn install_engine_components(
     build_dir: &Path,
 ) -> (
     Vec<ComponentEntry<Box<dyn Processor + Send + Sync>>>,
+    Vec<ComponentEntry<Box<dyn Segmentor + Send + Sync>>>,
     Vec<ComponentEntry<Box<dyn Translator + Send + Sync>>>,
 ) {
     let processors = create_components_from_list(
@@ -340,6 +357,13 @@ pub fn install_engine_components(
         "processor",
         create_processor,
     );
+    let segmentors = create_components_from_list(
+        config,
+        build_dir,
+        "engine/segmentors",
+        "segmentor",
+        create_segmentor,
+    );
     let translators = create_components_from_list(
         config,
         build_dir,
@@ -347,7 +371,7 @@ pub fn install_engine_components(
         "translator",
         create_translator,
     );
-    (processors, translators)
+    (processors, segmentors, translators)
 }
 
 #[cfg(test)]

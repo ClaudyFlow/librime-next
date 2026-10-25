@@ -34,10 +34,25 @@ fn real_schema_assembles_processors_from_config() {
     assert!(names.contains(&"navigator"), "应有 navigator，实际 {names:?}");
     assert!(names.contains(&"selector"), "应有 selector，实际 {names:?}");
 
-    // 还没移植的组件被跳过，但不能因此让链条断掉
+    // recognizer 已移植（2026-10-26）：它的作用是放行 `@` 这类不在 alphabet 里的键
     assert!(
-        !names.contains(&"recognizer"),
-        "recognizer 还没移植，不该出现在名单里"
+        names.contains(&"recognizer"),
+        "应有 recognizer，实际 {names:?}"
+    );
+    // key_binder / punctuator 还没移植：被跳过，但链条不能断
+    assert!(
+        !names.contains(&"key_binder") && !names.contains(&"punctuator"),
+        "未移植组件不该混进名单：{names:?}"
+    );
+
+    // 分段器名单同样来自配置（真实 luna_pinyin_simp 的 `engine/segmentors`
+    // 就是 matcher → abc_segmentor → fallback_segmentor，不是我们编的顺序）
+    let seg_names = engine.segmentor_names();
+    println!("segmentors = {seg_names:?}");
+    assert_eq!(
+        seg_names,
+        vec!["matcher", "abc_segmentor", "fallback_segmentor"],
+        "分段器装配必须来自配置：{seg_names:?}"
     );
     // 顺序必须与方案配置一致（luna_pinyin_simp: ascii_composer 在 speller 之前）
     let i_ascii = names.iter().position(|n| *n == "ascii_composer").unwrap();
@@ -54,5 +69,36 @@ fn translator_is_created_from_engine_translators_list() {
     assert!(
         names.iter().any(|n| n.starts_with("script_translator")),
         "luna_pinyin_simp 的 engine/translators 应产出 script_translator，实际 {names:?}"
+    );
+}
+
+#[test]
+fn multi_segment_input_produces_raw_then_abc() {
+    // 分段框架的意义：输入不再是"一大段"，而是按规则切成若干段分别翻译。
+    let mut engine = Engine::create(&build_dir(), "luna_pinyin_simp")
+        .expect("luna_pinyin_simp 引擎应能加载");
+    // 空格不在 `speller/alphabet` 里 → fallback_segmentor 切成 raw 段；
+    // 后面的字母由 abc_segmentor 切成 abc 段。
+    engine.context.input = " zho".to_string();
+    engine.context.caret_pos = 4;
+    engine.compose();
+
+    let shapes: Vec<(usize, usize, Vec<String>)> = engine
+        .context
+        .composition
+        .segmentation
+        .segments
+        .iter()
+        .map(|s| (s.start, s.end, s.tags.clone()))
+        .collect();
+    println!("segments = {shapes:?}");
+    assert!(
+        shapes.len() >= 2,
+        "「 zho」应切成 raw + abc 两段，实际 {shapes:?}"
+    );
+    assert!(shapes[0].2.contains(&"raw".to_string()), "首段应是 raw");
+    assert!(
+        shapes.iter().any(|s| s.2.contains(&"abc".to_string())),
+        "应有一段带 abc 标签：{shapes:?}"
     );
 }

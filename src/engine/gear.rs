@@ -18,12 +18,17 @@
 //! * `speller`     —— 主处理器：可打印键入栈 / 退格 / Esc / 空格回车提交 / 数字选词
 //! * `selector`    —— 上下 / 翻页导航高亮
 
+pub mod abc_segmentor;
 pub mod ascii_composer;
 pub mod editor;
+pub mod fallback_segmentor;
+pub mod matcher;
 pub mod key_binding;
 pub mod navigator;
 pub mod processor;
+pub mod recognizer;
 pub mod registry;
+pub mod segmentor;
 pub mod selector;
 pub mod speller;
 pub mod translator;
