@@ -77,6 +77,13 @@ pub const USERDB_DIR: &str = "userdb";
 pub const TRASH_DIR: &str = "trash";
 pub const SYNC_DIR: &str = "sync";
 
+/// `schema/` 下的**方案清单文件名**（点名制：`schemas:` 列出要部署的方案 id）。
+///
+/// 曾经是 `schema.toml` —— 2026-10-26 起**全仓库不认 TOML**（用户拍板：toml 不好用），
+/// 清单改用 YAML，文件名就是它。对应关系见 C++ `toml_lite.cc` 的 `LoadSchemaIdsFromToml`，
+/// 那条 TOML 分支在 lrn 里没有移植。
+pub const SCHEMA_MANIFEST: &str = "schema.yaml";
+
 /// Weasel-Next 的部署布局（`setup.cc` 里 `RimeTraits` 的四个目录 + `Deployer` 的几个字段）。
 ///
 /// **三个根路径（程序文件夹 / 共享数据目录 / 用户文件夹）由宿主经 API 注入**，

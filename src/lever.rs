@@ -15,7 +15,7 @@
 //! * **能**：建一个 `Deployer`、注册任务、按名字调度并统计结果（`deployer`）；
 //!   按 Weasel-Next 的分目录规则解析资源路径（`paths`）；读/改/写 `installation.yaml` 这类文件（`tree`）；
 //!   **跑 `deploy` 主链的 config 侧**：installation_update → workspace_update
-//!   （schema.toml 清单 → 逐方案 `config::compile` → dependencies 递归 → schema_list 写回
+//!   （`schema/schema.yaml` 点名清单 → 逐方案 `config::compile` → dependencies 递归 → schema_list 写回
 //!   `staging/default.yaml`）→ cleanup_trash（`deployment_tasks`）。
 //! * **不能**：`.bin`（prism/table）编译与 userdb 同步 —— 卡在 `dict` 层缺口
 //!   （`UserDb` / `SymDeleteCollector` / `NearSearchCorrector`），已留 trait 接缝。

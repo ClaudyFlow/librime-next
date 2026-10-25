@@ -16,7 +16,7 @@
 //! | `installation_update` | ✅ | 维护 `installation.yaml`（id/sync_dir/backup_config_files/发行版版本） |
 //! | `config_file_update` | ✅ | **编译**配置到 staging（`ConfigNeedsUpdate` mtime 比对 + trash 旧副本） |
 //! | `schema_update` | ✅ 含 .bin | schema_id 取源文件字段 → ConfigFileUpdate 编译 → `compile_dictionary`（DictionaryComponent 配置语义 + `dict::dict_compiler` 产 table/prism/reverse 三件套） |
-//! | `workspace_update` | ✅ 主循环 | schema.toml 清单 → 逐方案编译 → dependencies 递归 → `schema_list` 写回 `staging/default.yaml` |
+//! | `workspace_update` | ✅ 主循环 | `schema/schema.yaml` 清单（点名制）→ 逐方案编译 → dependencies 递归 → `schema_list` 写回 `staging/default.yaml` |
 //! | `cleanup_trash` | ✅ | 用户目录根的部署垃圾移进 `trash/` |
 //! | `prebuild_all_schemas` | ✅ | 递归枚举共享目录方案源文件全量预编译（与 C++ `classified_schema_sources` 的目录链校验逐条对齐，系列成员不漏） |
 //! | `backup_config_files` | ✅ | 用户目录根 yaml/txt 备份进 `<sync>/<user_id>/`（CRC32 比对 + customized copy 跳过） |
@@ -52,7 +52,7 @@ pub enum DeploymentTask {
     CleanOldLogFiles,
     /// `DetectModifications`：比较数据目录的 mtime 判断要不要维护。
     DetectModifications { data_dirs: Vec<PathBuf> },
-    /// `BackupConfigFiles`：备份 `*.yaml` / `*.toml`。
+    /// `BackupConfigFiles`：备份用户根下的 `*.yaml`（TOML 2026-10-26 起不认）。
     BackupConfigFiles,
     /// `UserDictSync`：用户词典同步。
     UserDictSync,
@@ -892,8 +892,9 @@ fn run_workspace_update(deployer: &mut Deployer) -> bool {
     // 2. SymlinkingPrebuiltDictionaries —— 未移植（预编译词典符号链接），跳过
     log_info("[Weasel-Next] SymlinkingPrebuiltDictionaries 未移植，跳过");
 
-    // 3. 方案清单：schema/schema.toml 优先，回退 default.yaml 的 schema_list
-    let mut schema_ids = load_schema_ids_from_toml(&deployer.user_data_dir);
+    // 3. 方案清单：`<user>/schema/schema.yaml`（点名制）优先，回退 default.yaml 的 schema_list
+    let manifest = load_schema_manifest(&deployer.user_data_dir);
+    let mut schema_ids = manifest.schemas.clone();
     let default_config = if schema_ids.is_empty() {
         load_file(&deployer.shared_data_dir.join("default.yaml")).ok()
     } else {
@@ -910,7 +911,7 @@ fn run_workspace_update(deployer: &mut Deployer) -> bool {
     }
     if !schema_ids.is_empty() {
         log_info(&format!(
-            "[Weasel-Next] 方案清单：{} 项（schema.toml 优先，回退 default.yaml）",
+            "[Weasel-Next] 方案清单：{} 项（schema.yaml 优先，回退 default.yaml）",
             schema_ids.len()
         ));
     }
@@ -966,7 +967,7 @@ fn run_workspace_update(deployer: &mut Deployer) -> bool {
         "finished updating schemas: {success} success, {failure} failure."
     ));
 
-    // 5. schema_list 写回 staging/default.yaml（清单唯一落点是 schema.toml，
+    // 5. schema_list 写回 staging/default.yaml（清单唯一落点是 schema/schema.yaml，
     //    但 librime 的菜单读 build/default.yaml 的 schema_list，所以两处都要有）
     if !schema_ids.is_empty()
         && let Some(mut value) = default_config.clone().or_else(|| {
@@ -987,7 +988,7 @@ fn run_workspace_update(deployer: &mut Deployer) -> bool {
             match config::to_yaml_string(&config::data::convert_from_yaml(&value, None)) {
                 Ok(yaml) => {
                     if fs::write(&output, yaml).is_ok() {
-                        log_info("[Weasel-Next] schema_list 已按 schema.toml 写回 staging/default.yaml");
+                        log_info("[Weasel-Next] schema_list 已按 schema.yaml 写回 staging/default.yaml");
                     }
                 }
                 Err(err) => log_warn(&format!("cannot serialize staging default.yaml: {err}")),
@@ -996,54 +997,63 @@ fn run_workspace_update(deployer: &mut Deployer) -> bool {
     failure == 0
 }
 
-/// 读 `<user_data_dir>/schema/schema.toml` 的 `schemas` 数组。
+/// 方案清单（**点名制**）：`<user_data_dir>/schema/schema.yaml`。
 ///
-/// 极简 TOML 解析（不引 crate）：只认 `schemas = [ ... ]` 块里的双引号字符串，
-/// 跳过 `#` 注释行。C++ 侧对应 `toml_lite.cc` 的 `LoadSchemaIdsFromToml`。
-pub fn load_schema_ids_from_toml(user_data_dir: &std::path::Path) -> Vec<String> {
-    let path = user_data_dir.join("schema").join("schema.toml");
-    let Ok(text) = fs::read_to_string(&path) else {
-        return Vec::new();
+/// ```yaml
+/// # 方案信息 —— 勾选清单 + 当前使用的方案
+/// active: double_pinyin_ziranma
+/// schemas:
+///   - luna_pinyin_simp
+///   - double_pinyin_ziranma
+/// ```
+///
+/// 2026-10-26：**TOML 已彻底移除**。之前这里读 `schema/schema.toml`
+/// （对应 C++ 补丁 `toml_lite.cc` 的 `LoadSchemaIdsFromToml`），用户拍板 toml 不好用、
+/// 全仓库不认，于是改成 YAML，语义与字段一字未变，只是换了格式。
+#[derive(Debug, Default, PartialEq)]
+pub struct SchemaManifest {
+    /// 当前在用方案（`active`），没有就是 `None`。
+    pub active: Option<String>,
+    /// 要部署的方案 id（**顺序 = 菜单顺序**）。
+    pub schemas: Vec<String>,
+}
+
+impl SchemaManifest {
+    pub fn is_empty(&self) -> bool {
+        self.schemas.is_empty()
+    }
+}
+
+/// 读 `<user_data_dir>/schema/schema.yaml`；文件不存在 / 解析失败都返回空清单
+/// （调用方据此回退 `default.yaml` 的 `schema_list`）。
+pub fn load_schema_manifest(user_data_dir: &std::path::Path) -> SchemaManifest {
+    let path = user_data_dir
+        .join(crate::lever::paths::SCHEMA_DIR)
+        .join(crate::lever::paths::SCHEMA_MANIFEST);
+    let Ok(value) = crate::load_file(&path) else {
+        return SchemaManifest::default();
     };
-    parse_toml_string_array(&text, "schemas")
+    let active = value
+        .get("active")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let schemas = value
+        .get("schemas")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| match item {
+                    // 容忍两种写法：裸 id，或 `schema: id`（与 default.yaml 的 schema_list 同构）
+                    serde_json::Value::String(id) => Some(id.clone()),
+                    other => other.get("schema").and_then(|s| s.as_str()).map(str::to_string),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    SchemaManifest { active, schemas }
 }
 
-/// 从 TOML 文本里抠 `key = [ "a", "b", ... ]` 的字符串数组（可跨行，容忍注释）。
-fn parse_toml_string_array(text: &str, key: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut in_block = false;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if !in_block {
-            // 匹配 `key = [`（允许 key 前有空白）
-            let prefix = format!("{key} = [");
-            if let Some(rest) = trimmed.strip_prefix(&prefix) {
-                in_block = true;
-                collect_quoted(rest, &mut out);
-            }
-        } else {
-            collect_quoted(trimmed, &mut out);
-            if trimmed.contains(']') {
-                break;
-            }
-        }
-    }
-    out
-}
-
-/// 收一行里的 `"..."` 字符串；`#` 后的内容忽略。
-fn collect_quoted(line: &str, out: &mut Vec<String>) {
-    let code = line.split('#').next().unwrap_or("");
-    let mut rest = code;
-    while let Some(start) = rest.find('"') {
-        let after = &rest[start + 1..];
-        let Some(end) = after.find('"') else { break };
-        out.push(after[..end].to_string());
-        rest = &after[end + 1..];
-    }
-}
-
-/// 从 `default.yaml`（JSON 视图）取 `schema_list` 的 id 序列。
 fn schema_list_from_json(value: &serde_json::Value) -> Vec<String> {
     value
         .get("schema_list")
@@ -1140,30 +1150,60 @@ mod tests {
     }
 
     #[test]
-    fn toml_array_parsing_handles_multiline_and_comments() {
-        let text = "\
-# 注释
-active = \"luna\"
-schemas = [
-    \"a\",   # 行内注释
-    \"b\",
-    # 整行注释
-    \"c.d\",
-]
-other = 1
-";
+    fn schema_manifest_reads_yaml_point_list() {
+        let root = std::env::temp_dir().join(format!("manifest-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("schema")).unwrap();
+        std::fs::write(
+            root.join("schema").join("schema.yaml"),
+            r#"# 方案信息 —— 勾选清单 + 当前使用的方案
+active: double_pinyin_ziranma
+schemas:
+  - luna_pinyin_simp
+  - double_pinyin_ziranma
+  - yuling.five
+"#,
+        )
+        .unwrap();
+
+        let manifest = load_schema_manifest(&root);
+        assert_eq!(manifest.active.as_deref(), Some("double_pinyin_ziranma"));
         assert_eq!(
-            parse_toml_string_array(text, "schemas"),
-            vec!["a".to_string(), "b".to_string(), "c.d".to_string()]
+            manifest.schemas,
+            vec![
+                "luna_pinyin_simp".to_string(),
+                "double_pinyin_ziranma".to_string(),
+                "yuling.five".to_string()
+            ]
         );
-        // 单行数组
-        assert_eq!(
-            parse_toml_string_array("schemas = [\"x\", \"y\"]", "schemas"),
-            vec!["x".to_string(), "y".to_string()]
-        );
-        // 没有该键 / 没有数组 → 空
-        assert!(parse_toml_string_array("active = \"x\"", "schemas").is_empty());
-        assert!(parse_toml_string_array("schemas = 3", "schemas").is_empty());
+
+        // 空目录 → 空清单（调用方据此回退 default.yaml）
+        let empty = std::env::temp_dir().join(format!("manifest-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&empty);
+        std::fs::create_dir_all(&empty).unwrap();
+        let manifest = load_schema_manifest(&empty);
+        assert!(manifest.is_empty());
+        assert_eq!(manifest.active, None);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    #[test]
+    fn toml_is_not_recognized_anymore() {
+        // 2026-10-26：TOML 彻底移除。磁盘上就算有 schema.toml 也不该被读进来。
+        let root = std::env::temp_dir().join(format!("manifest-toml-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("schema")).unwrap();
+        std::fs::write(
+            root.join("schema").join("schema.toml"),
+            r#"active = "luna"
+schemas = ["a", "b"]
+"#,
+        )
+        .unwrap();
+        assert!(load_schema_manifest(&root).is_empty(), "toml 不应被识别");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::os::raw::c_double;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use crate::engine::key_event::KeyEvent;
@@ -542,14 +542,21 @@ unsafe extern "C" fn rime_create_session() -> RimeSessionId {
     id
 }
 
+/// `<user>/schema/schema.yaml` 的相对路径（点名制方案清单，取代已废弃的 `schema.toml`）。
+fn crate_schema_manifest_rel() -> std::path::PathBuf {
+    std::path::PathBuf::from(crate::lever::paths::SCHEMA_DIR)
+        .join(crate::lever::paths::SCHEMA_MANIFEST)
+}
+
 fn default_schema_id(g: &Global) -> String {
-    // 取 schema.toml / default.yaml 里第一个方案；退化到 "luna_pinyin"
+    // 取 schema/schema.yaml（点名制）/ default.yaml 里第一个方案；退化到 "luna_pinyin"
     let candidates = [
         g.shared_data_dir.clone(),
         g.user_data_dir.clone(),
     ];
     for dir in candidates.iter().filter(|d| !d.is_empty()) {
-        for name in ["schema/schema.toml", "default.yaml", "schema/default.yaml"] {
+        let manifest = crate_schema_manifest_rel();
+        for name in [manifest.as_path(), Path::new("default.yaml"), Path::new("schema/default.yaml")] {
             let p = PathBuf::from(dir).join(name);
             if let Ok(text) = std::fs::read_to_string(&p) {
                 if let Some(id) = extract_first_schema_id(&text) {
@@ -561,7 +568,7 @@ fn default_schema_id(g: &Global) -> String {
     "luna_pinyin".to_string()
 }
 
-/// 从 schema.toml 的 `schemas = [...]` 或 default.yaml 的 `schema_list` 取第一个 id。
+/// 从 `schema/schema.yaml` 的 `schemas:` 或 `default.yaml` 的 `schema_list` 取第一个 id。
 fn extract_first_schema_id(text: &str) -> Option<String> {
     // 简单解析：找 `schema_list:` 后的 `- schema: xxx` 或 `schemas:` 后的 `- xxx`
     let mut lines = text.lines().peekable();
@@ -853,7 +860,8 @@ fn collect_schema_list(g: &Global) -> Vec<(String, String)> {
         if dir.is_empty() {
             continue;
         }
-        for name in ["schema/schema.toml", "default.yaml", "schema/default.yaml"] {
+        let manifest = crate_schema_manifest_rel();
+        for name in [manifest.as_path(), Path::new("default.yaml"), Path::new("schema/default.yaml")] {
             let p = PathBuf::from(&dir).join(name);
             if let Ok(text) = std::fs::read_to_string(&p) {
                 parse_schema_list(&text, &mut out);

@@ -4,15 +4,15 @@
 //! 时全部跳过，不失败。staging 输出指向临时目录，不碰真实 `build/`。
 //!
 //! 验证点（写侧契约）：
-//! * `schema/schema.toml` 的每个方案都产出 `staging/<id>/<id>.schema.yaml`（系列布局）；
-//! * `staging/default.yaml` 的 `schema_list` 与 `schema.toml` 一致（写回逻辑）；
+//! * `schema/schema.yaml`（点名制清单）的每个方案都产出 `staging/<id>/<id>.schema.yaml`（系列布局）；
+//! * `staging/default.yaml` 的 `schema_list` 与 `schema/schema.yaml` 一致（写回逻辑）；
 //! * dependencies 递归编译（被依赖方案的产物也在）；
 //! * **`.bin` 三件套**（2026-10-25 接上 dict 层后新增）：编译产物里
 //!   `translator/dictionary` 非空的方案，必须产出 `staging/<系列…>/<id>.{table,prism,reverse}.bin`。
 
 use std::path::{Path, PathBuf};
 
-use librime_next::lever::deployment_tasks::{DeploymentTask, load_schema_ids_from_toml};
+use librime_next::lever::deployment_tasks::{load_schema_manifest, DeploymentTask};
 use librime_next::lever::deployer::Deployer;
 use librime_next::load_file;
 
@@ -59,8 +59,12 @@ fn workspace_update_writes_staging_per_schema() {
         eprintln!("skip: no shared data dir");
         return;
     };
-    let schema_ids = load_schema_ids_from_toml(&user);
-    assert!(!schema_ids.is_empty(), "schema.toml 应该有清单");
+    let manifest = load_schema_manifest(&user);
+    assert!(
+        !manifest.is_empty(),
+        "用户目录的 schema/schema.yaml 应该有清单（点名制；TOML 版已于 2026-10-26 废弃）"
+    );
+    let schema_ids = manifest.schemas;
 
     // staging 指到临时目录：不碰真实 build/，也能反复跑。
     // ⚠️ 目录名必须是 `build` 才会被判定为 staging 根（真实场景就是 <user>/build），
