@@ -56,7 +56,12 @@ use super::user_dict_manager::UserDbFactory;
 /// （`shared_data_dir="."`、`user_data_dir="."`、`prebuilt/staging="build"`、
 /// `sync_dir="sync"`、`user_id="unknown"`、`backup_config_files=true`）。
 pub struct Deployer {
+    /// 程序文件夹（`PROGRAM_DIR`，安装目录）：宿主经 API 注入，是共享数据目录的父目录。
+    /// 只含共享数据目录（`shared_data_dir`），禁止任何设置文件、禁止任何 `build`。
+    pub program_dir: PathBuf,
+    /// 共享数据目录（`SHARE_DIR`，即 Weasel 设的 `Rime-Next` 数据目录）。宿主经 API 注入。
     pub shared_data_dir: PathBuf,
+    /// 用户文件夹（`USER_DIR`，如 `%APPDATA%\Rime-Next`）。宿主经 API 注入。
     pub user_data_dir: PathBuf,
     pub prebuilt_data_dir: PathBuf,
     pub staging_dir: PathBuf,
@@ -92,9 +97,12 @@ impl Deployer {
     /// `Deployer::Deployer()`：全部默认值照抄。
     pub fn new() -> Self {
         Self {
+            program_dir: PathBuf::new(),
             shared_data_dir: PathBuf::from("."),
             user_data_dir: PathBuf::from("."),
-            prebuilt_data_dir: PathBuf::from("build"),
+            // 出厂预编译取消（程序文件夹禁止 build），默认即空。
+            prebuilt_data_dir: PathBuf::new(),
+            // 相对 "build" 仅测试占位；真实部署由 `layout()` 钉到 `用户文件夹/build`。
             staging_dir: PathBuf::from("build"),
             sync_dir: PathBuf::from("sync"),
             user_id: "unknown".to_string(),
@@ -113,9 +121,14 @@ impl Deployer {
         }
     }
 
-    /// **Rust 侧新增**：把四个目录一次设好（`setup.cc` 的 `SetupDeployer` 干的事）。
+    /// **Rust 侧新增**：把三个根目录 + 派生的 staging/sync 一次设好
+    /// （`setup.cc` 的 `SetupDeployer` 干的事）。
     ///
-    /// `prebuilt_data_dir` 缺省是 `<shared>/build`、`staging_dir` 缺省是 `<user>/build`
+    /// `program_dir`（`PROGRAM_DIR`）由 `shared_data_dir` 的父目录推出 —— 宿主经 API 注入的是
+    /// `shared_data_dir`（即 `Rime-Next` 数据目录），其所在安装目录就是程序文件夹；也可用
+    /// [`Deployer::set_program_dir`] 显式覆盖。
+    /// `prebuilt_data_dir` 缺省是**空**（2026-10-25 硬规则：程序文件夹禁止任何 build，
+    /// 出厂预编译取消）、`staging_dir` 缺省是 `<user>/build`
     /// （`setup.cc:73-80`）；`sync_dir` 在 `installation_update` 里会被
     /// `installation.yaml` 的 `sync_dir` 覆盖，缺省 `<user>/sync`。
     pub fn with_data_dirs(
@@ -125,12 +138,41 @@ impl Deployer {
         let shared: PathBuf = shared_data_dir.into();
         let user: PathBuf = user_data_dir.into();
         let mut deployer = Self::new();
-        deployer.prebuilt_data_dir = shared.join("build");
+        // 2026-10-25：prebuilt 不再指向 `<shared>/build`，避免程序文件夹出现 build。
+        deployer.prebuilt_data_dir = PathBuf::new();
         deployer.staging_dir = user.join("build");
         deployer.sync_dir = user.join("sync");
-        deployer.shared_data_dir = shared;
+        deployer.shared_data_dir = shared.clone();
         deployer.user_data_dir = user;
+        // 程序文件夹 = 共享数据目录的父目录（安装目录）；无父目录时退回共享数据目录自身。
+        deployer.program_dir = shared
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| shared.clone());
         deployer
+    }
+
+    // ---- 三个根的 get/set（宿主经 API 注入实际路径）----
+
+    /// set `PROGRAM_DIR`：程序文件夹（安装目录）。宿主可在注入 `shared_data_dir` 后覆盖，
+    /// 例如宿主知道自己装在哪、不依赖 `shared_data_dir.parent()` 的推断。
+    pub fn set_program_dir(&mut self, dir: impl Into<PathBuf>) {
+        self.program_dir = dir.into();
+    }
+
+    /// set `SHARE_DIR`：共享数据目录（即 `Rime-Next` 数据目录）。
+    pub fn set_shared_data_dir(&mut self, dir: impl Into<PathBuf>) {
+        self.shared_data_dir = dir.into();
+    }
+
+    /// set `USER_DIR`：用户文件夹。
+    pub fn set_user_data_dir(&mut self, dir: impl Into<PathBuf>) {
+        self.user_data_dir = dir.into();
+    }
+
+    /// get `PROGRAM_DIR`。
+    pub fn program_dir(&self) -> &Path {
+        &self.program_dir
     }
 
     /// **Rust 侧新增**（测试用）：目录全在 `root` 下的沙箱布局。
@@ -142,8 +184,21 @@ impl Deployer {
     }
 
     /// 布局视图（路径解析规则都在 [`super::paths::Layout`]）。
+    ///
+    /// **字段即单一事实源**：`staging_dir` / `prebuilt_data_dir` 直接取自本结构体的
+    /// 字段，`layout()` 不二次改写。2026-10-25 硬规则（build 只存在于用户文件夹、
+    /// 出厂预编译取消）在**注入侧**执行，共有三个入口保证：
+    /// * [`Self::with_data_dirs`]：`staging = <user>/build`、`prebuilt = 空`；
+    /// * `c_api::rime_deployer_initialize`：同样强制，无视 `RimeTraits` 传入值；
+    /// * `c_api` 的 `set_shared_data_dir` / `set_user_data_dir` 同步重算 staging。
+    /// 这样 `layout()` 对字段忠实（测试可直接覆盖 `staging_dir` 指向沙箱），
+    /// 而真实宿主链路永远拿到用户文件夹下的 build。
+    ///
+    /// `program_dir` / `shared_data_dir` / `user_data_dir` 都是**宿主（Weasel）通过
+    /// API 经 get/set 注入**的根路径（lrn 持有为状态、不写死值）。
     pub fn layout(&self) -> super::paths::Layout {
         super::paths::Layout::new(
+            &self.program_dir,
             &self.shared_data_dir,
             &self.user_data_dir,
             &self.staging_dir,

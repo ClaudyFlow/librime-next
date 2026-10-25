@@ -1,0 +1,16 @@
+[package]
+name = "rime-scan"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# 独立、零依赖（仅标准库）。它演示 librime-next 的"文件识别 / 系列文件夹校验"
+# 与"词典击键统计"算法，可脱离被 engine 884 行阻塞的 librime-next 主库单独运行。
+# 将来算法应原样镜像进 `librime-next/src/lever/scan.rs`（那边用 serde_norway 解析 frontmatter）。
+[[bin]]
+name = "rime-scan"
+path = "src/main.rs"
+
+# 本工具是独立可运行 crate，刻意脱离 `Weasel-Next` 超级 workspace（否则会被当作成员一并能编，
+# 而主库 engine 当前被 884 行阻塞）。空 [workspace] 表即"退出上层 workspace"。
+[workspace]

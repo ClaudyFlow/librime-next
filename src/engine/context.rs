@@ -1,91 +1,113 @@
-//! `src/rime/context.{h,cc}`：会话级状态 —— input / caret / composition / commit / options。
+//! `src/rime/context.{h,cc}`：会话级状态（C++ 全量移植）。
+//!
+//! input / caret / composition / options / properties + 段选择与编辑操作。
+//! C++ 通过 notifier 把 select/update 事件回传引擎；Rust 版由 `Engine` 在
+//! 调用点（`process_key` / `select_candidate`）显式做对应处理（`on_select` 等）。
 
 use std::collections::HashMap;
 
-use crate::engine::candidate::Candidate;
-use crate::engine::composition::Composition;
-use crate::engine::segmentation::{SegStatus, Segmentation};
+use crate::engine::composition::{Composition, Preedit};
+use crate::engine::segmentation::SegStatus;
 
-/// `select()` 的返回：整段已提交，还是只确认了一部分、继续组字。
+/// `select()` 的返回：选择导致了整段提交，还是继续组字（给 `Session::choose` 用）。
 #[derive(Clone, Debug)]
 pub enum SelectResult {
-    /// 候选覆盖了整段输入 → 提交这段文本。
     Committed(String),
-    /// 候选只覆盖前缀 → 前缀已确认为 `committed_prefix`，剩余输入继续组字。
     Continued,
 }
 
+/// `BeginEditing` 打的标签：编辑发生后不再重开上一个选择。
+const SELECTED_BEFORE_EDITING: &str = "selected_before_editing";
+
+/// 软光标符号（U+2038 ‸），`soft_cursor` 选项开启时插进 preedit。
+const CARET_SYMBOL: &str = "\u{2038}";
+
 /// 会话上下文（对照 C++ `Context`）。
-///
-/// 简化模型：组合串是**单段**覆盖整个 `input`；翻译器把候选铺进这段的菜单，
-/// 每个候选带自己的 `end`（覆盖到第几个字节）。选择候选时按 `end` 决定是「整段提交」
-/// 还是「只确认前缀、剩余输入继续组字」（真实拼音的逐音节确认行为）。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Context {
-    /// 尚未确认的输入串（已确认的会从这里截掉）。
+    /// 完整输入串（composition 持有的可能只是截到光标的前缀）。
     pub input: String,
-    /// 本轮组字中已经确认的前缀文本。
-    pub committed_prefix: String,
     pub caret_pos: usize,
     pub composition: Composition,
-    /// 待提交文本（整段输入被消费完时出现）。
+    /// 已确认的前缀文本（逐音节确认时累积，如「你」；整段提交时拼接）。
+    pub committed_prefix: String,
+    /// 待提交文本（`commit()` 产生，`Session` 取走）。
     pub commit_text: Option<String>,
-    /// 当前高亮候选下标（箭头导航用，不直接提交）。
-    pub highlight: usize,
+    /// 每页候选数（来自 schema `menu/page_size`，供 c_api 读）。
     pub page_size: usize,
     pub options: HashMap<String, bool>,
     pub properties: HashMap<String, String>,
 }
 
-impl Default for Context {
-    fn default() -> Self {
-        Self {
-            input: String::new(),
-            committed_prefix: String::new(),
-            caret_pos: 0,
-            composition: Composition::new(),
-            commit_text: None,
-            highlight: 0,
-            page_size: 5,
-            options: HashMap::new(),
-            properties: HashMap::new(),
-        }
-    }
-}
-
 impl Context {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            page_size: 5,
+            ..Default::default()
+        }
     }
 
-    /// 是否正在组字（有未确认输入，或已有提交文本待取）。
     pub fn is_composing(&self) -> bool {
-        !self.input.is_empty() || !self.committed_prefix.is_empty() || self.commit_text.is_some()
+        !self.input.is_empty() || !self.composition.empty()
     }
 
     pub fn has_menu(&self) -> bool {
         self.composition
-            .segmentation
-            .segments
-            .first()
+            .back()
             .and_then(|s| s.menu.as_ref())
-            .map(|m| !m.is_empty())
-            .unwrap_or(false)
+            .map_or(false, |m| !m.is_empty())
     }
 
-    pub fn push_input(&mut self, ch: char) {
-        self.input.push(ch);
-        self.caret_pos = self.input.len();
+    pub fn get_selected_candidate(&self) -> Option<&crate::engine::candidate::Candidate> {
+        self.composition.back().and_then(|s| s.get_selected_candidate())
     }
 
-    pub fn pop_input(&mut self, len: usize) {
-        if len >= self.input.len() {
-            self.input.clear();
+    /// 当前高亮下标（末段 `selected_index`）。
+    pub fn highlight_index(&self) -> usize {
+        self.composition.back().map_or(0, |s| s.selected_index)
+    }
+
+    // ---- 输入编辑 ----
+
+    pub fn push_input_ch(&mut self, ch: char) -> bool {
+        if self.caret_pos >= self.input.len() {
+            self.input.push(ch);
+            self.caret_pos = self.input.len();
         } else {
-            let new_len = self.input.len() - len;
-            self.input.truncate(new_len);
+            let mut buf = [0u8; 4];
+            let s = ch.encode_utf8(&mut buf);
+            self.input.insert_str(self.caret_pos, s);
+            self.caret_pos += s.len();
         }
-        self.caret_pos = self.input.len();
+        true
+    }
+
+    pub fn push_input_str(&mut self, s: &str) -> bool {
+        if self.caret_pos >= self.input.len() {
+            self.input.push_str(s);
+            self.caret_pos = self.input.len();
+        } else {
+            self.input.insert_str(self.caret_pos, s);
+            self.caret_pos += s.len();
+        }
+        true
+    }
+
+    pub fn pop_input(&mut self, len: usize) -> bool {
+        if self.caret_pos < len {
+            return false;
+        }
+        self.caret_pos -= len;
+        self.input.truncate(self.caret_pos);
+        true
+    }
+
+    pub fn delete_input(&mut self, len: usize) -> bool {
+        if self.caret_pos + len > self.input.len() {
+            return false;
+        }
+        self.input.drain(self.caret_pos..self.caret_pos + len);
+        true
     }
 
     pub fn set_input(&mut self, value: &str) {
@@ -94,47 +116,43 @@ impl Context {
         self.caret_pos = self.input.len();
     }
 
+    pub fn set_caret_pos(&mut self, caret_pos: usize) {
+        self.caret_pos = caret_pos.min(self.input.len());
+    }
+
     pub fn clear(&mut self) {
         self.input.clear();
-        self.committed_prefix.clear();
         self.caret_pos = 0;
-        self.composition.reset("");
-        self.commit_text = None;
+        self.committed_prefix.clear();
+        self.composition.segmentation.segments.clear();
+        self.composition.segmentation.input.clear();
     }
 
-    /// 取待提交文本并清空（c_api `get_commit` 用）。
-    pub fn take_commit(&mut self) -> Option<String> {
-        self.commit_text.take().map(|t| {
-            self.input.clear();
-            self.committed_prefix.clear();
-            self.composition.reset("");
-            t
-        })
-    }
+    // ---- 段选择 ----
 
-    /// 整段组合的提交文本（未选择候选时按片段拼接原始输入）。
-    pub fn get_commit_text(&self) -> String {
-        let mut s = self.committed_prefix.clone();
-        s.push_str(&self.composition.get_commit_text());
-        s
-    }
-
-    /// 选择当前段菜单里的第 `index` 个候选。
+    /// `Select(index)`：选中末段第 index 个候选（置 `selected_index` + `Selected`）。
+    ///
+    /// 返回选择结果：候选覆盖整段输入 ⇒ [`SelectResult::Committed`]（整段提交）；
+    /// 只覆盖前缀 ⇒ [`SelectResult::Continued`]（截掉已确认前缀，剩余输入重新组字）。
     pub fn select(&mut self, index: usize) -> Option<SelectResult> {
         let input_len = self.input.len();
-        let cand: Candidate = {
-            let seg = self.composition.segmentation.segments.first()?;
+        let cand: crate::engine::candidate::Candidate = {
+            let seg = self.composition.back_mut()?;
             let menu = seg.menu.as_ref()?;
-            menu.candidate_at(index)?.clone()
+            let c = menu.candidate_at(index)?.clone();
+            seg.selected_index = index;
+            seg.status = SegStatus::Selected;
+            c
         };
         if cand.end >= input_len {
-            let text = format!("{}{}", self.committed_prefix, cand.text);
-            self.committed_prefix.clear();
-            self.input.clear();
-            self.composition.reset("");
+            // 整段覆盖：拼接已确认前缀，提交
+            let mut text = std::mem::take(&mut self.committed_prefix);
+            text.push_str(&cand.text);
+            self.clear();
             self.commit_text = Some(text.clone());
             Some(SelectResult::Committed(text))
         } else {
+            // 部分覆盖：前缀入账，截掉已确认的输入，续组字
             self.committed_prefix.push_str(&cand.text);
             self.input.drain(..cand.end);
             self.caret_pos = self.input.len();
@@ -150,41 +168,191 @@ impl Context {
         if !self.has_menu() {
             return false;
         }
-        let idx = self.highlight.min(self.menu_candidate_count().saturating_sub(1));
-        match self.select(idx) {
-            Some(SelectResult::Committed(_)) => true,
-            Some(SelectResult::Continued) => false,
-            None => false,
-        }
+        let idx = self
+            .highlight_index()
+            .min(self.menu_candidate_count().saturating_sub(1));
+        matches!(self.select(idx), Some(SelectResult::Committed(_)))
     }
 
     /// 当前段菜单里的候选数。
     pub fn menu_candidate_count(&self) -> usize {
         self.composition
-            .segmentation
-            .segments
-            .first()
+            .back()
             .and_then(|s| s.menu.as_ref())
-            .map(|m| m.candidate_count())
-            .unwrap_or(0)
+            .map_or(0, |m| m.candidate_count())
     }
 
-    /// 移动高亮候选（箭头/翻页导航，不直接提交）。
-    pub fn move_highlight(&mut self, delta: isize) {
+    /// 移动高亮候选（箭头/翻页导航，不直接提交）。返回高亮是否有变化。
+    pub fn move_highlight(&mut self, delta: isize) -> bool {
         let n = self.menu_candidate_count();
         if n == 0 {
-            self.highlight = 0;
-            return;
+            return false;
         }
-        let mut h = self.highlight as isize + delta;
-        if h < 0 {
-            h = 0;
-        }
-        if h >= n as isize {
-            h = n as isize - 1;
-        }
-        self.highlight = h as usize;
+        let cur = self.highlight_index() as isize;
+        let h = (cur + delta).clamp(0, n as isize - 1) as usize;
+        self.highlight(h)
     }
+
+    /// `Highlight(index)`：移动高亮（末段 `selected_index`），返回是否有变化。
+    pub fn highlight(&mut self, index: usize) -> bool {
+        let Some(seg) = self.composition.back_mut() else {
+            return false;
+        };
+        if seg.menu.is_none() {
+            return false;
+        }
+        let count = seg.menu.as_ref().map_or(0, |m| m.candidate_count());
+        let new_index = if count > 0 { index.min(count - 1) } else { 0 };
+        if seg.selected_index == new_index {
+            return false;
+        }
+        seg.selected_index = new_index;
+        true
+    }
+
+    /// `ConfirmCurrentSelection`：确认当前高亮（不落候选也允许 —— 空段交给
+    /// fluid_editor 提交整句的路径由调用方处理）。
+    pub fn confirm_current_selection(&mut self) -> bool {
+        let Some(seg) = self.composition.back_mut() else {
+            return false;
+        };
+        if seg.get_selected_candidate().is_none() && seg.end == seg.start {
+            return false;
+        }
+        seg.status = SegStatus::Selected;
+        true
+    }
+
+    pub fn delete_candidate(&mut self, index: usize) -> bool {
+        let Some(seg) = self.composition.back_mut() else {
+            return false;
+        };
+        seg.selected_index = index;
+        true
+    }
+
+    pub fn delete_current_selection(&mut self) -> bool {
+        let idx = self.highlight_index();
+        self.delete_candidate(idx)
+    }
+
+    /// `BeginEditing`：从后往前找第一个 `<= Selected` 的段；若恰为 `Selected`
+    /// 打上 `selected_before_editing`（此后 `ReopenPreviousSelection` 拒绝重开）。
+    pub fn begin_editing(&mut self) {
+        for seg in self.composition.segmentation.segments.iter_mut().rev() {
+            if seg.status > SegStatus::Selected {
+                return;
+            }
+            if seg.status == SegStatus::Selected {
+                if !seg.has_tag(SELECTED_BEFORE_EDITING) {
+                    seg.tags.push(SELECTED_BEFORE_EDITING.to_string());
+                }
+                return;
+            }
+        }
+    }
+
+    pub fn reopen_previous_segment(&mut self) -> bool {
+        if self.composition.segmentation.trim() {
+            if let Some(back) = self.composition.back_mut() {
+                if back.status >= SegStatus::Selected {
+                    back.reopen(self.caret_pos);
+                }
+            }
+            return true;
+        }
+        false
+    }
+
+    pub fn clear_previous_segment(&mut self) -> bool {
+        let Some(back) = self.composition.back() else {
+            return false;
+        };
+        let where_ = back.start;
+        if where_ >= self.input.len() {
+            return false;
+        }
+        let prefix = self.input[..where_].to_string();
+        self.set_input(&prefix);
+        true
+    }
+
+    pub fn reopen_previous_selection(&mut self) -> bool {
+        let segs = &mut self.composition.segmentation.segments;
+        for i in (0..segs.len()).rev() {
+            if segs[i].status > SegStatus::Selected {
+                return false;
+            }
+            if segs[i].status == SegStatus::Selected {
+                if segs[i].has_tag(SELECTED_BEFORE_EDITING) {
+                    return false;
+                }
+                segs.truncate(i + 1);
+                let caret = self.caret_pos;
+                segs[i].reopen(caret);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `ClearNonConfirmedComposition`：弹出末尾所有未选定段，再 `Forward()`。
+    pub fn clear_non_confirmed_composition(&mut self) -> bool {
+        let mut reverted = false;
+        while self
+            .composition
+            .back()
+            .map_or(false, |s| s.status < SegStatus::Selected)
+        {
+            self.composition.segmentation.pop_back();
+            reverted = true;
+        }
+        if reverted {
+            self.composition.segmentation.forward();
+        }
+        reverted
+    }
+
+    pub fn refresh_non_confirmed_composition(&mut self) -> bool {
+        self.clear_non_confirmed_composition()
+    }
+
+    // ---- 提交 ----
+
+    /// `Commit`：取组合文本待提交并清场。
+    pub fn commit(&mut self) -> bool {
+        if !self.is_composing() {
+            return false;
+        }
+        let text = self.get_commit_text();
+        self.clear();
+        self.commit_text = Some(text);
+        true
+    }
+
+    pub fn get_commit_text(&self) -> String {
+        if self.get_option("dumb") {
+            return String::new();
+        }
+        let mut s = self.committed_prefix.clone();
+        s.push_str(&self.composition.get_commit_text());
+        s
+    }
+
+    pub fn get_script_text(&self) -> String {
+        self.composition.get_script_text(false)
+    }
+
+    pub fn get_preedit(&self) -> Preedit {
+        let soft = if self.get_option("soft_cursor") {
+            CARET_SYMBOL
+        } else {
+            ""
+        };
+        self.composition.get_preedit(&self.input, self.caret_pos, soft)
+    }
+
+    // ---- options / properties ----
 
     pub fn set_option(&mut self, name: &str, value: bool) {
         self.options.insert(name.to_string(), value);
@@ -197,10 +365,20 @@ impl Context {
     pub fn set_property(&mut self, name: &str, value: &str) {
         self.properties.insert(name.to_string(), value.to_string());
     }
+
+    pub fn get_property(&self, name: &str) -> String {
+        self.properties.get(name).cloned().unwrap_or_default()
+    }
+
+    /// `ClearTransientOptions`：清掉 `_` 开头的 options/properties（方案局部）。
+    pub fn clear_transient_options(&mut self) {
+        self.options.retain(|k, _| !k.starts_with('_'));
+        self.properties.retain(|k, _| !k.starts_with('_'));
+    }
 }
 
-impl Segmentation {
-    /// 构造覆盖整段输入的单个段（我们的简化模型）。
+impl crate::engine::segmentation::Segmentation {
+    /// 构造覆盖整段输入的单个段（`Engine::compose` 的简化单段模型用）。
     pub fn segment_zero(len: usize) -> crate::engine::segmentation::Segment {
         crate::engine::segmentation::Segment::new(0, len)
     }

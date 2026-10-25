@@ -15,6 +15,10 @@ pub struct Schema {
     pub schema_name: String,
     /// 编译后的配置树（`build/<系列>/<id>.schema.yaml`）。
     pub config: Value,
+    /// `menu/page_size`（C++ `Schema::page_size`）。
+    pub page_size: usize,
+    /// `menu/alternative_select_keys`（C++ `Schema::select_keys`）。
+    pub select_keys: String,
 }
 
 impl Schema {
@@ -48,10 +52,22 @@ impl Schema {
             .and_then(|v| v.as_str())
             .unwrap_or(schema_id)
             .to_string();
+        let page_size = config
+            .pointer("/menu/page_size")
+            .and_then(|v| v.as_i64())
+            .filter(|n| *n > 0)
+            .map_or(5, |n| n as usize);
+        let select_keys = config
+            .pointer("/menu/alternative_select_keys")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         Some(Schema {
             schema_id: schema_id.to_string(),
             schema_name,
             config,
+            page_size,
+            select_keys,
         })
     }
 

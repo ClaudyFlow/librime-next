@@ -40,39 +40,81 @@
 //! `FallbackResourceResolver`（`resource.cc:88`）：主根找不到时，用回退根按
 //! **同一套分目录规则**再解一次（也不是扁平路径）。
 //!
-//! ## 三个解析器（`service.cc:167-195`）
+//! ## 三个根由宿主经 get/set 注入，lrn 持有为状态，只写死通用子目录名
 //!
-//! | 用途 | 根 | 回退根 | 后缀 |
+//! **三个根路径（程序文件夹 `PROGRAM_DIR` / 共享数据目录 `SHARE_DIR` / 用户文件夹 `USER_DIR`）
+//! 由 Weasel 通过 API（`RimeTraits` 的 `shared_data_dir` / `user_data_dir`）经 get/set 注入**，
+//! librime-next 把它们作为**状态持有**（`Layout` / `Deployer` 的 `program_dir` /
+//! `shared_data_dir` / `user_data_dir` 字段），**不写死字符串值、也不决定根叫什么**。
+//! 其中 `SHARE_DIR` = 宿主传入的 `shared_data_dir`（即 Weasel 设的 `Rime-Next` 数据目录），
+//! `PROGRAM_DIR`（安装目录，SHARE 的父目录）由 lrn 从 `shared_data_dir` 推出、可被 set 覆盖。
+//! lrn 只写死"各个版本输入法通用、一定不变"的**子目录名**
+//! （`SCHEMA_DIR` / `BUILD_DIR` / `MODEL_DIR` / `EASSY_DIR` / `THEME_DIR` / `PLUGIN_DIR` …），
+//! 全部相对这三个根拼出。
+//!
+//! | 用途 | 根（用户数据目录优先） | 回退根（共享数据目录） | 后缀 |
 //! |---|---|---|---|
-//! | 源配置 `config_source_file` | `user_data_dir` | `shared_data_dir` | `.yaml` |
-//! | 源方案 `schema_source_file` | `user_data_dir` | `shared_data_dir` | `.schema.yaml` |
-//! | 已部署产物（`compiled_config` / `compiled_schema`） | `staging_dir` | `prebuilt_data_dir` | `.yaml` / `.schema.yaml` |
-//! | 用户配置 `user_config` | `user_data_dir`（**无回退**） | — | `.yaml` |
+//! | 源配置 `config_source_file` | 用户数据目录 | 共享数据目录 | `.yaml` |
+//! | 源方案 `schema_source_file` | 用户数据目录 | 共享数据目录 | `.schema.yaml` |
+//! | 已部署产物（`compiled_config` / `compiled_schema`） | `用户文件夹/build` | （出厂预编译已取消，通常为空） | `.yaml` / `.schema.yaml` |
+//! | 用户配置 `user_config` | 用户文件夹（**无回退**） | — | `.yaml` |
 
 use std::path::{Path, PathBuf};
 
+// =====================================================================
+// 通用子目录名（写死在 librime-next 内部）
+// =====================================================================
+// 这些名字是"各个版本输入法通用、一定不变"的目录段，所有路径相对宿主注入的
+// 根（共享数据目录 / 用户数据目录）拼出来。根路径本身由 Weasel 通过 `RimeTraits`
+// API 注入，lrn 不设置、也不决定根路径（2026-10-25 架构澄清）。
+pub const SCHEMA_DIR: &str = "schema";
+pub const BUILD_DIR: &str = "build";
+pub const MODEL_DIR: &str = "model";
+pub const EASSY_DIR: &str = "eassy";
+pub const THEME_DIR: &str = "theme";
+pub const PLUGIN_DIR: &str = "plugin";
+pub const USERDB_DIR: &str = "userdb";
+pub const TRASH_DIR: &str = "trash";
+pub const SYNC_DIR: &str = "sync";
+
 /// Weasel-Next 的部署布局（`setup.cc` 里 `RimeTraits` 的四个目录 + `Deployer` 的几个字段）。
+///
+/// **三个根路径（程序文件夹 / 共享数据目录 / 用户文件夹）由宿主经 API 注入**，
+/// lrn 把它们作为**状态持有**（`program_dir` / `shared_data_dir` / `user_data_dir`），
+/// 由宿主的 get/set（RimeTraits）设进实际路径；lrn 不写死字符串值、也不决定根叫什么。
+/// lrn 只写死通用子目录名（`SCHEMA_DIR` 等）。
 #[derive(Debug, Clone)]
 pub struct Layout {
-    /// 共享数据目录（安装目录下的 `Rime-Next/`）。
+    /// 程序文件夹（`PROGRAM_DIR`）：宿主经 API 注入的安装目录，是共享数据目录的**父目录**。
+    /// 只含共享数据目录（`shared_data_dir`），禁止任何设置文件、禁止任何 `build`。
+    pub program_dir: PathBuf,
+    /// 共享数据目录（`SHARE_DIR`，即 Weasel 设的 `Rime-Next` 数据目录）。
+    /// 所有基础方案与数据（`schema`/`model`/`eassy`/`theme`/`plugin`）都在这里。
     pub shared_data_dir: PathBuf,
-    /// 用户数据目录（`%APPDATA%\Rime-Next`）。
+    /// 用户文件夹（`USER_DIR`，如 `%APPDATA%\Rime-Next`）。
     pub user_data_dir: PathBuf,
-    /// 部署产物目录（`<用户目录>/build`）。
+    /// 部署产物目录（`<用户目录>/build`）。**build 只存在于用户文件夹**（2026-10-25 硬规则）。
     pub staging_dir: PathBuf,
-    /// 预编译产物目录（出厂 `build/`）。
+    /// 预编译产物目录。2026-10-25 起**出厂预编译取消**（程序文件夹禁止 build），
+    /// 故通常为空；运行时已部署产物只从 `staging_dir`（用户目录 build）读取。
     pub prebuilt_data_dir: PathBuf,
 }
 
 impl Layout {
-    /// 从 `Deployer` 的目录字段搭出来。
+    /// 从 `Deployer` 的目录字段搭出来。三个根由宿主经 API 注入，直接收下。
+    ///
+    /// * `program_dir`：程序文件夹（`PROGRAM_DIR`，宿主经 API 注入的安装目录）。
+    /// * `shared_data_dir`：共享数据目录（`SHARE_DIR`，Weasel 通过 API 注入的 `Rime-Next` 数据目录）。
+    /// * `user_data_dir`：用户文件夹（`USER_DIR`，Weasel 通过 API 注入）。
     pub fn new(
+        program_dir: impl Into<PathBuf>,
         shared_data_dir: impl Into<PathBuf>,
         user_data_dir: impl Into<PathBuf>,
         staging_dir: impl Into<PathBuf>,
         prebuilt_data_dir: impl Into<PathBuf>,
     ) -> Self {
         Self {
+            program_dir: program_dir.into(),
             shared_data_dir: shared_data_dir.into(),
             user_data_dir: user_data_dir.into(),
             staging_dir: staging_dir.into(),
@@ -80,37 +122,63 @@ impl Layout {
         }
     }
 
-    /// `config_source_file`：`<id>.yaml`，用户目录优先、共享目录回退。
-    pub fn config_source(&self, resource_id: &str) -> PathBuf {
-        fallback_resolve(&self.user_data_dir, &self.shared_data_dir, resource_id, "", ".yaml")
+    /// **程序文件夹**（`PROGRAM_DIR`，宿主经 API 注入）：安装目录，是共享数据目录的父目录。
+    /// 禁止出现任何设置文件、禁止出现 `build`。
+    pub fn program_dir(&self) -> &Path {
+        &self.program_dir
     }
 
-    /// `schema_source_file`：`<id>.schema.yaml`，用户目录优先、共享目录回退。
+    /// **用户文件夹**（`USER_DIR`，宿主通过 API 注入，如 `%APPDATA%\Rime-Next`）：
+    /// 所有设置与部署产物（`build` 等）都写到这里。**部署强制写死到用户文件夹**。
+    pub fn user_folder(&self) -> &Path {
+        &self.user_data_dir
+    }
+
+    /// **共享数据目录**（`SHARE_DIR`，宿主通过 API 注入的 `Rime-Next` 数据目录）：
+    /// 所有基础方案与数据从这里读。
+    pub fn shared_folder(&self) -> &Path {
+        &self.shared_data_dir
+    }
+
+    /// `config_source_file`：`<id>.yaml`，用户目录优先、共享数据目录回退。
+    pub fn config_source(&self, resource_id: &str) -> PathBuf {
+        fallback_resolve(
+            self.user_folder(),
+            self.shared_folder(),
+            resource_id,
+            "",
+            ".yaml",
+        )
+    }
+
+    /// `schema_source_file`：`<id>.schema.yaml`，用户文件夹优先、共享数据目录回退。
     pub fn schema_source(&self, schema_id: &str) -> PathBuf {
         fallback_resolve(
-            &self.user_data_dir,
-            &self.shared_data_dir,
+            self.user_folder(),
+            self.shared_folder(),
             schema_id,
             "",
             ".schema.yaml",
         )
     }
 
-    /// 用户配置（`user_config` 组件）：`<用户目录>/<id>.yaml`，**没有**回退根。
+    /// 用户配置（`user_config` 组件）：`<用户文件夹>/<id>.yaml`，**没有**回退根。
     pub fn user_config(&self, resource_id: &str) -> PathBuf {
-        resolve(&self.user_data_dir, resource_id, "", ".yaml")
+        resolve(self.user_folder(), resource_id, "", ".yaml")
     }
 
     /// 已部署产物（`DeployedConfigResourceProvider` / `compiled_schema`）：
-    /// staging 优先、prebuilt 回退。
+    /// 实际部署时只查 `用户文件夹/build`（出厂预编译已取消，prebuilt 恒空）。
     pub fn deployed(&self, resource_id: &str, suffix: &str) -> PathBuf {
         fallback_resolve(&self.staging_dir, &self.prebuilt_data_dir, resource_id, "", suffix)
     }
 
-    /// 已编译配置（`compiled_config`）的**写**目标：只走 staging，不回退。
+    /// 已编译配置（`compiled_config`）的**写**目标：只走 `staging_dir`，不回退。
     ///
     /// `SaveOutputPlugin` 拿的是 `CreateStagingResourceResolver`（`save_output_plugin.cc`），
     /// 所以写目标永远是 `<staging>/<id>.yaml` 或 `<staging>/<leaf>/<id>.yaml`。
+    /// staging 根由 [`super::deployer::Deployer::layout`] 强制为 `用户文件夹/build`
+    /// （2026-10-25 硬规则：build 只存在于用户文件夹）。
     pub fn staged_output(&self, resource_id: &str) -> PathBuf {
         resolve(&self.staging_dir, resource_id, "", ".yaml")
     }
@@ -120,15 +188,15 @@ impl Layout {
         self.deployed(schema_id, ".schema.yaml")
     }
 
-    /// Weasel-Next 的用户词典目录：`<用户目录>/userdb`（官方是用户目录根部，
+    /// Weasel-Next 的用户词典目录：`<用户文件夹>/userdb`（官方是用户目录根部，
     /// 见 `plugin/librime/src/input_stat_translator.cc` 的注释）。
     pub fn user_db_dir(&self) -> PathBuf {
-        self.user_data_dir.join("userdb")
+        self.user_folder().join(USERDB_DIR)
     }
 
-    /// 回收站：`<用户目录>/trash`。
+    /// 回收站：`<用户文件夹>/trash`。
     pub fn trash_dir(&self) -> PathBuf {
-        self.user_data_dir.join("trash")
+        self.user_folder().join(TRASH_DIR)
     }
 
     /// 方案源文件候选（用于"方案在不在"的判断，按搜索顺序）：
@@ -138,14 +206,14 @@ impl Layout {
     pub fn schema_source_candidates(&self, schema_id: &str) -> Vec<PathBuf> {
         let mut candidates = Vec::new();
         let series = series_subdir(schema_id);
-        for root in [&self.user_data_dir, &self.shared_data_dir] {
+        for root in [self.user_folder(), self.shared_folder()] {
             candidates.push(
-                root.join("schema")
+                root.join(SCHEMA_DIR)
                     .join(&series)
                     .join(format!("{schema_id}.schema.yaml")),
             );
             candidates.push(
-                root.join("schema")
+                root.join(SCHEMA_DIR)
                     .join(&series)
                     .join(format!("{schema_id}.yaml")),
             );
@@ -216,16 +284,16 @@ pub fn resolve(root: &Path, resource_id: &str, prefix: &str, suffix: &str) -> Pa
         return root.join(series_subdir(resource_id)).join(&base);
     }
     if suffix.ends_with(".gram") {
-        return root.join("model").join(&base);
+        return root.join(MODEL_DIR).join(&base);
     }
     // ⑤ .txt → eassy/<id>.txt（essay 按 id 平铺，不建系列夹；C++ resource.cc:110-111）
     if suffix.ends_with(".txt") {
-        return root.join("eassy").join(&base);
+        return root.join(EASSY_DIR).join(&base);
     }
     // ⑥ .theme.toml → theme/<系列…>/<id>.theme.toml（主题按系列分层；C++ resource.cc:112-113）
     if suffix.ends_with(".theme.toml") {
         return root
-            .join("theme")
+            .join(THEME_DIR)
             .join(series_subdir(resource_id))
             .join(&base);
     }
@@ -233,7 +301,7 @@ pub fn resolve(root: &Path, resource_id: &str, prefix: &str, suffix: &str) -> Pa
     //    不转成系列目录；rime-lua 的 package.path 另有点号即目录约定，此分支暂无
     //    调用方，与 C++ 保持一致）
     if suffix.ends_with(".lua") {
-        return root.join("plugin").join(resource_id).join(&base);
+        return root.join(PLUGIN_DIR).join(resource_id).join(&base);
     }
 
     // ③ / ④：配置类资源分目录，**无扁平回退**。
@@ -244,14 +312,14 @@ pub fn resolve(root: &Path, resource_id: &str, prefix: &str, suffix: &str) -> Pa
             Some(if is_staging_root(root) {
                 series_subdir(&leaf)
             } else {
-                format!("schema/{}", series_subdir(&leaf))
+                format!("{SCHEMA_DIR}/{}", series_subdir(&leaf))
             })
         } else if suffix.ends_with(".schema.yaml") || suffix.ends_with(".dict.yaml") {
             // 后缀带 .schema.yaml 时资源 id 本身不带 `.schema`，系列链按整个 id 分段
             Some(if is_staging_root(root) {
                 series_subdir(resource_id)
             } else {
-                format!("schema/{}", series_subdir(resource_id))
+                format!("{SCHEMA_DIR}/{}", series_subdir(resource_id))
             })
         } else {
             None
@@ -421,7 +489,7 @@ mod tests {
         let root = temp("schema-source");
         let user = root.join("user");
         let shared = root.join("shared");
-        let layout = Layout::new(&shared, &user, user.join("build"), shared.join("build"));
+        let layout = Layout::new(&root, &shared, &user, user.join("build"), shared.join("build"));
         // 都没有 → nested（用户目录）是唯一候选
         assert_eq!(
             layout.schema_source("luna"),
@@ -478,7 +546,7 @@ mod tests {
     #[test]
     fn compiled_config_writes_into_schema_subdir() {
         let root = temp("compiled");
-        let layout = Layout::new(root.join("shared"), root.join("user"), root.join("build"), root.join("prebuilt"));
+        let layout = Layout::new(&root, root.join("shared"), root.join("user"), root.join("build"), root.join("prebuilt"));
         // `.schema` 资源在 staging 根下是 `<staging>/<leaf>/<leaf>.schema.yaml`
         assert_eq!(
             layout.staged_output("luna.schema"),
@@ -494,7 +562,7 @@ mod tests {
         // 出厂产物目录名必须是 `build`（staging 根判定看目录名），与真实布局一致。
         let staging = root.join("user/build");
         let prebuilt = root.join("shared/build");
-        let layout = Layout::new(root.join("shared"), root.join("user"), &staging, &prebuilt);
+        let layout = Layout::new(&root, root.join("shared"), root.join("user"), &staging, &prebuilt);
         // prebuilt 只有扁平文件 → 不认（2026-10-25 删回退），返回 staging 的 nested 路径
         touch(&prebuilt.join("stroke.schema.yaml"));
         assert_eq!(
@@ -514,7 +582,7 @@ mod tests {
     #[test]
     fn user_db_and_trash_dirs() {
         let root = temp("dirs");
-        let layout = Layout::new("s", root.join("user"), root.join("user/build"), "p");
+        let layout = Layout::new(Path::new("p"), Path::new("s"), root.join("user"), root.join("user/build"), Path::new("p"));
         assert_eq!(layout.user_db_dir(), root.join("user/userdb"));
         assert_eq!(layout.trash_dir(), root.join("user/trash"));
         let _ = std::fs::remove_dir_all(&root);

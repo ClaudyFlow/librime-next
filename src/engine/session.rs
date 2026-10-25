@@ -67,7 +67,7 @@ impl Session {
         };
         let result = engine.context.select(idx);
         if matches!(result, Some(SelectResult::Continued)) {
-            engine.context.highlight = 0;
+            engine.context.highlight(0);
             engine.compose();
         }
         if let Some(t) = engine.context.commit_text.take() {

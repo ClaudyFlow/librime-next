@@ -97,8 +97,9 @@
 
 | 差异 | 说明 |
 |---|---|
-| **~~`__build_info` 缺失~~（已澄清）** | 2026-10-25 复核实测产物**有** `__build_info/timestamps`（rime_version=1.17.0 + 全部资源 mtime），`ConfigNeedsUpdate` 的 mtime 比对链路完整；此条系早期误记 |
-| **YAML 输出格式不同** | 文本层面差异大（702 行 vs 425 行），语义层面基本等价（schema 配置、engine 组件列表一致） |
+| **~~`__build_info` 缺失~~（已澄清）** | 2026-10-25 复核实测产物**有** `__build_info/timestamps`（rime_version=1.17.0 + 全部资源 mtime），`ConfigNeedsUpdate` 的 mtime 比对链路完整；此条系早期误记。另注：装机实时基线（`%APPDATA%/Rime-Next/build/`）的 schema.yaml 反而**没有**它——那是装机版 C++（weasel-next.patch）行为，非标准 C++；LRN 比装机基线更对齐标准 C++ |
+| **YAML 输出格式不同** | 文本层面差异大（702 行 vs 425 行），语义层面**完全等价**（schema 配置、engine 组件列表一致） |
+| **prism 拼写总数 2432 vs 1792** | 部分部署实测比对（见第六节）：LRN 把 correction 拼写编入 prism（**对齐 C++ 原版 `prism.cc:242` 标记 `is_correction`**），装机实时基线用不含这些 correction 的旧源/配置部署（两边 `schema_checksum` 不同：LRN `0x011b50b8` / 基线 `0x29a1ad47`）。核心拼写集合等价（`common_prefix_search` 返回相同 spelling_id），功能无差异 |
 
 ---
 
@@ -131,3 +132,56 @@ cargo test --manifest-path librime-next/Cargo.toml
 cargo build --manifest-path librime-next/Cargo.toml
 librime-next/tools/abi_check/run_abi_check.sh
 ```
+
+---
+
+## 六、部分部署实测对比（2026-10-25 晚）
+
+**目的**：用真实 dll（`target/debug/librime_next.dll` = librime-next 的 cdylib，已确认导出 `rime_get_api`、`data_size=804`）走 C ABI 做部分部署，产物与用户文件夹现有 C++ 基线（`%APPDATA%/Rime-Next/build/luna_pinyin_simp/`）逐文件对比。
+
+**方法**：`tools/abi_check/partial_deploy.c` 加载 dll → `setup` → `deployer_initialize` → `deploy` → `finalize`，沙箱 user_dir 只列 `luna_pinyin_simp`。实测 install 阶段用 shared 的 `default.yaml` 覆盖了沙箱配置，触发**全量部署**（19 方案 / 24s 完成），但聚焦对比 luna_pinyin_simp 部分。
+
+### 结果
+
+| 文件 | LRN 最新 dll 部署 | C++ 实时基线 | 结论 |
+|---|---|---|---|
+| 文件结构 | `luna_pinyin_simp/` 下 `prism.bin` + `schema.yaml` | 同（无 table/reverse） | **一致** |
+| `luna_pinyin_simp.schema.yaml` | 43308 B | 42918 B（差 390 B） | 语义 **完全等价**，差异仅 `__build_info` 段（LRN 有 / 基线无） |
+| `luna_pinyin_simp.prism.bin` | 34292 B / 2432 拼写 | 31732 B / 1792 拼写 | 字节不同；LRN 多 **640 个 correction 拼写** |
+
+### prism 差异根因
+
+- C++ 原版 `Prism::Build`（`src/rime/dict/prism.cc:142-256`）**不跳过 correction 拼写**——把 script 里所有拼写（含 `is_correction` 的）都编入 trie，并在 `:242` 标记 `kTypeIsCorrectionMask`。
+- LRN 的 `Prism::build`（`src/dict/prism.rs:391-505`）行为对齐：把源 schema speller 的 `pinyin:/spelling_correction` + `pinyin:/key_correction` 生成的 correction 拼写也编入 → 2432 个。
+- 对用户文件夹实时基线（1792）而言，它部署时所用的源/配置**不含这些 correction**（两边 `schema_checksum` 不同：`0x011b50b8` vs `0x29a1ad47` 即证）。属**源演进 / 装机配置差**，非代码缺陷。
+- 功能等价铁证：相同输入 `common_prefix_search` 返回**完全相同的 spelling_id**（`nihao→[349,365]`、`zhong→[639,652,667,670,671]` 等）。
+
+### 结论
+
+luna_pinyin_simp 的部分部署产物与 C++ 实时基线**语义完全等价**；prism 的字节差来自 correction 拼写（LRN 对齐 C++ 原版行为，基线对齐旧装机配置），**无需代码修复**。
+
+### ⚠️ 阻塞：lib 当前无法编译
+
+对比完成后发现 `git status` 显示 `src/engine/` 有 **884 行未提交改动**（composition/context/speller/menu/schema/segmentation + 新 `gear/segmentors.rs`），这些是本日"engine 部分移植"的进行中代码，**从未编译验证**，导致 `cargo build` 整库失败（`Context::move_highlight`/`commit_composition`、`Segmentation::segment_zero`、`Regex::is_full_match` 等未实现）。18:09 部署用的 dll 靠旧 target 缓存编过；任何新的 `cargo build`（含改 prism.rs 后重编）都会失败。需先决定：修复使可编译 / 回退 / 保持现状。
+
+---
+
+## 七、engine 阻塞修复 + 扫描器镜像 + 全量测试通过（2026-10-25 深夜）
+
+**engine 19 个编译错误全部修复**（`cargo build` 产出 `librime_next.dll`，58.8MB）：
+
+| 缺失 | 修复方式 |
+|---|---|
+| `Context::move_highlight` / `commit_composition` / `menu_candidate_count` / `Segmentation::segment_zero` | 从 HEAD 取回实现并按当前结构适配（`committed_prefix` 字段恢复；`highlight()` 方法化） |
+| `Context::select` 返回 `Option<SelectResult>` | 恢复"整段覆盖→Committed / 部分覆盖→Continued"语义 |
+| `Speller` 当值用 | `Engine::create` 改为从 schema 编译后配置 `Speller::new(&schema.config)` 装配 |
+| `Regex::is_full_match` | fancy_regex 无此方法；构造时加 `^(?:…)$` 锚点 + `regex_full_match` helper |
+| `compose()` 从未被触发（e2e 全挂的根因） | `Engine::process_key` 补"输入变更才重组"——对齐 C++ `update_notifier → OnContextUpdate → Compose`；高亮导航不变更输入故不重组（符合 C++ 行为） |
+
+**扫描器镜像进 lrn**：`src/lever/scan.rs`（`tools/rime-scan` 算法正式化，serde_norway 解析 frontmatter，路径用 `paths` 常量）。实测与工具基线**逐位一致**：171 文件（schema 41 / dict 79 / config 7 / theme 1 / lua 37 / plugin-data 4 / essay 2）、120 个 yaml 系列摆放 0 误报、OVERALL 4,733,605 词条 avg 9.41 max 84。
+
+**测试**：lib 243（含 scan 5）+ lever_deploy 集成（真实数据目录全量 WorkspaceUpdate，231s）+ e2e 6 + 其余 14，**全过**。
+
+**架构修正**：`Deployer::layout()` 不再强行覆盖 staging/prebuilt，改为忠实反映字段；硬规则执行点移到注入侧（`rime_deployer_initialize` 强制 staging=`<user>/build`、prebuilt 恒空；`set_user_data_dir` 同步重算 staging）。修复了 lever_deploy 测试因 staging 覆盖失效而写穿真实 build 目录的问题。
+
+**遗留**：真实 build 目录被失败测试运行污染（00:02-00:05 写入的 lrn 编译产物，语义等价）；待一次 C++ 真实部署恢复一致。

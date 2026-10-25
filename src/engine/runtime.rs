@@ -41,7 +41,10 @@ impl Engine {
             build_dir: build_dir.to_path_buf(),
         };
         engine.initialize_components();
-        engine.processors.push(Box::new(Speller));
+        // Speller 是配置驱动的（C++ 由 `SpellerComponent::Create` 从 schema 的
+        // `speller:` 节点装配），这里直接从方案的编译后配置树构造。
+        let speller = Speller::new(&engine.schema.config);
+        engine.processors.push(Box::new(speller));
         engine.processors.push(Box::new(Selector));
         Some(engine)
     }
@@ -55,7 +58,14 @@ impl Engine {
     }
 
     /// 处理一次按键（对照 `ConcreteEngine::ProcessKey`）。
+    ///
+    /// C++ 的对应机制：`Context::PushInput/PopInput/DeleteInput/Clear` 发
+    /// `update_notifier_` → `ConcreteEngine::OnContextUpdate` → `Compose(ctx)`；
+    /// `Highlight` 虽也发 update，但 `Composition::Reset` 对未变输入不弹段，
+    /// 高亮得以保留。Rust 简化版 `compose()` 无条件清段，因此这里只在
+    /// **输入串真的变了**时重算——纯高亮导航（Selector）不触发，符合 C++ 行为。
     pub fn process_key(&mut self, key: &KeyEvent) -> bool {
+        let input_before = self.context.input.clone();
         // 把 processors 取出到局部，避免「遍历 self.processors 同时把 &mut self 传进去」的借用冲突
         let mut processors = std::mem::take(&mut self.processors);
         let mut result = false;
@@ -73,6 +83,9 @@ impl Engine {
             }
         }
         self.processors = processors;
+        if self.context.input != input_before {
+            self.compose();
+        }
         result
     }
 

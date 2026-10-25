@@ -18,15 +18,20 @@ impl Menu {
         self.candidates.push(candidate);
     }
 
-    /// 按 quality 降序排序并去重（同文本保留质量最高者）。
+    pub fn add_all(&mut self, candidates: Vec<Candidate>) {
+        self.candidates.extend(candidates);
+    }
+
+    /// 汇合各翻译器的候选：按 quality 降序**稳定**排序。
+    /// C++ 是 `MergedTranslation` 懒式逐个 peek 合并（质量优先、平局先来先得），
+    /// 急切模型下等价于稳定排序；不去重 —— 去重是 `uniquifier` 过滤器的职责。
     pub fn prepare(&mut self) {
-        self.candidates.sort_by(|a, b| {
-            b.quality
-                .partial_cmp(&a.quality)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let mut seen = std::collections::HashSet::new();
-        self.candidates.retain(|c| seen.insert(c.text.clone()));
+        self.candidates
+            .sort_by(|a, b| {
+                b.quality
+                    .partial_cmp(&a.quality)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
     }
 
     pub fn candidate_count(&self) -> usize {

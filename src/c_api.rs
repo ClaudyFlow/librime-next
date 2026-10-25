@@ -8,6 +8,7 @@
 
 #![allow(non_snake_case, dead_code)]
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::os::raw::c_double;
@@ -26,6 +27,9 @@ type RimeSessionId = usize;
 struct Global {
     shared_data_dir: String,
     user_data_dir: String,
+    /// 程序文件夹（安装目录）。运行期可经 `set_program_dir` 注入/覆盖，
+    /// 缺省在 `deployer_initialize` 时由 `shared_data_dir` 的父目录推出。
+    program_dir: String,
     prebuilt_data_dir: String,
     staging_dir: String,
     sessions: HashMap<RimeSessionId, Session>,
@@ -53,6 +57,7 @@ fn global() -> &'static Mutex<Global> {
         Mutex::new(Global {
             shared_data_dir: String::new(),
             user_data_dir: String::new(),
+            program_dir: String::new(),
             prebuilt_data_dir: String::new(),
             staging_dir: String::new(),
             sessions: HashMap::new(),
@@ -309,6 +314,17 @@ pub struct RimeApi {
     pub highlight_candidate: Option<unsafe extern "C" fn(RimeSessionId, usize) -> Bool>,
     pub highlight_candidate_on_current_page: Option<unsafe extern "C" fn(RimeSessionId, usize) -> Bool>,
     pub change_page: Option<unsafe extern "C" fn(RimeSessionId, Bool) -> Bool>,
+    // ---- 三个根目录的 get/set（2026-10-25 增补，挂在 `change_page` 之后，DLL 尾部扩展）----
+    /// 程序文件夹（`program_dir`）。返回内部静态副本，调用方不应释放/改写。
+    pub get_program_dir: Option<unsafe extern "C" fn() -> *const c_char>,
+    /// 程序文件夹（带缓冲区的线程安全版本）。
+    pub get_program_dir_s: Option<unsafe extern "C" fn(*mut c_char, usize)>,
+    /// 设置程序文件夹（运行期覆盖，部署时 `layout()` 会用到）。
+    pub set_program_dir: Option<unsafe extern "C" fn(*const c_char)>,
+    /// 设置共享数据目录（= `shared_data_dir`，即 `Rime-Next` 数据目录）。
+    pub set_shared_data_dir: Option<unsafe extern "C" fn(*const c_char)>,
+    /// 设置用户数据目录（= `user_data_dir`）。
+    pub set_user_data_dir: Option<unsafe extern "C" fn(*const c_char)>,
     pub get_candidate_preview:
         Option<unsafe extern "C" fn(RimeSessionId, *mut RimeCandidatePreview) -> Bool>,
     pub free_candidate_preview: Option<unsafe extern "C" fn(*mut RimeCandidatePreview)>,
@@ -415,18 +431,25 @@ unsafe extern "C" fn rime_deployer_initialize(traits: *mut RimeTraits) {
     if let Some(v) = read_cstr(t.app_name) {
         d.app_name = v;
     }
-    d.prebuilt_data_dir = match read_cstr(t.prebuilt_data_dir) {
-        Some(v) => PathBuf::from(v),
-        None => d.shared_data_dir.join("build"),
-    };
-    d.staging_dir = match read_cstr(t.staging_dir) {
-        Some(v) => PathBuf::from(v),
-        None => d.user_data_dir.join("build"),
-    };
+    // 2026-10-25 硬规则（执行点在注入侧；`Deployer::layout()` 忠实反映字段）：
+    // * 出厂预编译（prebuilt）取消——程序文件夹禁止任何 build，prebuilt **恒空**，
+    //   无视 `RimeTraits` 传入值；
+    // * **build 只存在于用户文件夹**——不论宿主传什么 staging_dir，都强制为
+    //   `<user_data_dir>/build`。要沙箱化部署的调用方（测试）可在
+    //   `deployer_initialize` 之后直接改 `Deployer.staging_dir` 字段。
+    d.prebuilt_data_dir = PathBuf::new();
+    d.staging_dir = d.user_data_dir.join("build");
     d.sync_dir = d.user_data_dir.join("sync");
     if let Some(v) = read_cstr(t.log_dir) {
         d.log_dir = PathBuf::from(v);
     }
+    // 程序文件夹（`PROGRAM_DIR`）= 共享数据目录（被宿主经 API 设成 `Rime-Next` 数据目录）
+    // 的父目录；无父目录时退回共享数据目录自身。宿主也可用 `RimeTraits` 之外的 setter 显式覆盖。
+    d.program_dir = d
+        .shared_data_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| d.shared_data_dir.clone());
     g.deployer = Some(d);
 }
 
@@ -638,7 +661,7 @@ unsafe extern "C" fn rime_get_context(id: RimeSessionId, ctx: *mut RimeContext) 
         return 0;
     };
     let comp = &context.composition;
-    let preedit = comp.get_preedit();
+    let preedit = context.get_preedit();
     (*ctx).composition.length = preedit.text.len() as c_int;
     (*ctx).composition.cursor_pos = preedit.caret_pos as c_int;
     (*ctx).composition.sel_start = preedit.sel_start as c_int;
@@ -663,7 +686,12 @@ unsafe extern "C" fn rime_get_context(id: RimeSessionId, ctx: *mut RimeContext) 
         } else {
             std::ptr::null_mut()
         };
-        (raw, context.page_size as c_int, context.highlight as c_int, n as c_int)
+        (
+            raw,
+            context.page_size as c_int,
+            context.highlight_index() as c_int,
+            n as c_int,
+        )
     } else {
         (std::ptr::null_mut(), context.page_size as c_int, 0, 0)
     };
@@ -994,7 +1022,8 @@ unsafe extern "C" fn rime_highlight_candidate(id: RimeSessionId, index: usize) -
     let mut g = global().lock().unwrap();
     if let Some(s) = g.sessions.get_mut(&id) {
         if let Some(c) = s.context_mut() {
-            c.highlight = index.min(c.menu_candidate_count().saturating_sub(1));
+            let idx = index.min(c.menu_candidate_count().saturating_sub(1));
+            c.highlight(idx);
             return 1;
         }
     }
@@ -1144,6 +1173,70 @@ unsafe extern "C" fn rime_get_staging_dir() -> *const c_char {
 }
 unsafe extern "C" fn rime_get_user_data_sync_dir(_out: *mut c_char, _n: usize) {}
 
+// ----------------------------------------------------------------- 三个根目录的 get/set
+//
+// 三个路径（程序文件夹 / 共享数据目录 / 用户数据目录）各自有 get + set：
+// - `get_*_s(out, n)`：线程安全地把路径拷进调用方缓冲区（标准做法，无泄漏）。
+// - `get_*()`：返回线程本地缓冲区的指针，调用方应在下次调用前用完（同 librime 的
+//   `get_user_data_dir` 约定：返回内部缓冲、可覆盖、不可 free）。
+// - `set_*`：运行期注入/覆盖，同时写进 `Global` 与已存在的 `Deployer`，使后续 `deploy()`
+//   经 `layout()` 读到最新路径（2026-10-25：部署强制走用户文件夹，但根可由宿主经 API 设）。
+
+thread_local! {
+    static PROGRAM_DIR_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+unsafe extern "C" fn rime_get_program_dir() -> *const c_char {
+    let g = global().lock().unwrap();
+    PROGRAM_DIR_BUF.with(|b| {
+        let mut buf = b.borrow_mut();
+        buf.clear();
+        buf.extend_from_slice(g.program_dir.as_bytes());
+        buf.push(0);
+        buf.as_ptr() as *const c_char
+    })
+}
+
+unsafe extern "C" fn rime_get_program_dir_s(out: *mut c_char, n: usize) {
+    let g = global().lock().unwrap();
+    copy_dir(out, n, &g.program_dir);
+}
+
+unsafe extern "C" fn rime_set_program_dir(dir: *const c_char) {
+    if let Some(s) = read_cstr(dir) {
+        let mut g = global().lock().unwrap();
+        g.program_dir = s.clone();
+        if let Some(d) = g.deployer.as_mut() {
+            d.set_program_dir(PathBuf::from(s));
+        }
+    }
+}
+
+unsafe extern "C" fn rime_set_shared_data_dir(dir: *const c_char) {
+    if let Some(s) = read_cstr(dir) {
+        let mut g = global().lock().unwrap();
+        g.shared_data_dir = s.clone();
+        if let Some(d) = g.deployer.as_mut() {
+            d.set_shared_data_dir(PathBuf::from(s));
+        }
+    }
+}
+
+unsafe extern "C" fn rime_set_user_data_dir(dir: *const c_char) {
+    if let Some(s) = read_cstr(dir) {
+        let user = PathBuf::from(&s);
+        // build 只存在于用户文件夹（2026-10-25 硬规则）：用户目录变更 ⇒ staging 重算
+        let staging = user.join("build");
+        let mut g = global().lock().unwrap();
+        g.user_data_dir = s.clone();
+        g.staging_dir = staging.to_string_lossy().to_string();
+        if let Some(d) = g.deployer.as_mut() {
+            d.set_user_data_dir(user);
+            d.staging_dir = staging;
+        }
+    }
+}
+
 // 其余函数：安全打桩（MVP 暂不实现 deploy / config 读写 / proto）
 unsafe extern "C" fn stub_false() -> Bool {
     0
@@ -1258,6 +1351,11 @@ fn build_api() -> RimeApi {
         highlight_candidate: Some(rime_highlight_candidate),
         highlight_candidate_on_current_page: Some(rime_highlight_candidate_on_current_page),
         change_page: Some(rime_change_page),
+        get_program_dir: Some(rime_get_program_dir),
+        get_program_dir_s: Some(rime_get_program_dir_s),
+        set_program_dir: Some(rime_set_program_dir),
+        set_shared_data_dir: Some(rime_set_shared_data_dir),
+        set_user_data_dir: Some(rime_set_user_data_dir),
         get_candidate_preview: None,
         free_candidate_preview: None,
     }
