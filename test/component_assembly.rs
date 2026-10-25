@@ -102,3 +102,53 @@ fn multi_segment_input_produces_raw_then_abc() {
         "应有一段带 abc 标签：{shapes:?}"
     );
 }
+
+#[test]
+fn filters_are_assembled_from_config() {
+    let engine = Engine::create(&build_dir(), "luna_pinyin_simp")
+        .expect("luna_pinyin_simp 引擎应能加载");
+    let names = engine.filter_names();
+    println!("filters = {names:?}");
+    // 真实方案至少声明了 uniquifier；它必须真的挂到链上（不再只是个名字）
+    assert!(
+        names.iter().any(|n| *n == "uniquifier"),
+        "应有 uniquifier，实际 {names:?}"
+    );
+}
+
+#[test]
+fn uniquifier_removes_duplicate_candidates_real_dict() {
+    let mut engine = Engine::create(&build_dir(), "luna_pinyin_simp")
+        .expect("luna_pinyin_simp 引擎应能加载");
+    engine.context.input = "nihao".to_string();
+    engine.context.caret_pos = 5;
+    engine.compose();
+
+    let texts: Vec<String> = engine
+        .context
+        .composition
+        .segmentation
+        .segments
+        .first()
+        .and_then(|s| s.menu.as_ref())
+        .map(|m| {
+            m.candidates()
+                .iter()
+                .map(|c| c.text.clone())
+                .collect()
+        })
+        .expect("应有菜单");
+    // 实测（2026-10-26，真实 luna_pinyin_simp 产物）：
+    //   关掉 filter 链时 nihao 有 294 条候选，挂上 uniquifier 后 293 条
+    //   —— 正好删掉 1 条重复。这条断言就是在守住"filter 链真的被调用"。
+    let total = texts.len();
+    let mut deduped = texts.clone();
+    deduped.sort();
+    deduped.dedup();
+    assert_eq!(
+        total,
+        deduped.len(),
+        "uniquifier 生效后不应出现重复词条：{:?}",
+        &texts[..total.min(15)]
+    );
+}

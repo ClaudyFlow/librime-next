@@ -33,6 +33,7 @@ use crate::engine::gear::abc_segmentor::AbcSegmentor;
 use crate::engine::gear::ascii_composer::AsciiComposer;
 use crate::engine::gear::editor::Editor;
 use crate::engine::gear::fallback_segmentor::FallbackSegmentor;
+use crate::engine::gear::filter::{Filter, SingleCharFilter, Uniquifier};
 use crate::engine::gear::matcher::Matcher;
 use crate::engine::gear::navigator::Navigator;
 use crate::engine::gear::processor::Processor;
@@ -270,6 +271,15 @@ where
 // ------------------------------------------------------------ 组件工厂
 
 /// C++ `gears_module.cc` 的 processor 部分（当前已移植的那些）。
+/// C++ `gears_module.cc` 的 filter 部分（当前已移植的那些）。
+pub fn create_filter(ticket: &Ticket) -> Option<Box<dyn Filter + Send + Sync>> {
+    match ticket.klass.as_str() {
+        "uniquifier" => Some(Box::new(Uniquifier::new())),
+        "single_char" | "single_char_filter" => Some(Box::new(SingleCharFilter::new())),
+        _ => None,
+    }
+}
+
 pub fn create_processor(ticket: &Ticket) -> Option<Box<dyn Processor + Send + Sync>> {
     match ticket.klass.as_str() {
         "ascii_composer" => Some(Box::new(AsciiComposer::new(ticket.config))),
@@ -349,6 +359,7 @@ pub fn install_engine_components(
     Vec<ComponentEntry<Box<dyn Processor + Send + Sync>>>,
     Vec<ComponentEntry<Box<dyn Segmentor + Send + Sync>>>,
     Vec<ComponentEntry<Box<dyn Translator + Send + Sync>>>,
+    Vec<ComponentEntry<Box<dyn Filter + Send + Sync>>>,
 ) {
     let processors = create_components_from_list(
         config,
@@ -371,7 +382,14 @@ pub fn install_engine_components(
         "translator",
         create_translator,
     );
-    (processors, segmentors, translators)
+    let filters = create_components_from_list(
+        config,
+        build_dir,
+        "engine/filters",
+        "filter",
+        create_filter,
+    );
+    (processors, segmentors, translators, filters)
 }
 
 #[cfg(test)]

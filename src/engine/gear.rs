@@ -22,6 +22,7 @@ pub mod abc_segmentor;
 pub mod ascii_composer;
 pub mod editor;
 pub mod fallback_segmentor;
+pub mod filter;
 pub mod matcher;
 pub mod key_binding;
 pub mod navigator;

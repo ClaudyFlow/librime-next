@@ -16,6 +16,7 @@ use crate::engine::composition::Composition;
 use crate::engine::context::Context;
 use crate::engine::gear::abc_segmentor::AbcSegmentor;
 use crate::engine::gear::fallback_segmentor::FallbackSegmentor;
+use crate::engine::gear::filter::Filter;
 use crate::engine::gear::matcher::Matcher;
 use crate::engine::gear::processor::{ProcessResult, Processor};
 use crate::engine::gear::registry::{ComponentEntry, install_engine_components};
@@ -38,6 +39,7 @@ pub struct Engine {
     translators: Vec<ComponentEntry<Box<dyn Translator + Send + Sync>>>,
     processors: Vec<ComponentEntry<Box<dyn Processor + Send + Sync>>>,
     segmentors: Vec<ComponentEntry<Box<dyn Segmentor + Send + Sync>>>,
+    filters: Vec<ComponentEntry<Box<dyn Filter + Send + Sync>>>,
     build_dir: std::path::PathBuf,
 }
 
@@ -51,6 +53,7 @@ impl Engine {
             translators: Vec::new(),
             processors: Vec::new(),
             segmentors: Vec::new(),
+            filters: Vec::new(),
             build_dir: build_dir.to_path_buf(),
         };
         engine.initialize_components();
@@ -60,8 +63,9 @@ impl Engine {
     /// C++ `ConcreteEngine::InitializeComponents`：读 `engine/processors` 与
     /// `engine/translators`，按名单逐个构造。
     fn initialize_components(&mut self) {
-        let (processors, segmentors, translators) =
+        let (processors, segmentors, translators, filters) =
             install_engine_components(&self.schema.config, &self.build_dir);
+        self.filters = filters;
         if translators.is_empty() {
             // 方案没列 `engine/translators`（或列表里全是还没移植的 translator）：
             // 退回旧的「按 dictionary/prism 直接开拼音词典」路径，保证还能打字。
@@ -124,6 +128,9 @@ impl Engine {
             entry.refresh(ctx);
         }
         for entry in &mut self.translators {
+            entry.refresh(ctx);
+        }
+        for entry in &mut self.filters {
             entry.refresh(ctx);
         }
     }
@@ -274,6 +281,32 @@ impl Engine {
             seg.selected_index = 0;
         }
         self.translators = translators;
+        self.apply_filters();
+    }
+
+    /// C++ `TranslateSegments` 里 `menu->AddFilter(...)` 那段：逐段套用 filter 链。
+    fn apply_filters(&mut self) {
+        if self.filters.is_empty() {
+            return;
+        }
+        let filters = std::mem::take(&mut self.filters);
+        for seg in self.context.composition.segmentation.segments.iter_mut() {
+            // 先把"这一段该套哪些 filter"算出来，再动 menu —— 否则会同时借用 seg 两次
+            let applicable: Vec<bool> = filters
+                .iter()
+                .map(|entry| {
+                    entry.is_enabled() && entry.component.applies_to_segment(seg)
+                })
+                .collect();
+            let Some(menu) = seg.menu.as_mut() else { continue };
+            for (entry, applies) in filters.iter().zip(applicable) {
+                if !applies {
+                    continue;
+                }
+                entry.component.apply(menu.candidates_mut());
+            }
+        }
+        self.filters = filters;
     }
 
     /// 已装配的 processor 名单（诊断用：验证 `engine/processors` 真的被读进来了）。
@@ -289,6 +322,11 @@ impl Engine {
     /// 已装配的 segmentor 名单。
     pub fn segmentor_names(&self) -> Vec<&str> {
         self.segmentors.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    /// 已装配的 filter 名单。
+    pub fn filter_names(&self) -> Vec<&str> {
+        self.filters.iter().map(|e| e.name.as_str()).collect()
     }
 
     pub fn schema_id(&self) -> &str {
@@ -312,6 +350,7 @@ impl Engine {
             translators: Vec::new(),
             processors: Vec::new(),
             segmentors: Vec::new(),
+            filters: Vec::new(),
             build_dir: std::path::PathBuf::new(),
         }
     }

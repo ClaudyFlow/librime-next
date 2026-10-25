@@ -51,6 +51,11 @@ impl Menu {
         &self.candidates
     }
 
+    /// 可变候选列表 —— 给 filter 链用（C++ 的 filter 改写的是流，这里改写列表）。
+    pub fn candidates_mut(&mut self) -> &mut Vec<Candidate> {
+        &mut self.candidates
+    }
+
     /// 取出第 `page_no` 页（每页 `page_size` 条）。`is_last_page` 由调用方据总数判断。
     pub fn page(&self, page_size: usize, page_no: usize) -> Vec<Candidate> {
         if page_size == 0 {
