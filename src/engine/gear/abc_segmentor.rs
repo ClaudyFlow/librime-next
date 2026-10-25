@@ -5,7 +5,7 @@
 //! 或分隔符。扫到第一个不合格字符为止，`[j, k)` 即一段，打 `abc` 标签 +
 //! `abc_segmentor/extra_tags` 里配的额外标签。
 
-use crate::engine::gear::segmentor::Segmentor;
+use crate::engine::gear::segmentor::{Segmentor, SegmentorView};
 use crate::engine::segmentation::{Segment, Segmentation};
 
 const DEFAULT_ALPHABET: &str = "zyxwvutsrqponmlkjihgfedcba";
@@ -63,7 +63,7 @@ impl AbcSegmentor {
 }
 
 impl Segmentor for AbcSegmentor {
-    fn proceed(&self, segmentation: &mut Segmentation) -> bool {
+    fn proceed(&self, segmentation: &mut Segmentation, _view: SegmentorView) -> bool {
         let input = segmentation.input.clone();
         let j = segmentation.current_start();
         let mut k = j;
@@ -115,7 +115,7 @@ mod tests {
     fn whole_input_becomes_one_abc_segment() {
         let s = AbcSegmentor::new(&json!({}));
         let mut seg = segs("nihao");
-        assert!(s.proceed(&mut seg));
+        assert!(s.proceed(&mut seg, SegmentorView::default()));
         assert_eq!(seg.segments.len(), 1);
         assert_eq!((seg.segments[0].start, seg.segments[0].end), (0, 5));
         assert!(seg.segments[0].tags.contains(&"abc".to_string()));
@@ -125,7 +125,7 @@ mod tests {
     fn stops_at_character_outside_alphabet() {
         let s = AbcSegmentor::new(&json!({ "speller": { "alphabet": "abc" } }));
         let mut seg = segs("abc;");
-        assert!(s.proceed(&mut seg));
+        assert!(s.proceed(&mut seg, SegmentorView::default()));
         assert_eq!(seg.segments.len(), 1);
         assert_eq!((seg.segments[0].start, seg.segments[0].end), (0, 3));
     }
@@ -134,7 +134,7 @@ mod tests {
     fn empty_segment_when_nothing_valid() {
         let s = AbcSegmentor::new(&json!({ "speller": { "alphabet": "abc" } }));
         let mut seg = segs(";");
-        assert!(s.proceed(&mut seg));
+        assert!(s.proceed(&mut seg, SegmentorView::default()));
         assert!(seg.segments.is_empty());
     }
 }

@@ -57,7 +57,13 @@ fn real_schema_assembles_processors_from_config() {
     println!("segmentors = {seg_names:?}");
     assert_eq!(
         seg_names,
-        vec!["matcher", "abc_segmentor", "punct_segmentor", "fallback_segmentor"],
+        vec![
+            "ascii_segmentor",
+            "matcher",
+            "abc_segmentor",
+            "punct_segmentor",
+            "fallback_segmentor",
+        ],
         "分段器装配必须来自配置：{seg_names:?}"
     );
     // 顺序必须与方案配置一致（luna_pinyin_simp: ascii_composer 在 speller 之前）

@@ -12,6 +12,16 @@
 
 use crate::engine::segmentation::Segmentation;
 
+/// 分段器能看到的那一点上下文（C++ 里 segmentor 持有 `Engine*`，直接读选项）。
+///
+/// lrn 的 segmentor 列表在 `calculate_segmentation` 里被 `mem::take` 出来遍历，
+/// 此时拿不到 `&Engine`（会和 `&mut segmentation` 打架），所以把需要的开关
+/// **挑出来**传进去 —— 目前只有 `ascii_mode` 一个。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SegmentorView {
+    pub ascii_mode: bool,
+}
+
 pub trait Segmentor {
-    fn proceed(&self, segmentation: &mut Segmentation) -> bool;
+    fn proceed(&self, segmentation: &mut Segmentation, view: SegmentorView) -> bool;
 }

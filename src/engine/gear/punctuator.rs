@@ -20,7 +20,7 @@ use serde_json::Value;
 
 use crate::engine::candidate::Candidate;
 use crate::engine::gear::processor::{ProcessResult, Processor};
-use crate::engine::gear::segmentor::Segmentor;
+use crate::engine::gear::segmentor::{Segmentor, SegmentorView};
 use crate::engine::gear::translator::Translator;
 use crate::engine::key_event::{KeyEvent, XK_SPACE};
 use crate::engine::segmentation::{Segment, Segmentation, SegStatus};
@@ -91,7 +91,7 @@ impl PunctSegmentor {
 }
 
 impl Segmentor for PunctSegmentor {
-    fn proceed(&self, segmentation: &mut Segmentation) -> bool {
+    fn proceed(&self, segmentation: &mut Segmentation, _view: SegmentorView) -> bool {
         let input = segmentation.input.clone();
         let k = segmentation.current_start();
         if k == input.len() {
@@ -484,7 +484,7 @@ mod tests {
             segments: vec![Segment::new(0, 3)],
         };
         seg.forward();
-        assert!(!s.proceed(&mut seg)); // exclusive
+        assert!(!s.proceed(&mut seg, SegmentorView::default())); // exclusive
         let (start, end, tags) = {
             let last = seg.segments.last().unwrap();
             (last.start, last.end, last.tags.clone())

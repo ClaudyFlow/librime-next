@@ -20,7 +20,7 @@ use crate::engine::gear::filter::Filter;
 use crate::engine::gear::matcher::Matcher;
 use crate::engine::gear::processor::{ProcessResult, Processor};
 use crate::engine::gear::registry::{ComponentEntry, install_engine_components};
-use crate::engine::gear::segmentor::Segmentor;
+use crate::engine::gear::segmentor::{Segmentor, SegmentorView};
 use crate::engine::gear::selector::Selector;
 use crate::engine::gear::speller::Speller;
 use crate::engine::gear::translator::{ScriptTranslator, Translator};
@@ -251,6 +251,9 @@ impl Engine {
     fn calculate_segmentation(&mut self, caret_pos: usize) {
         // 同样的借用规避：把组件列表取到局部再遍历
         let segmentors = std::mem::take(&mut self.segmentors);
+        let view = SegmentorView {
+            ascii_mode: self.context.get_option("ascii_mode"),
+        };
         {
             let segs = &mut self.context.composition.segmentation;
             while !segs.has_finished() {
@@ -259,7 +262,7 @@ impl Engine {
                     if !entry.is_enabled() {
                         continue;
                     }
-                    if !entry.component.proceed(segs) {
+                    if !entry.component.proceed(segs, view) {
                         break;
                     }
                 }

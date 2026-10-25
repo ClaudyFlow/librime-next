@@ -4,7 +4,7 @@
 //! 让它在界面上原样显示（"吃掉"不了的输入不会消失）。
 //! 相邻的单字符 raw 段会**合并成长 raw 段**（打字时一次次追加）。
 
-use crate::engine::gear::segmentor::Segmentor;
+use crate::engine::gear::segmentor::{Segmentor, SegmentorView};
 use crate::engine::segmentation::{Segment, Segmentation};
 
 pub struct FallbackSegmentor;
@@ -16,7 +16,7 @@ impl FallbackSegmentor {
 }
 
 impl Segmentor for FallbackSegmentor {
-    fn proceed(&self, segmentation: &mut Segmentation) -> bool {
+    fn proceed(&self, segmentation: &mut Segmentation, _view: SegmentorView) -> bool {
         if segmentation.current_segment_length() > 0 {
             return false;
         }
@@ -63,7 +63,7 @@ mod tests {
             input: ";".to_string(),
             segments: Vec::new(),
         };
-        assert!(!s.proceed(&mut seg));
+        assert!(!s.proceed(&mut seg, SegmentorView::default()));
         assert_eq!(seg.segments.len(), 1);
         assert_eq!((seg.segments[0].start, seg.segments[0].end), (0, 1));
         assert!(seg.segments[0].tags.contains(&"raw".to_string()));
@@ -76,9 +76,9 @@ mod tests {
             input: ";;".to_string(),
             segments: Vec::new(),
         };
-        assert!(!s.proceed(&mut seg)); // 第一个 ';'
+        assert!(!s.proceed(&mut seg, SegmentorView::default())); // 第一个 ';'
         seg.forward();
-        assert!(!s.proceed(&mut seg)); // 第二个 ';' 并入上一段
+        assert!(!s.proceed(&mut seg, SegmentorView::default())); // 第二个 ';' 并入上一段
         assert_eq!(seg.segments.len(), 1);
         assert_eq!((seg.segments[0].start, seg.segments[0].end), (0, 2));
     }
@@ -96,7 +96,7 @@ mod tests {
             input: "abc".to_string(),
             segments: vec![Segment::new(0, 3), Segment::new(3, 3)],
         };
-        assert!(!s.proceed(&mut seg2));
+        assert!(!s.proceed(&mut seg2, SegmentorView::default()));
         assert_eq!(seg2.segments.len(), 2);
         let _ = &seg;
     }

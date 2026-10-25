@@ -31,6 +31,7 @@ use serde_json::Value;
 use crate::engine::context::Context;
 use crate::engine::gear::abc_segmentor::AbcSegmentor;
 use crate::engine::gear::ascii_composer::AsciiComposer;
+use crate::engine::gear::ascii_segmentor::AsciiSegmentor;
 use crate::engine::gear::editor::Editor;
 use crate::engine::gear::fallback_segmentor::FallbackSegmentor;
 use crate::engine::gear::key_binder::KeyBinder;
@@ -301,6 +302,7 @@ pub fn create_processor(ticket: &Ticket) -> Option<Box<dyn Processor + Send + Sy
 pub fn create_segmentor(ticket: &Ticket) -> Option<Box<dyn Segmentor + Send + Sync>> {
     match ticket.klass.as_str() {
         "abc_segmentor" => Some(Box::new(AbcSegmentor::new(ticket.config))),
+        "ascii_segmentor" => Some(Box::new(AsciiSegmentor::new())),
         "matcher" => Some(Box::new(Matcher::new(ticket.config, &ticket.name_space))),
         "fallback_segmentor" => Some(Box::new(FallbackSegmentor::new())),
         "punct_segmentor" => Some(Box::new(PunctSegmentor::with_config(ticket.config, false))),
