@@ -25,7 +25,7 @@
 //!   按字节匹配的 Boost 子集引擎（`xform` / `erase` / `exclude_patterns` 都用它）。
 //!   子集之外的语法（环视、命名组、`(?i)`、懒惰/占有量词、POSIX 字符类、`\p{..}` …）
 //!   **编译期直接报 [`calculus::RuleError`]**（带规则原文 + 出错片段 + 字节位置），
-//!   不静默降级。真实方案的 `speller/algebra` 里一条都没用到（`tests/algebra_real_rules.rs`）。
+//!   不静默降级。真实方案的 `speller/algebra` 里一条都没用到（`test/algebra_real_rules.rs`）。
 //!
 //! ## 移植时踩到的"必须照抄"的点
 //!

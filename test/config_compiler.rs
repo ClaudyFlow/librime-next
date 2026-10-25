@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use librime_next::config::{Config, ConfigBuilder, ResourceResolver};
 
 fn load(id: &str) -> Config {
-    let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test/data");
     let resolver = ResourceResolver::new(vec![data_dir]);
     let data = ConfigBuilder::new().load_config(resolver, id);
     Config::with_data(data)

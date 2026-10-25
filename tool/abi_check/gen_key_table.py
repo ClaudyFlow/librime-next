@@ -65,7 +65,7 @@ def main() -> None:
         rows.append((keyval, name))
 
     lines = []
-    lines.append('//! 由 `tools/abi_check/gen_key_table.py` 从 C++ librime 的 `src/rime/key_table.cc` 生成。')
+    lines.append('//! 由 `tool/abi_check/gen_key_table.py` 从 C++ librime 的 `src/rime/key_table.cc` 生成。')
     lines.append('//!')
     lines.append('//! 不要手改：改 C++ 那边的表，然后重跑生成脚本。')
     lines.append('//! 对应 C++ 的 `key_names[]` + `keys_by_name[]`，即 `RimeGetKeyName()` 的全部数据。')

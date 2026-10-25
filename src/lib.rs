@@ -27,7 +27,7 @@
 //! 引擎照旧读产物、照旧用同一份 rime.dll
 //! ```
 //!
-//! 而且 30 份现成的编译产物已经备份成夹具（`fixtures/build-20261023/`），每一步都能对拍。
+//! 而且 30 份现成的编译产物已经备份成夹具（`fixture/build-20261023/`），每一步都能对拍。
 
 pub mod algo;
 pub mod c_api;
@@ -40,5 +40,5 @@ pub mod lever;
 ///
 /// **实现已归位到 config 层**（[`config::load::load_file`]）：块标量、Rime 词典的
 /// `...` 约定都是配置层的私有知识，不属于 crate 顶层。这里只保留一层 re-export，
-/// 免得外部调用点（`examples/algo_real.rs` 等）跟着改。
+/// 免得外部调用点（`example/algo_real.rs` 等）跟着改。
 pub use config::load::load_file;

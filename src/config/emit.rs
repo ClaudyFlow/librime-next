@@ -27,7 +27,7 @@
 //! （见 [`super::types::MapRef`]）。C++ 那边是 `std::map`，产物按字节序排列，和手写源
 //! 对不上；这里有意不追那个顺序，`diff` 比的是树不是字节。
 //!
-//! 标量风格这些规则逐条对拍过 30 份 librime 产物（`fixtures/build-20261023/`），
+//! 标量风格这些规则逐条对拍过 30 份 librime 产物（`fixture/build-20261023/`），
 //! 改动前请先看 [`to_yaml_string`] 的测试与 `CLI roundtrip` 的 30/30。
 //!
 //! ## 为什么返回 `Result`
@@ -257,7 +257,7 @@ mod tests {
         assert_eq!(yaml(&Item::scalar("a\nb\n")), "|\na\nb\n");
         // 作为映射值时才按 `键 + 2` 缩进（这才是实际用法：description 之类）。
         // 末尾的空行也是 yaml-cpp 的形状：夹具里 `description: |` 之后、下一个键之前
-        // 正好空一行（见 fixtures/.../yuling.schema.yaml:378-383）。
+        // 正好空一行（见 fixture/.../yuling.schema.yaml:378-383）。
         let map = Item::map();
         if let Item::Map(entries) = &map {
             entries

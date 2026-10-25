@@ -4,13 +4,13 @@
 //! 对照 C++ `ConcreteEngine::InitializeComponents`（`engine.cc:549-575`）：
 //! 名单来自方案配置，而不是硬编码 —— 这份断言就是在证明这件事。
 //!
-//! 数据：`tests/e2e/build/`（真实 `luna_pinyin_simp` 的编译产物）。
+//! 数据：`test/e2e/build/`（真实 `luna_pinyin_simp` 的编译产物）。
 
 use librime_next::engine::runtime::Engine;
 use std::path::PathBuf;
 
 fn build_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/e2e/build")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test/e2e/build")
 }
 
 #[test]

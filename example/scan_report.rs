@@ -1,7 +1,7 @@
 //! 用 lrn 正式的 `lever::scan` 扫描真实数据目录，输出识别/校验/击键报告。
 //! 用法：cargo run --example scan_report -- <数据目录>
 //!
-//! 与独立工具 `tools/rime-scan` 的算法同源；本 example 证明镜像进 lrn 后
+//! 与独立工具 `tool/rime-scan` 的算法同源；本 example 证明镜像进 lrn 后
 //! 对真实数据的输出与工具基线一致（文件数、0 误报、击键数）。
 
 use std::path::Path;

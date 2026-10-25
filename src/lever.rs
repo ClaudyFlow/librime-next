@@ -22,7 +22,7 @@
 //!
 //! 2026-10-24：这三个模块由子代理写出后**没有接进编译**（`lever.rs` 还是空壳、没有 `pub mod`），
 //! 现已接上并纳入 `cargo test`。
-//! 2026-10-25：deployment_tasks 的 8 个任务本体落地，集成测试 `tests/lever_deploy.rs`
+//! 2026-10-25：deployment_tasks 的 8 个任务本体落地，集成测试 `test/lever_deploy.rs`
 //! 用真实数据目录跑通 `WorkspaceUpdate`（12 个方案全部产出 `staging/<id>/<id>.schema.yaml`）。
 //! `deploy` 主链四步通三步，只剩 `user_dict_upgrade`（等 `dict` 的 `UserDb`）；
 //! `clean_old_log_files` 依赖 glog 日志目录机制，Rust 侧无对应物。

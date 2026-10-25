@@ -2,7 +2,7 @@
 
 > 2026-10-25 实际部署验证后整理。验证方式：用真实源布局
 > （`C:/code/Weasel-Next/Rime-Next`）跑全量 `deploy_workspace()`（19 方案 69 产物），
-> 单方案 `luna_pinyin_simp` 的 `SchemaUpdate` 部署，并与 `fixtures/build-20261023-current`
+> 单方案 `luna_pinyin_simp` 的 `SchemaUpdate` 部署，并与 `fixture/build-20261023-current`
 > 的原版编译产物做语义 diff。
 
 ---
@@ -122,7 +122,7 @@
 # 单方案部署（示例脚本）
 cargo run --manifest-path librime-next/Cargo.toml --example deploy_luna
 
-# 语义对比（我们的产物 vs fixtures 原版）
+# 语义对比（我们的产物 vs fixture 原版）
 cargo run --manifest-path librime-next/Cargo.toml --example schema_diff <our.yaml> <fixture.yaml>
 
 # 全量测试
@@ -130,7 +130,7 @@ cargo test --manifest-path librime-next/Cargo.toml
 
 # ABI 检查（需先构建 cdylib）
 cargo build --manifest-path librime-next/Cargo.toml
-librime-next/tools/abi_check/run_abi_check.sh
+librime-next/tool/abi_check/run_abi_check.sh
 ```
 
 ---
@@ -139,7 +139,7 @@ librime-next/tools/abi_check/run_abi_check.sh
 
 **目的**：用真实 dll（`target/debug/librime_next.dll` = librime-next 的 cdylib，已确认导出 `rime_get_api`、`data_size=804`）走 C ABI 做部分部署，产物与用户文件夹现有 C++ 基线（`%APPDATA%/Rime-Next/build/luna_pinyin_simp/`）逐文件对比。
 
-**方法**：`tools/abi_check/partial_deploy.c` 加载 dll → `setup` → `deployer_initialize` → `deploy` → `finalize`，沙箱 user_dir 只列 `luna_pinyin_simp`。实测 install 阶段用 shared 的 `default.yaml` 覆盖了沙箱配置，触发**全量部署**（19 方案 / 24s 完成），但聚焦对比 luna_pinyin_simp 部分。
+**方法**：`tool/abi_check/partial_deploy.c` 加载 dll → `setup` → `deployer_initialize` → `deploy` → `finalize`，沙箱 user_dir 只列 `luna_pinyin_simp`。实测 install 阶段用 shared 的 `default.yaml` 覆盖了沙箱配置，触发**全量部署**（19 方案 / 24s 完成），但聚焦对比 luna_pinyin_simp 部分。
 
 ### 结果
 
@@ -178,7 +178,7 @@ luna_pinyin_simp 的部分部署产物与 C++ 实时基线**语义完全等价**
 | `Regex::is_full_match` | fancy_regex 无此方法；构造时加 `^(?:…)$` 锚点 + `regex_full_match` helper |
 | `compose()` 从未被触发（e2e 全挂的根因） | `Engine::process_key` 补"输入变更才重组"——对齐 C++ `update_notifier → OnContextUpdate → Compose`；高亮导航不变更输入故不重组（符合 C++ 行为） |
 
-**扫描器镜像进 lrn**：`src/lever/scan.rs`（`tools/rime-scan` 算法正式化，serde_norway 解析 frontmatter，路径用 `paths` 常量）。实测与工具基线**逐位一致**：171 文件（schema 41 / dict 79 / config 7 / theme 1 / lua 37 / plugin-data 4 / essay 2）、120 个 yaml 系列摆放 0 误报、OVERALL 4,733,605 词条 avg 9.41 max 84。
+**扫描器镜像进 lrn**：`src/lever/scan.rs`（`tool/rime-scan` 算法正式化，serde_norway 解析 frontmatter，路径用 `paths` 常量）。实测与工具基线**逐位一致**：171 文件（schema 41 / dict 79 / config 7 / theme 1 / lua 37 / plugin-data 4 / essay 2）、120 个 yaml 系列摆放 0 误报、OVERALL 4,733,605 词条 avg 9.41 max 84。
 
 **测试**：lib 243（含 scan 5）+ lever_deploy 集成（真实数据目录全量 WorkspaceUpdate，231s）+ e2e 6 + 其余 14，**全过**。
 
@@ -222,7 +222,7 @@ processor 链不再是硬编码的 `Speller + Selector`。
 
 ### 验证
 
-- 新增测试 `tests/component_assembly.rs`：用真实 `luna_pinyin_simp` 产物断言
+- 新增测试 `test/component_assembly.rs`：用真实 `luna_pinyin_simp` 产物断言
   `processor_names()` 含 ascii_composer / speller / express_editor / navigator / selector，
   **且顺序来自配置**（ascii_composer 在 speller 之前）；translator 从 `engine/translators`
   产出 script_translator。
@@ -239,3 +239,37 @@ processor 链不再是硬编码的 `Speller + Selector`。
 6. `filters`：`uniquifier`（去重）/ `simplifier`（简繁）/ `single_char_filter`
 7. #19 dict corrector：`SymDeleteCollector::Collect` / `NearSearchCorrector::ToleranceSearch`
 8. UserDb：用户词典读写同步（`user_dict_manager` 目前只有接口）
+
+## 九、目录命名：强制单数，禁止缩写（2026-10-26）
+
+**规则**（用户拍板）：本仓库任何目录名**一律单数**——"永远只有一个的文件夹叫复数名，
+会造成语义错位和识别困难"；缩写只允许 `src` / `doc` 这类极通用的，其余不用。
+
+### 本次改动
+
+| 旧 | 新 | 类型 |
+|---|---|---|
+| `examples/` | `example/` | 复数 → 单数 |
+| `fixtures/` | `fixture/` | 复数 → 单数 |
+| `tools/` | `tool/` | 复数 → 单数（与宿主仓库根部的 `tool/` 对齐） |
+| `tests/` | `test/` | 复数 → 单数 |
+
+连带更新 15 个文件 / 30 处路径引用（`README.md`、`doc/STATUS.md`、源码注释、
+`test/*` 里的 `join("test/e2e/build")`、`tool/abi_check/` 下的脚本）。
+
+### 代价：`test/` 与 `example/` 必须在 Cargo.toml 里显式登记
+
+离开 cargo 约定目录名后自动发现失效，`Cargo.toml` 里逐条写了 `[[test]]` / `[[example]]`。
+**风险**：新增集成测试或 example 时，除了放文件还要同步加一段；
+漏加的话 cargo **不报错、静默跳过**。这是本次改名唯一的持续成本。
+
+### 已知冲突（改不动或建议保留，需用户定夺）
+
+- `mod tests`（`src/**` 里的单元测试模块）：Rust 生态惯用名，改了不影响编译但偏离工具链约定。
+- `target/`：cargo 输出目录，不可改。
+- `test/e2e`：`e2e` 是缩写（end-to-end），与规则冲突；业界标准写法，改成 `end_to_end` 可行但更长。
+- `sync/`：已从仓库根部清掉——它不是源码目录，而是默认 `Deployer`
+  （`user_data_dir="."`、`sync_dir="sync"` 为**相对路径**）跑同步任务时写进 CWD 的产物。
+  **真问题**：默认构造用相对路径会污染调用方当前目录，建议宿主必须注入数据目录后才允许跑同步任务。
+- 宿主 `Rime-Next/` 数据目录侧仍是 `schema` / `model` / `eassy` / `theme` / `plugin`
+  （`eassy` 是 essay 的历史拼写错误），它们已被装机版 C++ 补丁写死，改名属于安装器迁移，不在本次范围。

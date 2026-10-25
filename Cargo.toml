@@ -22,6 +22,65 @@ crate-type = ["lib", "cdylib"]
 name = "librime-next"
 path = "src/main.rs"
 
+# ---------------------------------------------------------------------------
+# 为什么下面的 [[test]] / [[example]] 要逐个手写
+#
+# 本仓库的目录命名规则：**强制单数**（"永远只有一个的文件夹不许用复数"）。
+# 所以 cargo 约定俗成的复数目录名 `tests/` 与 `examples/` 在本仓库改用单数
+# `test/` 与 `example/`；一旦离开约定目录名，cargo 的自动发现就失效，必须显式登记。
+#
+# 代价：新增一个集成测试 / example 时，除了丢文件进目录，**还要在这里加一段**。
+# 漏加的话文件不会参与构建，且 cargo 不会报错（静默跳过）——这是本次改名的主要风险。
+# ---------------------------------------------------------------------------
+
+[[test]]
+name = "algebra_real_rules"
+path = "test/algebra_real_rules.rs"
+
+[[test]]
+name = "component_assembly"
+path = "test/component_assembly.rs"
+
+[[test]]
+name = "config_compiler"
+path = "test/config_compiler.rs"
+
+[[test]]
+name = "engine_e2e"
+path = "test/engine_e2e.rs"
+
+[[test]]
+name = "key_order"
+path = "test/key_order.rs"
+
+[[test]]
+name = "lever_deploy"
+path = "test/lever_deploy.rs"
+
+[[example]]
+name = "algo_real"
+path = "example/algo_real.rs"
+
+[[example]]
+name = "deploy_diff"
+path = "example/deploy_diff.rs"
+
+[[example]]
+name = "deploy_luna"
+path = "example/deploy_luna.rs"
+
+[[example]]
+name = "prism_info"
+path = "example/prism_info.rs"
+
+[[example]]
+name = "scan_report"
+path = "example/scan_report.rs"
+
+[[example]]
+name = "schema_diff"
+path = "example/schema_diff.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 # `preserve_order`：把 `serde_json::Value::Object` 的后备映射从 `BTreeMap` 换成

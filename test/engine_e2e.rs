@@ -1,4 +1,4 @@
-//! 端到端：用真实 Rime 词典数据（tests/e2e/build/，从已装 Rime 的 build/ 拷来）
+//! 端到端：用真实 Rime 词典数据（test/e2e/build/，从已装 Rime 的 build/ 拷来）
 //! 跑通「按键 → 拼音分词 → 查词 → 候选 → 选择 → 提交」。
 //!
 //! 对照 C++ librime：同样喂 "nihao"，应能在候选里拿到「你好」并提交。
@@ -8,7 +8,7 @@ use librime_next::engine::{SelectResult, Session};
 use std::path::PathBuf;
 
 fn build_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/e2e/build")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test/e2e/build")
 }
 
 /// 把一个 ASCII 串逐个字符作为按键喂给会话。

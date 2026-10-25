@@ -10,7 +10,7 @@ LIBRIME_SRC="${LIBRIME_SRC:-C:/code/librime/src}"
 CC="${CC:-/c/Program Files/llvm-mingw/bin/gcc}"
 
 DLL="$ROOT/target/debug/librime_next.dll"
-E2E="$ROOT/librime-next/tests/e2e"
+E2E="$ROOT/librime-next/test/e2e"
 WORK="${TMPDIR:-/tmp}/rime_next_abi_check"
 USER_DIR="$WORK/user"
 
