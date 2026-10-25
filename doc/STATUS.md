@@ -185,3 +185,57 @@ luna_pinyin_simp 的部分部署产物与 C++ 实时基线**语义完全等价**
 **架构修正**：`Deployer::layout()` 不再强行覆盖 staging/prebuilt，改为忠实反映字段；硬规则执行点移到注入侧（`rime_deployer_initialize` 强制 staging=`<user>/build`、prebuilt 恒空；`set_user_data_dir` 同步重算 staging）。修复了 lever_deploy 测试因 staging 覆盖失效而写穿真实 build 目录的问题。
 
 **遗留**：真实 build 目录被失败测试运行污染（00:02-00:05 写入的 lrn 编译产物，语义等价）；待一次 C++ 真实部署恢复一致。
+
+---
+
+## 八、#20 组件机制第一批：动态装配 + processor 链（2026-10-26 凌晨）
+
+**这是能不能替换 `rime.dll` 的硬闸门之一。** C++ `ConcreteEngine::InitializeComponents`
+（`engine.cc:549-575`）读方案里的四个列表（`engine/processors` / `segmentors` /
+`translators` / `filters`）逐个从全局 Registry 创建；本批把它移植成**按名单动态装配**，
+processor 链不再是硬编码的 `Speller + Selector`。
+
+| 新增文件 | 对照 C++ | 说明 |
+|---|---|---|
+| `src/engine/gear/registry.rs` | `registry.h` + `gears_module.cc` + `engine.cc` 的 `Condition` | `Ticket` / `Condition`（`all_of` `any_of` `none_of` `!option`）/ `ComponentEntry` / `create_components_from_list` / 组件工厂 |
+| `src/engine/gear/key_binding.rs` | `gear/key_binding_processor.h` + `_impl.h` | 绑定表 + **精确匹配** + Shift 兜底 |
+| `src/engine/gear/ascii_composer.rs` | `gear/ascii_composer.cc`（装机补丁版） | 中西文切换 / 单击 Shift / 临时西文 / 大写字母进入 inline ascii |
+| `src/engine/gear/editor.rs` | `gear/editor.cc` | `express_editor`（默认）/ `fluid_editor`：空格确认、回车上屏原始串、Esc 取消、退格回退 |
+| `src/engine/gear/navigator.rs` | `gear/navigator.cc` | 插入符导航：左右 / Home / End / Ctrl+左右按音节跳 |
+
+### 两个容易踩错的 C++ 语义（实测对齐）
+
+1. **绑定查表是精确匹配，不是掩码匹配**。`KeyEvent::operator==`（`key_event.h:43-45`）
+   比的是**完整** `(keycode, modifier)`；`kModifierMask` 只用于 `repr()`。
+   后果：写 `- {accept: Return}` 的绑定**不会**被 `Release+Return` 命中
+   （`kReleaseMask` 是 bit 30，恰好在 `kModifierMask` 里）。第一版实现按掩码查表，
+   测试没过才发现。
+2. **Shift 有两次兜底**（`key_binding_processor_impl.h:22-40`）：精确匹配失败后，
+   带 Shift 时先试"把 Shift 换成 Control"，再试"去掉 Shift"；**Ctrl/Alt 按下则完全不兜底**。
+   Editor / Navigator 传 `All`，AsciiComposer 传 `None`。
+
+### 没移植的组件不会被吞掉
+
+工厂对未移植的 klass 返回 `None`，行为等同 C++ `Require` 失败：**打日志 + 跳过该项**，
+链条继续。所以列表里的 `recognizer` / `key_binder` / `punctuator` 现在只是缺席，
+不会像以前那样整条 processor 链退化为硬编码的 `Speller+Selector`。
+
+### 验证
+
+- 新增测试 `tests/component_assembly.rs`：用真实 `luna_pinyin_simp` 产物断言
+  `processor_names()` 含 ascii_composer / speller / express_editor / navigator / selector，
+  **且顺序来自配置**（ascii_composer 在 speller 之前）；translator 从 `engine/translators`
+  产出 script_translator。
+- lib 测试 243 → **270**；engine_e2e 6/6、key_order 3/3、config_compiler 2/2、
+  algebra_real_rules 8/8、lever_deploy 1（真实目录全量 WorkspaceUpdate）。
+
+### 第二批待办（按依赖顺序）
+
+1. `recognizer`（104 行 C++）：`patterns` → 段 tag，几乎所有方案都列了它
+2. `key_binder`（365 行）：开关切换 / 按键转发，简繁切换与方案切换靠它
+3. `punctuator`（439 行）：标点全半角 `Opunct` 映射
+4. `table_translator`（+1128 行）：五笔 / 郑码 / 宇浩这类**形码**方案目前完全跑不了
+5. `segmentors` 链 + `engine/segmentors` 装配（`CalculateSegmentation` 的 `Proceed` 循环）
+6. `filters`：`uniquifier`（去重）/ `simplifier`（简繁）/ `single_char_filter`
+7. #19 dict corrector：`SymDeleteCollector::Collect` / `NearSearchCorrector::ToleranceSearch`
+8. UserDb：用户词典读写同步（`user_dict_manager` 目前只有接口）

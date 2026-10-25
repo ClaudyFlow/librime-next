@@ -7,7 +7,23 @@
 //! * `speller`   —— 主处理器：可打印键入栈 / 退格 / Esc / 空格回车提交 / 数字选词
 //! * `selector`  —— 上下 / 翻页导航高亮
 
+//! 本目录按 C++ `src/rime/gear/` 的划分对齐：
+//! * `processor`   —— `ProcessResult` 与 `Processor` trait
+//! * `registry`    —— `gear/gears_module.cc` 的组件工厂 + `engine.cc` 的 `Condition` 装配
+//! * `key_binding` —— `gear/key_binding_processor.h`：`KeyEvent → action` 绑定表
+//! * `ascii_composer` —— 中西文切换（含单击 Shift / 临时西文）
+//! * `editor`      —— `express_editor` / `fluid_editor`（空格确认、回车上屏原始串…）
+//! * `navigator`   —— 插入符导航（左右 / Home / End / 音节跳）
+//! * `translator`  —— `Translator` trait + `ScriptTranslator`（拼音分词 + 查表）
+//! * `speller`     —— 主处理器：可打印键入栈 / 退格 / Esc / 空格回车提交 / 数字选词
+//! * `selector`    —— 上下 / 翻页导航高亮
+
+pub mod ascii_composer;
+pub mod editor;
+pub mod key_binding;
+pub mod navigator;
 pub mod processor;
+pub mod registry;
 pub mod selector;
 pub mod speller;
 pub mod translator;

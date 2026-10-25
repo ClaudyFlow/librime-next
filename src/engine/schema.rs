@@ -71,6 +71,18 @@ impl Schema {
         })
     }
 
+    /// 测试专用：空的方案对象（无配置树）。
+    #[cfg(test)]
+    pub fn empty_for_test() -> Schema {
+        Schema {
+            schema_id: String::new(),
+            schema_name: String::new(),
+            config: serde_json::Value::Object(serde_json::Map::new()),
+            page_size: 5,
+            select_keys: String::new(),
+        }
+    }
+
     pub fn get_string(&self, path: &str) -> Option<String> {
         self.config.pointer(path).and_then(|v| v.as_str()).map(str::to_string)
     }

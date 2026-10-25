@@ -330,6 +330,21 @@ impl Context {
         true
     }
 
+    /// C++ `engine_->sink()(text)`：不经组合**直接**把一段文本送进提交管道。
+    ///
+    /// 与 [`Self::commit`] 的区别：不走 `Composition::GetCommitText()`，也不要求当前
+    /// 正在组字 —— `commit_script_text` / `commit_comment` 以及 AsciiComposer 的
+    /// 临时西文结算（`CommitAndReset`）走的就是这条路。
+    pub fn commit_direct(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        match self.commit_text {
+            Some(ref mut s) => s.push_str(&text),
+            None => self.commit_text = Some(text),
+        }
+    }
+
     pub fn get_commit_text(&self) -> String {
         if self.get_option("dumb") {
             return String::new();
