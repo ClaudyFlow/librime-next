@@ -28,6 +28,7 @@ pub mod key_binder;
 pub mod key_binding;
 pub mod navigator;
 pub mod processor;
+pub mod punctuator;
 pub mod recognizer;
 pub mod registry;
 pub mod segmentor;

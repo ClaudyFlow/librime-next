@@ -39,10 +39,10 @@ fn real_schema_assembles_processors_from_config() {
         names.contains(&"recognizer"),
         "应有 recognizer，实际 {names:?}"
     );
-    // punctuator 还没移植：被跳过，但链条不能断
+    // 2026-10-26：punctuator 已移植（连带 punct_segmentor / punct_translator）
     assert!(
-        !names.contains(&"punctuator"),
-        "未移植组件不该混进名单：{names:?}"
+        names.contains(&"punctuator"),
+        "应有 punctuator，实际 {names:?}"
     );
     // processor 名单与方案配置同序：ascii_composer → recognizer → key_binder → speller …
     assert_eq!(
@@ -57,7 +57,7 @@ fn real_schema_assembles_processors_from_config() {
     println!("segmentors = {seg_names:?}");
     assert_eq!(
         seg_names,
-        vec!["matcher", "abc_segmentor", "fallback_segmentor"],
+        vec!["matcher", "abc_segmentor", "punct_segmentor", "fallback_segmentor"],
         "分段器装配必须来自配置：{seg_names:?}"
     );
     // 顺序必须与方案配置一致（luna_pinyin_simp: ascii_composer 在 speller 之前）

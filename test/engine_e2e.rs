@@ -246,3 +246,21 @@ fn key_binder_forwards_control_h_as_backspace() {
     let ctx = session.context().expect("应有上下文");
     assert_eq!(ctx.input, "niha", "Control+h 应等价退格，删掉最后一个字符");
 }
+
+#[test]
+fn punctuator_turns_comma_into_full_width() {
+    // 真实方案的 `punctuator/half_shape` 里 `,` 是 `{commit: "，"}`：
+    // Punctuator 吃掉按键 → punct_segmentor 打标签 → punct_translator 出候选 → 直接上屏。
+    let mut session = Session::create(&build_dir(), "luna_pinyin_simp");
+    assert!(
+        session.process_key(b',' as u32, 0),
+        "逗号应被 punctuator 消费"
+    );
+    let commit = session.take_commit();
+    assert_eq!(commit.as_deref(), Some("，"), "逗号应上屏为全角，实际 {commit:?}");
+    assert_eq!(
+        session.context().map(|c| c.input.clone()).as_deref(),
+        Some(""),
+        "已上屏的标点不该留在输入串里"
+    );
+}

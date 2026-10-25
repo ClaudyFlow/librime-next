@@ -37,6 +37,7 @@ use crate::engine::gear::key_binder::KeyBinder;
 use crate::engine::gear::filter::{Filter, SingleCharFilter, Uniquifier};
 use crate::engine::gear::matcher::Matcher;
 use crate::engine::gear::navigator::Navigator;
+use crate::engine::gear::punctuator::{PunctSegmentor, PunctTranslator, Punctuator};
 use crate::engine::gear::processor::Processor;
 use crate::engine::gear::recognizer::Recognizer;
 use crate::engine::gear::segmentor::Segmentor;
@@ -288,6 +289,7 @@ pub fn create_processor(ticket: &Ticket) -> Option<Box<dyn Processor + Send + Sy
         "fluid_editor" | "fluency_editor" => Some(Box::new(Editor::fluid(ticket.config))),
         "key_binder" => Some(Box::new(KeyBinder::new(ticket.config))),
         "navigator" => Some(Box::new(Navigator::new(ticket.config))),
+        "punctuator" => Some(Box::new(Punctuator::with_config(ticket.config, false))),
         "recognizer" => Some(Box::new(Recognizer::new(ticket.config, &ticket.name_space))),
         "selector" => Some(Box::new(Selector)),
         "speller" => Some(Box::new(Speller::new(ticket.config))),
@@ -301,6 +303,7 @@ pub fn create_segmentor(ticket: &Ticket) -> Option<Box<dyn Segmentor + Send + Sy
         "abc_segmentor" => Some(Box::new(AbcSegmentor::new(ticket.config))),
         "matcher" => Some(Box::new(Matcher::new(ticket.config, &ticket.name_space))),
         "fallback_segmentor" => Some(Box::new(FallbackSegmentor::new())),
+        "punct_segmentor" => Some(Box::new(PunctSegmentor::with_config(ticket.config, false))),
         _ => None,
     }
 }
@@ -308,6 +311,7 @@ pub fn create_segmentor(ticket: &Ticket) -> Option<Box<dyn Segmentor + Send + Sy
 /// C++ `gears_module.cc` 的 translator 部分（当前已移植的那些）。
 pub fn create_translator(ticket: &Ticket) -> Option<Box<dyn Translator + Send + Sync>> {
     match ticket.klass.as_str() {
+        "punct_translator" => Some(Box::new(PunctTranslator::with_config(ticket.config, false))),
         "script_translator" | "r10n_translator" => {
             let (dict_name, prism_name) = translator_dict_name(ticket)?;
             let dict = crate::dict::dictionary::Dictionary::open(
