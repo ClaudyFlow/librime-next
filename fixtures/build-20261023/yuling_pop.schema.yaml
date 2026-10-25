@@ -1,0 +1,295 @@
+__build_info:
+  rime_version: 1.17.0
+  timestamps:
+    default: 1792334290
+    default.custom: 0
+    key_bindings: 1790864701
+    key_bindings.custom: 0
+    symbols: 1791476714
+    symbols.custom: 0
+    yuling.custom: 0
+    yuling.schema: 1792506985
+    yuling_pop.custom: 0
+    yuling_pop.schema: 1769011658
+engine:
+  filters:
+    - "lua_filter@*yuhao.yuhao_hide_space_candidates"
+    - "lua_filter@*yuhao.yuhao_autocompletion_filter"
+    - "lua_filter@*yuhao.yuhao_single_char_only_for_full_code"
+    - "lua_filter@*yuhao.yuhao_charset_filter_common"
+    - "lua_filter@*yuhao.yuhao_charset_filter_tonggui"
+    - "lua_filter@*yuhao.yuhao_charset_filter_harmonic"
+    - "simplifier@traditionalize"
+    - "simplifier@simplify"
+    - "lua_filter@*yuhao.yuhao_charset_prioritizer_common"
+    - "lua_filter@*yuhao.yuhao_charset_prioritizer_tonggui"
+    - "lua_filter@*yuhao.yuhao_charset_prioritizer_harmonic"
+    - "lua_filter@*yuhao.yuhao_popper_hints"
+    - "lua_filter@*yuhao.yuhao_short_code_hint"
+    - "lua_filter@*yuhao.yuhao_compatible_chaifen_filter"
+    - "lua_filter@*yuhao.yuhao_chaifen_filter"
+    - uniquifier
+  processors:
+    - "lua_processor@*yuhao.yuhao_switch_proc@yuhao_macro"
+    - ascii_composer
+    - recognizer
+    - key_binder
+    - "lua_processor@*yuhao.yuhao_auto_select_postponed"
+    - speller
+    - punctuator
+    - selector
+    - navigator
+    - express_editor
+  segmentors:
+    - ascii_segmentor
+    - matcher
+    - abc_segmentor
+    - punct_segmentor
+    - fallback_segmentor
+  translators:
+    - punct_translator
+    - "history_translator@history"
+    - reverse_lookup_translator
+    - table_translator
+    - "lua_translator@*yuhao.yuhao_switch_tr@yuhao_macro"
+history:
+  initial_quality: 1
+  input: z
+  size: 9
+key_binder:
+  bindings:
+    - {accept: "Control+period", toggle: ascii_punct, when: always}
+    - {accept: "Control+Shift+period", toggle: ascii_punct, when: always}
+    - {accept: "Control+Shift+J", toggle: simplification, when: always}
+    - {accept: "Control+Shift+F", toggle: traditionalization, when: always}
+    - {accept: "Control+Shift+M", toggle: yuhao_charset_prioritizer_common, when: always}
+    - {accept: "Control+Shift+O", toggle: yuhao_charset_filter_common, when: always}
+    - {accept: 0, toggle: yuhao_charset_filter_common, when: has_menu}
+    - {accept: "/", toggle: yuhao_chaifen.off, when: has_menu}
+    - {accept: "Control+Shift+L", toggle: yuhao_compatible_chaifen_filter, when: always}
+    - {accept: "Control+Shift+D", toggle: yuhao_single_char_only_for_full_code, when: always}
+    - {accept: Tab, toggle: yuhao_single_char_only_for_full_code, when: has_menu}
+    - {accept: "Control+Shift+K", toggle: yuhao_hide_space_candidates, when: always}
+    - {accept: "Control+Shift+Y", toggle: yuhao_autocompletion_filter, when: always}
+    - {accept: semicolon, send: 2, when: has_menu}
+    - {accept: apostrophe, send: 3, when: has_menu}
+    - {accept: minus, send: Page_Up, when: has_menu}
+    - {accept: equal, send: Page_Down, when: has_menu}
+    - {accept: "Control+Shift+N", select: yuling_pop, when: always}
+    - {accept: "Control+Shift+B", select: yuling_fluency, when: always}
+    - {accept: "Control+Shift+N", select: yuling_fluency, when: always}
+    - {accept: "Control+Shift+B", select: yuling, when: always}
+menu:
+  page_size: 5
+punctuator:
+  full_shape:
+    " ": {commit: "　"}
+    "!": {commit: "！"}
+    "\"": {pair: ["“", "”"]}
+    "#": "＃"
+    "$": {commit: "￥"}
+    "%": {commit: "％"}
+    "&": "＆"
+    "'": {pair: ["‘", "’"]}
+    "(": "（"
+    ")": "）"
+    "*": "＊"
+    "+": "＋"
+    ",": {commit: "，"}
+    "-": "－"
+    .: {commit: "。"}
+    "/": {commit: "／"}
+    ":": {commit: "："}
+    ";": {commit: "；"}
+    "<": {commit: "《"}
+    "=": {commit: "＝"}
+    ">": {commit: "》"}
+    "?": {commit: "？"}
+    "@": "＠"
+    "[": {commit: "【"}
+    "\\": "、"
+    "]": {commit: "】"}
+    "^": {commit: "……"}
+    _: "——"
+    "`": "｀"
+    "{": {commit: "{"}
+    "|": {commit: "｜"}
+    "}": {commit: "}"}
+    "~": "～"
+  half_shape:
+    "!": {commit: "！"}
+    "\"": {pair: ["“", "”"]}
+    "#": "#"
+    "$": {commit: "￥"}
+    "%": "%"
+    "&": "&"
+    "'": {pair: ["‘", "’"]}
+    "(": "（"
+    ")": "）"
+    "*": "*"
+    "+": "+"
+    ",": {commit: "，"}
+    "-": "-"
+    .: {commit: "。"}
+    "/": "/"
+    ":": {commit: "："}
+    ";": {commit: "；"}
+    "<": {commit: "《"}
+    "=": {commit: "="}
+    ">": {commit: "》"}
+    "?": {commit: "？"}
+    "@": "@"
+    "[": "「"
+    "\\": "、"
+    "]": "」"
+    "^": {commit: "……"}
+    _: "——"
+    "`": "`"
+    "{": "『"
+    "|": "|"
+    "}": "』"
+    "~": {commit: "~"}
+  import_preset: symbols
+recognizer:
+  import_preset: default
+  patterns:
+    email: "^[A-Za-z][-_.0-9A-Za-z]*@.*$"
+    punct: "^/([0-9]0?|[A-Za-z]+)?$"
+    reverse_lookup: "^z([a-z]+?)*$"
+    uppercase: "^(?![`;]).*[A-Z][-_+.'0-9A-Za-z]*$"
+    url: "^(www[.]|https?:|ftp[.:]|mailto:|file:).*$|^[a-z]+[.].+$"
+reverse_lookup:
+  closing_tips: "〔全拼簡拼輸入關閉〕"
+  dictionary: yuhao_pinyin
+  preedit_format:
+    - "xform/([nl])v/$1ü/"
+    - "xform/([nl])ue/$1üe/"
+    - "xform/([jqxy])v/$1u/"
+  prefix: z
+  tips: "〔全拼簡拼輸入〕"
+schema:
+  author:
+    - "作者 朱宇浩"
+    - "官方網站 <https://shurufa.app>"
+    - "官方QQ群 735728797"
+  dependencies:
+    - yuhao_pinyin
+    - yuling_chaifen
+    - yuling_chaifen_tw
+  description: |
+    靈明輸入法之延時頂屏版,候選項唯一時不自動上屏,需要下一擊頂出候選項.
+
+  name: "靈明·頂真"
+  schema_id: yuling_pop
+  version: "乙巳冬至"
+schema_name:
+  chaifen: yuling_chaifen
+  chaifen_code_all_roots: true
+  chaifen_tw: yuling_chaifen_tw
+  code: yuling
+  code_tw: yuling_tw
+  max_code_length: 4
+  words: yuling
+simplify:
+  comment_format:
+    - "xform/^/〔/"
+    - "xform/$/〕/"
+  opencc_config: t2s.json
+  option_name: simplification
+  tags:
+    - abc
+    - reverse_lookup
+  tips: all
+speller:
+  algebra:
+    - "derive/^([a-y])([a-y])/$1z/"
+  alphabet: "zyxwvutsrqponmlkjihgfedcba/"
+  auto_select: false
+  auto_select_pattern: "[qwrtypsdfghjklxcvbnm]{0,3}[aeiou]|[qwrtypsdfghjklxcvbnm]{4}"
+  delimiter: "`"
+  initials: "zyxwvutsrqponmlkjihgfedcba/"
+switches:
+  - options: [original, yuhao_charset_prioritizer_common, yuhao_charset_prioritizer_tonggui, yuhao_charset_prioritizer_harmonic]
+    reset: 1
+    states: ["原始排序", "常用字先", "簡化字先", "傳統字先"]
+  - options: [cjk, yuhao_charset_filter_common, yuhao_charset_filter_tonggui, yuhao_charset_filter_harmonic]
+    reset: 0
+    states: ["全部漢字", "僅常用字", "僅簡化字", "僅傳統字"]
+  - name: yuhao_single_char_only_for_full_code
+    reset: 1
+    states: ["字詞同出", "主單模式"]
+  - options: [yuhao_chaifen.off, yuhao_chaifen.lv2d, yuhao_chaifen.lv3]
+    reset: 0
+    states: ["隱藏注解", "二重詳解", "多重註解"]
+  - options: [yuhao_popper_hints, yuhao_autocompletion_filter]
+    reset: 0
+    states: ["預測提示", "精確匹配"]
+  - name: yuhao_hide_space_candidates
+    reset: 0
+    states: ["有空格簡", "無空格簡"]
+  - name: yuhao_compatible_chaifen_filter
+    reset: 0
+    states: ["顯示兼容", "屏蔽兼容"]
+  - name: yuhao_chaifen_source
+    reset: 0
+    states: ["陸拆提示", "臺拆提示"]
+  - name: traditionalization
+    reset: 0
+    states: ["简保持", "简转繁"]
+  - name: simplification
+    reset: 0
+    states: ["繁保持", "繁轉簡"]
+  - name: ascii_mode
+    reset: 0
+    states: ["中文", "西文"]
+  - name: full_shape
+    reset: 0
+    states: ["半角", "全角"]
+  - name: ascii_punct
+    reset: 0
+    states: ["。，", "．，"]
+traditionalize:
+  comment_format:
+    - "xform/^/〔/"
+    - "xform/$/〕/"
+  opencc_config: s2t.json
+  option_name: traditionalization
+  tags:
+    - abc
+    - reverse_lookup
+  tips: all
+translator:
+  comment_format:
+    - "xform/^~/ /"
+  db_class: tabledb
+  dictionary: yuling
+  disable_user_dict_for_patterns:
+    - "^z.*$"
+  enable_completion: true
+  enable_encoder: false
+  enable_sentence: false
+  enable_user_dict: false
+  encode_commit_history: false
+  max_phrase_length: 4
+  preedit_format:
+    []
+  prism: yuling
+yuhao_macro:
+  funckeys:
+    macro: [0x2f]
+  macros:
+    "": [{items: [{names: [original, yuhao_charset_prioritizer_common, yuhao_charset_prioritizer_tonggui, yuhao_charset_prioritizer_harmonic], states: ["原始排序", "常用字先", "簡化字先", "傳統字先"], type: radio}, {names: [cjk, yuhao_charset_filter_common, yuhao_charset_filter_tonggui, yuhao_charset_filter_harmonic], states: ["全部漢字", "僅常用字", "僅簡化字", "僅傳統字"], type: radio}, {name: yuhao_single_char_only_for_full_code, states: ["字詞同出", "主單模式"], type: switch}, {names: [yuhao_popper_hints, yuhao_autocompletion_filter], states: ["預測提示", "精確匹配"], type: radio}, {name: yuhao_hide_space_candidates, states: ["有空格簡", "無空格簡"], type: switch}], type: menu}]
+    date: [{expr: "return os.date(\"%Y-%m-%d\")", name: "☀日期", type: eval}, {expr: "return os.date(\"%Y年%m月%d日\")", name: "⛅年月日", type: eval}]
+    dist: [{expr: "return function(args)\n  return string.format(\"librime: [%s]\", rime_api.get_rime_version())\nend\n", type: eval}, {expr: "return function(args)\n  return string.format(\"distribution: [%s](%s/%s)\",\n    rime_api.get_distribution_name(),\n    rime_api.get_distribution_code_name(),\n    rime_api.get_distribution_version())\nend\n", type: eval}]
+    div: [{name: yuhao_chaifen_source, states: ["☐陸標拆分", "☑臺標拆分"], type: switch}]
+    dot: [{name: ascii_punct, states: ["☐中文標點", "☑西文標點"], type: switch}]
+    full: [{name: full_shape, states: ["☐半角", "☑全角"], type: switch}]
+    half: [{name: full_shape, states: ["☐半角", "☑全角"], type: switch}]
+    help: [{name: yuhao_single_char_only_for_full_code, states: ["☐字詞同出", "☑主單模式"], type: switch}, {name: yuhao_hide_space_candidates, states: ["☐有空格簡", "☑無空格簡"], type: switch}, {name: yuhao_chaifen_source, states: ["☐陸標拆分", "☑臺標拆分"], type: switch}, {name: full_shape, states: ["☐半角", "☑全角"], type: switch}, {name: ascii_punct, states: ["☐中文標點", "☑西文標點"], type: switch}]
+    punc: [{name: ascii_punct, states: ["☐中文標點", "☑西文標點"], type: switch}]
+    simp: [{name: simplification, states: ["☐不轉換", "☑繁轉簡"], type: switch}]
+    space: [{name: yuhao_hide_space_candidates, states: ["☐有空格簡", "☑無空格簡"], type: switch}]
+    time: [{expr: "return os.date(\"%H:%M:%S\")", name: "⌚時間", type: eval}, {expr: "return os.date(\"%Y%m%d%H%M\")", name: "Ⓣ時間", type: eval}, {expr: "return tostring(os.time())", name: "Ⓢ時間戳", type: eval}]
+    trad: [{name: traditionalization, states: ["☐不轉換", "☑簡轉繁"], type: switch}]
+    uni: [{expr: "return require(\"yuhao.yuhao_core\").unicode()", hijack: true, type: eval}]
+    w: [{expr: "return require(\"yuhao.yuhao_core\").unicode()", hijack: true, type: eval}]

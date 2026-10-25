@@ -1,0 +1,21 @@
+# 编辑算子测试：`key/+`、`key/=`、`key/N+`、`@next`、`__merge`
+base:
+  letters: [a, b, c]
+  text: hello
+  map: {k1: v1}
+
+indexed:
+  __include: base
+  __patch:
+    letters/1+: [x, y]
+    letters/@next: z
+    text/+: " world"
+    text/=: over
+    map/k1/=: v2
+
+merged:
+  __include: base
+  __patch:
+    __merge:
+      map: {k2: v2}
+      text: merged

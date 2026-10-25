@@ -1,0 +1,169 @@
+__build_info:
+  rime_version: 1.17.0
+  timestamps:
+    default: 1792334290
+    default.custom: 0
+    key_bindings: 1790864701
+    key_bindings.custom: 0
+    symbols: 1791476714
+    symbols.custom: 0
+    tiger_sentence.custom: 0
+    tiger_sentence.schema: 1791604982
+ascii_composer:
+  good_old_caps_lock: true
+  switch_key:
+    Caps_Lock: clear
+    Control_L: noop
+    Control_R: noop
+    Shift_L: commit_code
+    Shift_R: commit_code
+engine:
+  filters:
+    - "lua_filter@tiger_sentence_buffer_filter"
+  processors:
+    - "lua_processor@tiger_sentence_ascii"
+    - recognizer
+    - "lua_processor@tiger_sentence_processor"
+    - key_binder
+    - speller
+    - punctuator
+    - selector
+    - navigator
+    - express_editor
+  segmentors:
+    - abc_segmentor
+    - punct_segmentor
+    - fallback_segmentor
+  translators:
+    - punct_translator
+    - "lua_translator@tiger_sentence_translator"
+key_binder:
+  bindings:
+    - {accept: Tab, send: Down, when: has_menu}
+    - {accept: "Shift+Tab", send: Up, when: has_menu}
+    - {accept: minus, send: Page_Up, when: paging}
+    - {accept: equal, send: Page_Down, when: has_menu}
+menu:
+  page_size: 5
+punctuator:
+  digit_separators: ""
+  full_shape:
+    " ": {commit: "　"}
+    "!": {commit: "！"}
+    "\"": {pair: ["“", "”"]}
+    "#": "＃"
+    "$": {commit: "￥"}
+    "%": {commit: "％"}
+    "&": "＆"
+    "'": {pair: ["‘", "’"]}
+    "(": "（"
+    ")": "）"
+    "*": "＊"
+    "+": "＋"
+    ",": {commit: "，"}
+    "-": "－"
+    .: {commit: "。"}
+    "/": {commit: "／"}
+    ":": {commit: "："}
+    ";": {commit: "；"}
+    "<": {commit: "《"}
+    "=": {commit: "＝"}
+    ">": {commit: "》"}
+    "?": {commit: "？"}
+    "@": "＠"
+    "[": {commit: "【"}
+    "\\": "、"
+    "]": {commit: "】"}
+    "^": {commit: "……"}
+    _: "——"
+    "`": "｀"
+    "{": {commit: "{"}
+    "|": {commit: "｜"}
+    "}": {commit: "}"}
+    "~": "～"
+  half_shape:
+    "!": {commit: "！"}
+    "\"": {pair: ["“", "”"]}
+    "#": "#"
+    "$": {commit: "￥"}
+    "%": {commit: "%"}
+    "&": "&"
+    "'": {pair: ["‘", "’"]}
+    "(": "（"
+    ")": "）"
+    "*": "*"
+    "+": "+"
+    ",": {commit: "，"}
+    "-": "-"
+    .: {commit: "。"}
+    "/": {commit: "、"}
+    ":": {commit: "："}
+    ";": {commit: "；"}
+    "<": {commit: "《"}
+    "=": {commit: "="}
+    ">": {commit: "》"}
+    "?": {commit: "？"}
+    "@": "@"
+    "[": {commit: "【"}
+    "\\": "、"
+    "]": {commit: "】"}
+    "^": {commit: "……"}
+    _: "——"
+    "`": {commit: "`"}
+    "{": {commit: "{"}
+    "|": {commit: "|"}
+    "}": {commit: "}"}
+    "~": {commit: "~"}
+  import_preset: symbols
+recognizer:
+  import_preset: default
+  patterns:
+    email: "^[A-Za-z][-_.0-9A-Za-z]*@.*$"
+    uppercase: "[A-Z][-_+.'0-9A-Za-z]*$"
+    url: "^(www[.]|https?:|ftp[.:]|mailto:|file:).*$|^[a-z]+[.].+$"
+schema:
+  author:
+    - TigerClaw
+  description: |
+    从虎整句常用字词表生成的变长整句方案。
+    码表/字频/白名单为明文 txt（tiger_sentence.codes.txt 等），运行时加载，
+    不使用 Rime 词典文件或用户覆盖层；可直接替换以导入其它形码方案。
+    整个输入由一个词条完整匹配时，候选菜单保留全部名次供手选。
+    自动选重最低码数默认为 3：分段路径中的非首选单字至少三码才按语言模型分数竞争，
+    非首选多字词仍必须显式选重；分号/引号/数字写入编码选重。
+    首次输入时用 Lua 分页加载 models/sentence-fivegram-mobile.bin 做五阶 Kneser-Ney 打分。
+    形码证据和紧凑词先验仅重排现有候选，不进入自动上屏置信度。
+
+  name: "虎整句"
+  schema_id: tiger_sentence
+  version: 1.6.20261010.1
+speller:
+  alphabet: "zyxwvutsrqponmlkjihgfedcba;';0123456789~"
+  auto_select: false
+  delimiter: " "
+  initials: "abcdefghijklmnopqrstuvwxyz~"
+switches:
+  - name: ascii_mode
+    reset: 0
+    states: ["中文", "西文"]
+  - name: ascii_punct
+    states: ["。，", "．，"]
+  - name: full_shape
+    states: ["半角", "全角"]
+  - name: tiger_sentence_early_commit
+    states: ["提前上屏关", "提前上屏开"]
+  - name: tiger_sentence_early_commit_to_preedit
+    states: ["提前上屏至应用", "提前上屏至编码"]
+  - abbrev: ["关", "弱", "中", "强"]
+    options: [tiger_sentence_correction_off, tiger_sentence_correction_weak, tiger_sentence_correction_medium, tiger_sentence_correction_strong]
+    states: ["按键纠错关", "按键纠错弱", "按键纠错中", "按键纠错强"]
+tiger_sentence:
+  auto_select_min_code_length: 3
+  high_freq_limit: 1500
+  memory_profile: compact
+  min_retained_raw_length: 0
+  option_defaults:
+    tiger_sentence_early_commit: true
+    tiger_sentence_early_commit_to_preedit: false
+    tiger_sentence_key_correction: false
+  tab_learning: true

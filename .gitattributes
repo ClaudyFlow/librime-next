@@ -1,0 +1,11 @@
+# 统一换行：仓库内一律 LF，检出时按平台转换。
+# Rust / C / Python 源码在 Windows 与 Linux 上都要能直接编译，混用换行会引发
+# "整文件被改写" 的无谓 diff。
+* text=auto eol=lf
+
+# 二进制：不做任何换行/过滤处理
+*.bin binary
+*.gz binary
+*.png binary
+*.jpg binary
+*.ico binary

@@ -1,0 +1,9 @@
+patch:
+  schema_list:
+    -
+      {schema: luna_pinyin_simp}
+__build_info:
+  rime_version: 1.17.0
+  timestamps:
+    default: 1792907566
+    default.custom: 0

@@ -1,0 +1,49 @@
+[package]
+name = "librime-next"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# ⚠️ 只给**这个工具**加真 YAML 依赖；线上 IME 用的仍是 common/src/yaml.rs 的零依赖极简解析器，
+# 不因为这里而改变装载行为。
+#
+# 为什么需要它：librime 用 yaml-cpp 写出的产物里有嵌套流式映射
+# （宇浩的 `yuhao_macro` 就是 `[{items: [{names: [...], states: [...]}]}]`），
+# 手写解析器去啃它不值当；配置层重写要的是**无损读写**，不是"够用就行"。
+#
+# network 已验证可用（index.crates.io 200）。
+[lib]
+name = "librime_next"
+path = "src/lib.rs"
+# 产出 rime.dll 替代品：cdylib 给 Weasel 前端链接；lib 留给本仓库测试/集成
+crate-type = ["lib", "cdylib"]
+
+[[bin]]
+name = "librime-next"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# `preserve_order`：把 `serde_json::Value::Object` 的后备映射从 `BTreeMap` 换成
+# `IndexMap`。**这不是性能选择，是正确性选择**：配置树的键序必须来自源文件，而不是
+# serde_json 默认的字节序重排（否则产物键序永远和手写源对不上）。
+# 影响面仅"对象的迭代/序列化顺序"（JSON 语义不变；`Value` 的 `PartialEq` 本就与键序无关）。
+serde_json = { version = "1", features = ["preserve_order"] }
+# 2026-10-24：`serde_yaml` 已归档（版本号里就是 `0.9.34+deprecated`），换成它的维护分支
+# `serde_norway`（API 一致，只改 crate 前缀）。仍然是"serde 的 YAML 插头"，语义不变。
+serde_norway = "0.9"
+# 配置树自己的映射（`config::types::MapRef`）也用它：`IndexMap::insert` 的语义恰好是
+# "已有键保持原位、新键追加到尾部"，正是合并（`__include` / `__merge` / `__patch`）要的规则。
+indexmap = "2"
+# marisa-trie 的**纯 Rust** 移植（tokuhirom，BSD-2-Clause），读 Rime 的 `.table.bin`
+# 里的字符串表用。之前试过"链接 librime deps 里编好的 libmarisa.a + 一个 C++ shim"，
+# 能跑但是引入了 C++；换成这个 crate 后整条链都是 Rust。
+# API 见 `dict/marisa.rs`：`Reader::from_bytes` + `Trie::read` 可直接吃内存里的 blob。
+rsmarisa = "0.4"
+# 正则用 `fancy-regex`（2026-10-25）：`regex` crate 是线性的、但**不支持反向引用与环视**，
+# 而真实方案里两样都在用 —— `double_pinyin_ziranma`/`_flypy` 的 `xform/([aoe])\1(\w)/$1$2/`、
+# 16 份宇浩系方案的 `recognizer/patterns/uppercase` 环视。fancy-regex 是 `regex` 的超集，
+# 普通模式仍委托给它，速度不退化；语义对齐 librime 的 `boost::regex`。
+# 仍有的两处手工翻译见 `algo/calculus.rs`。
+rusty-leveldb = "4.0.2"
+fancy-regex = "0.20.0"
