@@ -17,12 +17,14 @@
 //! * `translator`  —— `Translator` trait + `ScriptTranslator`（拼音分词 + 查表）
 //! * `speller`     —— 主处理器：可打印键入栈 / 退格 / Esc / 空格回车提交 / 数字选词
 //! * `selector`    —— 上下 / 翻页导航高亮
+//! * `chord_composer` / `streaming_chord_processor` —— 并击输入（两版实现，见各自文档）
 
 pub mod abc_segmentor;
 pub mod affix_segmentor;
 pub mod ascii_composer;
 pub mod ascii_segmentor;
 pub mod charset_filter;
+pub mod chord_composer;
 pub mod echo_translator;
 pub mod editor;
 pub mod fallback_segmentor;
@@ -46,6 +48,7 @@ pub mod selector;
 pub mod shape;
 pub mod simplifier;
 pub mod speller;
+pub mod streaming_chord_processor;
 pub mod switch_translator;
 pub mod table_translator;
 pub mod translator;

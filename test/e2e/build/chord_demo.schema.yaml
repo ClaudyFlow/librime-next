@@ -1,0 +1,62 @@
+# 并击输入（经典版 `chord_composer`）的 e2e 验证方案。
+#
+# 这份配置刻意做小，只验证"并击 → 编码串 → 转发给 speller"这条主链：
+#
+#   alphabet: a..z          —— 26 个字母都算并击键，按下集合就是"和弦"
+#   algebra: derive/^in$/ni/ —— 和弦按 **alphabet 书写顺序**拼串，{n,i} 出来是 "in"，
+#                               用一条规则换成拼音音节 "ni"
+#   bindings: Return        —— 攒下的原始输入原样上屏
+#
+# 于是「同时按 n 和 i」= 一个音节 ni，松手后照常出「你/尼/泥」候选。
+schema:
+  schema_id: chord_demo
+  name: "并击输入 (e2e 验证)"
+version: "1.0"
+
+engine:
+  processors:
+    - chord_composer
+    - ascii_composer
+    - speller
+    - punctuator
+    - selector
+    - navigator
+    - express_editor
+  segmentors:
+    - ascii_segmentor
+    - abc_segmentor
+    - punct_segmentor
+    - fallback_segmentor
+  translators:
+    - punct_translator
+    - script_translator
+  filters:
+    - uniquifier
+
+speller:
+  alphabet: "zyxwvutsrqponmlkjihgfedcba"
+  delimiter: " '"
+
+translator:
+  dictionary: luna_pinyin
+  prism: luna_pinyin_simp
+
+chord_composer:
+  alphabet: "abcdefghijklmnopqrstuvwxyz"
+  algebra:
+    # 和弦按 alphabet 的书写顺序拼串：{n,i} 出来是 "in"（i 在前），换成音节 "ni"
+    - derive/^in$/ni/
+    # 一个键也能是一个和弦；`z` 展开成整个 "nihao"，用来区分
+    # 「原始输入」（z）与「转发后的输入串」（nihao）
+    - derive/^z$/nihao/
+  bindings:
+    Return: commit_raw_input
+
+menu:
+  page_size: 9
+
+switches:
+  - name: ascii_mode
+    states: [ 中文, 西文 ]
+  - name: full_shape
+    states: [ 半角, 全角 ]

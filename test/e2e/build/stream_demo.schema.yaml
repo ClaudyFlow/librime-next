@@ -1,0 +1,64 @@
+# 流式并击（`streaming_chord_processor`）的 e2e 验证方案。
+#
+# 与经典版的区别：它不是"攒够一个和弦再结算"，而是**一边敲一边把并击码写进输入串**，
+# 靠时间判断音节边界。所以验证点也变成两条：
+#
+#   1. 两个键几乎同时落（Δt <= chord_duration_ms）⇒ 合成一串，中间**不插隔音符**；
+#   2. 隔着超过 chord_timeout_ms 再落第二个键 ⇒ 认定前一音节结束，插一个 `'`。
+#
+# 分区定义故意做窄（声母只有 n、韵母只有 i），这样"哪些键参与并击"一目了然；
+# 隔音符不配 `streaming_chord/delimiter`，走"向 speller/delimiter 要第一个非空格字符"
+# 那条回退路径（也正是真实方案的写法）。
+schema:
+  schema_id: stream_demo
+  name: "流式并击 (e2e 验证)"
+version: "1.0"
+
+engine:
+  processors:
+    - chord_composer
+    - ascii_composer
+    - speller
+    - punctuator
+    - selector
+    - navigator
+    - express_editor
+  segmentors:
+    - ascii_segmentor
+    - abc_segmentor
+    - punct_segmentor
+    - fallback_segmentor
+  translators:
+    - punct_translator
+    - script_translator
+  filters:
+    - uniquifier
+
+speller:
+  alphabet: "zyxwvutsrqponmlkjihgfedcba"
+  delimiter: " '"
+
+translator:
+  dictionary: luna_pinyin
+  prism: luna_pinyin_simp
+
+streaming_chord:
+  # 声母区 / 韵母区
+  initial_keys: "n"
+  final_keys: "i"
+  # 阈值压到 60 / 40 毫秒：e2e 里两个键挨着送，ΔΔt 远小于容差
+  chord_timeout_ms: 60
+  chord_duration_ms: 40
+  # 物理键 → 宫保代码（一对一映射，只为了证明 key_map 被读到了）
+  key_map:
+    n: n
+    i: i
+
+menu:
+  page_size: 9
+
+switches:
+  - name: ascii_mode
+    states: [ 中文, 西文 ]
+  - name: full_shape
+    states: [ 半角, 全角 ]

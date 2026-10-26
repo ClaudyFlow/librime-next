@@ -36,6 +36,7 @@ use crate::engine::gear::editor::Editor;
 use crate::engine::gear::fallback_segmentor::FallbackSegmentor;
 use crate::engine::gear::affix_segmentor::AffixSegmentor;
 use crate::engine::gear::charset_filter::CharsetFilter;
+use crate::engine::gear::chord_composer::ChordComposer;
 use crate::engine::gear::echo_translator::EchoTranslator;
 use crate::engine::gear::filter::{Filter, SingleCharFilter, Uniquifier};
 use crate::engine::gear::history_translator::HistoryTranslator;
@@ -53,6 +54,7 @@ use crate::engine::gear::selector::Selector;
 use crate::engine::gear::shape::ShapeProcessor;
 use crate::engine::gear::simplifier::Simplifier;
 use crate::engine::gear::speller::Speller;
+use crate::engine::gear::streaming_chord_processor::StreamingChordProcessor;
 use crate::engine::gear::table_translator::TableTranslator;
 use crate::engine::gear::translator::{ScriptTranslator, Translator};
 use crate::engine::gear::translator_options::TranslatorOptions;
@@ -365,6 +367,16 @@ pub fn create_filter(ticket: &Ticket) -> Option<Box<dyn Filter + Send + Sync>> {
 pub fn create_processor(ticket: &Ticket) -> Option<Box<dyn Processor + Send + Sync>> {
     match ticket.klass.as_str() {
         "ascii_composer" => Some(Box::new(AsciiComposer::new(ticket.config))),
+        // C++ `ChordComposerComponent::Create`（`chord_composer.cc:279-289`）是个**分派器**：
+        // 方案里声明了 `streaming_chord` 段就造流式版，否则造经典版。两者对外都叫
+        // `chord_composer`，配置段却是分开的（`chord_composer/` 与 `streaming_chord/`）。
+        "chord_composer" => {
+            if ticket.config.get("streaming_chord").is_some() {
+                Some(Box::new(StreamingChordProcessor::new(ticket.config)))
+            } else {
+                Some(Box::new(ChordComposer::new(ticket.config)))
+            }
+        }
         "express_editor" => Some(Box::new(Editor::express(ticket.config))),
         "fluid_editor" | "fluency_editor" => Some(Box::new(Editor::fluid(ticket.config))),
         "key_binder" => Some(Box::new(KeyBinder::new(ticket.config))),

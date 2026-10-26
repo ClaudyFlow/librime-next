@@ -1832,3 +1832,141 @@ fn default_schema_prefers_the_previously_selected_one() {
     );
 }
 
+
+// ── 并击输入（`chord_composer` / `streaming_chord_processor`）─────────────
+//
+// 两种实现的分工见各自模块文档，这里只钉三条外部可见的行为：
+//   1. 并击中时输入串是空的，但**组合态成立**，提示挂在末段 prompt 上；
+//   2. 松手后编码串被转发给 speller，候选照常出；
+//   3. 流式版靠时间切音节 —— 隔太久就插隔音符。
+
+/// `K_RELEASE_MASK`：抬键事件（宿主送 KeyUp 时带这个位）。
+use librime_next::engine::key_event::K_RELEASE_MASK;
+
+/// 按下 + 抬起（没有抬键的平台上只会有前一半，这里两半都送）。
+fn press_and_release(session: &mut Session, ch: char) {
+    assert!(session.process_key(ch as u32, 0), "按下 {ch} 应被消费");
+    assert!(
+        session.process_key(ch as u32, K_RELEASE_MASK),
+        "抬起 {ch} 应被消费"
+    );
+}
+
+#[test]
+fn chord_composer_shows_the_chord_as_a_prompt_while_holding() {
+    let mut session = new_session(&build_dir(), "chord_demo");
+    // 两个键都按住不放
+    assert!(session.process_key(b'n' as u32, 0));
+    assert!(session.process_key(b'i' as u32, 0));
+
+    let ctx = session.context().expect("引擎可读");
+    assert!(ctx.is_composing(), "并击中必须算组合态，否则宿主不画候选窗");
+    assert_eq!(ctx.input, "", "松手之前一个字符都还没进输入串");
+    assert_eq!(
+        ctx.composition.segmentation.segments.len(),
+        1,
+        "靠一个 phony 段撑着组合态"
+    );
+    let seg = &ctx.composition.segmentation.segments[0];
+    assert!(seg.has_tag("phony"), "承载提示的是临时垫的虚拟段");
+    assert!(seg.has_tag("chord_prompt"));
+    assert_eq!(
+        seg.prompt, "ni",
+        "和弦按 alphabet 顺序拼成 in，algebra 换成 ni 后当提示"
+    );
+    assert!(ctx.get_option("_chord_typing"), "要告诉宿主本方案用并击");
+}
+
+#[test]
+fn chord_composer_releases_into_the_regular_translator() {
+    let mut session = new_session(&build_dir(), "chord_demo");
+    press_and_release(&mut session, 'n');
+    press_and_release(&mut session, 'i');
+
+    {
+        let ctx = session.context().expect("引擎可读");
+        assert_eq!(ctx.input, "ni", "编码串应被转发进输入串");
+        assert_eq!(
+            ctx.composition.get_prompt(),
+            "",
+            "听完和弦就该把提示收掉"
+        );
+    }
+    let texts = candidate_texts(&mut session);
+    // 和弦只出一个音节 `ni`，所以菜单里是单字候选而不是「你好」那条双音节词
+    assert_eq!(
+        texts.first().map(String::as_str),
+        Some("你"),
+        "编码串进了 speller 就该照常出词，实际：{:?}",
+        &texts[..texts.len().min(8)]
+    );
+}
+
+#[test]
+fn chord_composer_commits_the_raw_sequence_on_return() {
+    // bindings 里 `Return: commit_raw_input` —— 并击期间攒的**原始**输入原样上屏。
+    //
+    // 这个用例必须是"原始输入 ≠ 输入串"才有效：方案里 `derive/^z$/nihao/`
+    // 让一个 `z` 展开成 "nihao"，于是
+    //   raw_sequence = "z"（用户敲的），input = "nihao"（转发出来的）。
+    // 回车若走上屏原始串会得到 "z"，走普通提交会得到 "nihao" —— 两者可区分。
+    let mut session = new_session(&build_dir(), "chord_demo");
+    press_and_release(&mut session, 'z');
+
+    {
+        let ctx = session.context().expect("引擎可读");
+        assert_eq!(ctx.input, "nihao", "和弦编码应被逐键转发进输入串");
+    }
+    let texts = candidate_texts(&mut session);
+    assert_eq!(
+        texts.first().map(String::as_str),
+        Some("你好"),
+        "多键转发的顺序必须保住（否则会得到 oahin 这种乱序），实际：{:?}",
+        &texts[..texts.len().min(8)]
+    );
+
+    assert!(session.process_key(0xff0d, 0), "回车应被组件吃掉");
+    assert_eq!(
+        session.take_commit().as_deref(),
+        Some("z"),
+        "上屏的是攒下来的原始输入，不是转发后的输入串"
+    );
+}
+
+#[test]
+fn streaming_chord_joins_keys_that_land_together() {
+    let mut session = new_session(&build_dir(), "stream_demo");
+    assert!(session.process_key(b'n' as u32, 0));
+    assert!(session.process_key(b'i' as u32, 0));
+
+    let ctx = session.context().expect("引擎可读");
+    assert_eq!(
+        ctx.input, "ni",
+        "两个键落在容差窗口内 ⇒ 同一个和弦，中间不插隔音符"
+    );
+
+    assert!(session.process_key(b'n' as u32, K_RELEASE_MASK));
+    assert!(session.process_key(b'i' as u32, K_RELEASE_MASK));
+    let texts = candidate_texts(&mut session);
+    assert_eq!(
+        texts.first().map(String::as_str),
+        Some("你"),
+        "流式版也走同一条翻译链，实际：{:?}",
+        &texts[..texts.len().min(8)]
+    );
+}
+
+#[test]
+fn streaming_chord_breaks_syllables_on_timeout() {
+    let mut session = new_session(&build_dir(), "stream_demo");
+    assert!(session.process_key(b'n' as u32, 0));
+    // 方案里 `chord_timeout_ms: 60`，睡 150ms 必然越过超时边界
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    assert!(session.process_key(b'i' as u32, 0));
+
+    let ctx = session.context().expect("引擎可读");
+    assert_eq!(
+        ctx.input, "n'i",
+        "停顿超过超时阈值 ⇒ 认定前一音节结束，插 speller 的隔音符"
+    );
+}

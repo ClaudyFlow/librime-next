@@ -11,7 +11,7 @@
 //! | `src/rime/algo/` | 1,829 | [`algo`] | **已移植** | 无（纯算法） | C++ 测试逐条对拍 + 真实方案样例 |
 //! | `src/rime/dict/` | 7,372 | [`dict`] | **已移植** | leveldb / marisa | `.bin` 读侧 + 编译链 231 测试全过 |
 //! | `src/rime/lever/` | 1,968 | [`lever`] | **已移植** | config + dict | 部署任务序列对拍，440s 测试通过 |
-//! | `src/rime/gear/` | 9,560 | [`engine::gear`] | **已移植（MVP）** | engine + dict | 拼音级 translator/processor/selector 联调 |
+//! | `src/rime/gear/` | 9,560 | [`engine::gear`] | **已移植** | engine + dict | 组件名 **35/35 全覆盖**（含并击输入两套实现）；出厂 124 个方案引用的组件 472/472 |
 //! | `src/rime/`（顶层） | ~1,700 | [`engine`] | **已移植（MVP）** | 全部 | `RimeSetup→ProcessKey→GetContext→Select→Commit` 端到端 |
 //! | `src/rime_api.{h,cc}` | — | [`c_api`] | **已移植（MVP）** | engine | `rime_get_api()` 导出 `RimeApi`，字段逐字对齐 |
 //!

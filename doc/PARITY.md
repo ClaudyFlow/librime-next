@@ -12,7 +12,7 @@
 
 | 层 | LRN | 补丁版 | 判定 |
 |---|---|---|---|
-| 输入组件 | 33 / 35 | 35 / 35 | 数量上仍缺 2 项（`chord_composer`、`streaming_chord_processor`，都是并击输入，出厂 0 引用）。**出厂 124 个方案引用的组件已 100% 覆盖**（引用加权 472/472） |
+| 输入组件 | 35 / 35 | 35 / 35 | **数量与引用加权都追平**（出厂 124 个方案引用的组件 472/472）。`chord_composer` / `streaming_chord_processor` 是并击输入，出厂 0 引用，但一个类名后面挂两套实现 —— 都做了 |
 | **整句组句（WordGraph + Poet）** | **有**，`src/engine/gear/poet.rs` + `Dictionary::lookup_from_graph` | 有，`ScriptSyllabifier::BuildSyllableGraph` + `Poet::MakeSentences` | **已对齐**（`b1b0125`）。`nihaoshijie` → 「你好世界」；`nihao` → 「你好」（精确词条不组句） |
 | 用户词典 UserDb 持久化 | **有**，`db.rs` + `level_db.rs`（rusty-leveldb）+ `user_db.rs` + `user_dictionary.rs`；`script_translator` 与 `table_translator` 两条学词链路都已打通，另补 `UnityTableEncoder` + `DictEntryIterator` | LevelDB 实装，`%APPDATA%/Rime-Next/userdb/` 下 4 个 `.userdb` 在用 | **已对齐**（拼音 + 形码双路） |
 | 语法模型 octagram grammar | **有**，`gram_db.rs` + `grammar.rs`（Darts trie + 紧凑 n-gram 编码 + 五元打分） | 有，4 个 `.gram` 共约 470 MB 在用 | **已对齐**（未提交时）。`zhongguoren` → 「中國人」排第一 |
@@ -34,9 +34,10 @@
 | `recognizer` | ✅ | 26 |
 | `selector` | ✅ | 26 |
 | `speller` | ✅ | 32 |
-| `chord_composer` | ❌ | 0 |
+| `chord_composer` | ✅ | 0（并击输入的**工厂**：方案里有 `streaming_chord` 段就走流式版，否则走经典版，见下两行） |
 | `shape_processor` | ✅ | 0（全角模式下的 ASCII 直转上屏，`gear/shape.rs`） |
-| `streaming_chord_processor` | ❌ | 0 |
+| `chord_composer`（经典版 `ChordComposer`） | ✅ | 0（`gear/chord_composer.rs`：按下集合攒成和弦，抬键结算后逐键转发给 speller） |
+| `streaming_chord_processor` | ✅ | 0（`gear/streaming_chord_processor.rs`：边敲边写输入串，靠 `chord_duration_ms` / `chord_timeout_ms` 切音节） |
 
 ### segmentor（6）
 
@@ -243,7 +244,10 @@ grep -E 'r\.Register' /c/code/librime/src/rime/gear/gears_module.cc
     **31/35 → 33/35**。这两个组件出厂引用是 0，但它们撑起的 `F4` / `Control+grave`
     方案菜单**每个用户都会用** —— 属"组件 0 引用但功能 100% 在用"。顺带接上
     `key_binder` 的 `select: .next`（原先打"尚未移植，忽略"的日志）
-12. 其余 2 项（`chord_composer`、`streaming_chord_processor`；并击输入，出厂 0 引用）
+12. ~~`chord_composer` + `streaming_chord_processor`~~ ✅ 组件 **33/35 → 35/35**，
+    引用加权不变（两者出厂都是 0 引用）。C++ 的 `ChordComposerComponent::Create`
+    是个**分派器**：方案里有 `streaming_chord` 段就造流式版，否则造经典版 ——
+    两套都是约 300/490 行的完整实现，所以都做了。
 
 | 日期 | 变更 |
 |---|---|
@@ -265,3 +269,4 @@ grep -E 'r\.Register' /c/code/librime/src/rime/gear/gears_module.cc
 | 2026-10-26 | `default.yaml` 的解析路径对齐：补丁版全程走 `Config::Require("config")->Create("default")`，那个解析器的根是**用户目录、回退根是共享目录**（`service.cc:167-172`）。LRN 原来两处（编译 schema 的基准配置、方案清单的回退来源）都硬写成 `shared_data_dir/default.yaml`，用户改过 `%APPDATA%/Rime-Next/default.yaml` 时会被忽略。改成 `default_config_path()` 用户优先 + 共享回退。全量 **519 passed / 0 failed** |
 | 2026-10-26 | `echo_translator` ✅（兜底回显）：组件 **30/35 → 31/35**。C++ 靠 `EchoTranslation::Compare` 检查 `other->exhausted()` 实现"别处有料就自尽"，LRN 的翻译器之间没有协商通道，改用 `Translator::is_fallback()` 标记 + runtime 延后合并，语义等价（单一 `quality` 排序做不到"根本不出现"）。e2e：`vvv` 切不出音节 → 只剩 raw 候选「vvv」且能原样上屏；`nihao` → 有「你好」时兜底让位。全量 **525 passed / 0 failed** |
 | 2026-10-26 | **`Switcher` 方案菜单** ✅：`src/engine/switcher.rs` + `gear/switch_translator.rs` + `gear/schema_list_translator.rs`，组件 **31/35 → 33/35**。C++ 的 `Switcher` 同时是 `Processor` 和独立 `Engine`（靠 `set_active_engine` 让宿主切读它的 context），Rust 没有多继承，**菜单直接写主引擎的 `Context`** 就不需要那套转发。方案切换要"登记 + 延迟执行"（组件自己就在 processors 链里，同步重建会被列表归位覆盖）。e2e 8 条：`F4` 开菜单（方案在前·当前方案第一·开关在后）、Esc 关、再按 F4 跳下一个方案、开关翻转并落盘 `user.yaml`、单选组互斥、切方案后引擎重建仍能打字、`.default` 按 `previously_selected_schema` 挑方案。`Menu::prepare` 这里刻意**不调** —— 候选顺序是建菜单时算好的。全量 **557 passed / 0 failed** |
+| 2026-10-26 | **并击输入 ✅（组件计数追平 35/35）**：`gear/chord_composer.rs`（经典版）+ `gear/streaming_chord_processor.rs`（流式版），工厂按 `streaming_chord` 段分派。把 C++ 的两条 notifier 通道显式化：`Processor` trait 加 `on_attach` / `on_context_update` / `on_unhandled_key`（C++ 是组件在构造函数里 `connect`，Rust 的 `Context` 是纯数据，改由引擎在对应时机逐个通知）。顺带两处修正：① 合成键队列从 **LIFO 改 FIFO** —— `send_sequence` 与并击编码都是**有序**的，`Vec::pop()` 会把它们整个倒过来；② C++ `CommitRawInput` 在当前版本是死胡同（`set_input` → `Compose` 重建分段 → `ClearNonConfirmedComposition` 又全拆掉 → `Commit()` 拒绝），补一次直上屏，否则用户敲的原始输入凭空消失。e2e 5 条：并击期间输入串为空但 `IsComposing()` 成立且提示挂在末段 prompt、松手后编码串进 speller 出「你」、`Return` 上屏的是**原始**输入（`z`）而非转发后的（`nihao`）、流式版同窗落键不插隔音符、超时落键插 `'`。全量 **580 passed / 0 failed** |

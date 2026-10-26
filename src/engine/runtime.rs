@@ -44,7 +44,11 @@ pub struct Engine {
     segmentors: Vec<ComponentEntry<Box<dyn Segmentor + Send + Sync>>>,
     filters: Vec<ComponentEntry<Box<dyn Filter + Send + Sync>>>,
     /// 组件请求引擎代转的按键队列（见 [`Engine::enqueue_synthetic_key`]）。
-    synthetic_queue: Vec<KeyEvent>,
+    ///
+    /// 每项是 `(按键, 未命中时是否直接上屏该字符)`。第二个字段专为
+    /// `chord_composer` 而设：它 `FinishChord` 时把和弦编码逐键转发，若某键谁都
+    /// 不吃（典型是空格），C++ 直接 `CommitText` 上屏（`chord_composer.cc:228-231`）。
+    synthetic_queue: std::collections::VecDeque<(KeyEvent, bool)>,
     build_dir: std::path::PathBuf,
     /// 数据根列表，按 **C++ `ResourceResolver` 的查找顺序**：用户目录优先、共享目录其次。
     ///
@@ -108,7 +112,7 @@ impl Engine {
             processors: Vec::new(),
             segmentors: Vec::new(),
             filters: Vec::new(),
-            synthetic_queue: Vec::new(),
+            synthetic_queue: std::collections::VecDeque::new(),
             build_dir: build_dir.to_path_buf(),
             data_roots,
             default_config,
@@ -194,6 +198,22 @@ impl Engine {
             self.segmentors = segmentors;
         }
         self.refresh_component_conditions();
+        // C++ 的组件在**构造函数里**就能碰 `engine_->context()`（`ChordComposer` 靠它
+        // 打 `_chord_typing`，`chord_composer.cc:48`）。Rust 的构造只拿得到方案配置树，
+        // 所以装配完补一个 attach 阶段 —— 顺序上必须晚于 `refresh_component_conditions`，
+        // 否则 `when:` 有条件、此刻还没启用/禁用的组件会被误通知。
+        self.attach_processors();
+    }
+
+    /// 装配完成后的组件初始化（对照 C++ 组件构造函数里对 `context()` 的副作用）。
+    fn attach_processors(&mut self) {
+        let mut processors = std::mem::take(&mut self.processors);
+        for entry in processors.iter_mut() {
+            if entry.is_enabled() {
+                entry.component.on_attach(self);
+            }
+        }
+        self.processors = processors;
     }
 
     /// C++ `UpdateComponentConditions`：opoption 变化后重算每个组件的启用状态。
@@ -228,17 +248,39 @@ impl Engine {
         // 代转的）不上屏，所以不记；C++ 同样用 `synthetic` 参数跳过。
         if !result {
             self.context.commit_history.push_key(key);
+            // `engine.cc:193`：`unhandled_key_notifier` 是**无条件**发的（只在
+            // `commit_history` 那里看 `synthetic`），所以合成键同样通知。
+            self.notify_unhandled_key(key);
         }
         // 组字状态可能改变了 option（如 AsciiComposer 切 ascii_mode），重算启用条件
         self.refresh_component_conditions();
-        // 组件代转的按键（key_binder 的 send / send_sequence）：此时处理器列表已归位
-        while let Some(synthetic) = self.synthetic_queue.pop() {
-            if self.run_processor_chain(&synthetic) {
+        // 组件代转的按键（key_binder 的 send / send_sequence、chord_composer 的
+        // 和弦编码）：此时处理器列表已归位。
+        //
+        // **必须 FIFO**：`send_sequence: "{Control+a}{BackSpace}"` 与并击和弦
+        // `"abc"` 都是有意义的**顺序**，早年这里用 `Vec::pop()`（LIFO）会把它们
+        // 整个倒过来。C++ 是同步递归、天然保序。
+        //
+        // 处理中新登记的按键追加到队尾（`enqueue_synthetic_key` 往同一队列 push），
+        // 于是"嵌套转发"排在当前批次之后，同样保序。
+        while let Some((synthetic, commit_if_unhandled)) = self.synthetic_queue.pop_front() {
+            let handled = self.run_processor_chain(&synthetic);
+            if handled {
                 result = true;
+            } else {
+                if commit_if_unhandled && (0x20..=0x7e).contains(&synthetic.keycode) {
+                    // C++ `chord_composer.cc:228-231`：转发失败 ⇒ 该字符直接上屏
+                    self.context
+                        .commit_raw_text((synthetic.keycode as u8 as char).to_string());
+                }
+                self.notify_unhandled_key(&synthetic);
             }
             self.refresh_component_conditions();
         }
         if self.context.input != input_before {
+            // `Context::PushInput` 等发 `update_notifier` ⇒ `ConcreteEngine::OnContextUpdate`
+            // ⇒ `Compose`。两条都在这里补：先通知组件，再重算。
+            self.notify_context_update();
             self.compose();
         }
         // 提交可能发生在任何一个 processor 里（editor 的 space / enter / 数字键），
@@ -249,6 +291,29 @@ impl Engine {
             self.apply_schema(&schema_id);
         }
         result
+    }
+
+    /// 逐个通知处理器：这个键整条链都没吃下（C++ `unhandled_key_notifier`）。
+    fn notify_unhandled_key(&mut self, key: &KeyEvent) {
+        // 借用规避：`processors` 取到局部，组件才能拿到 `&mut Engine`
+        let mut processors = std::mem::take(&mut self.processors);
+        for entry in processors.iter_mut() {
+            if entry.is_enabled() {
+                entry.component.on_unhandled_key(self, key);
+            }
+        }
+        self.processors = processors;
+    }
+
+    /// 逐个通知处理器：上下文变了（C++ `Context::update_notifier`）。
+    fn notify_context_update(&mut self) {
+        let mut processors = std::mem::take(&mut self.processors);
+        for entry in processors.iter_mut() {
+            if entry.is_enabled() {
+                entry.component.on_context_update(self);
+            }
+        }
+        self.processors = processors;
     }
 
     /// C++ `Engine::ApplyCommit(commit_entry)`：把刚提交的内容交给各翻译器学词。
@@ -284,9 +349,18 @@ impl Engine {
     ///
     /// 于是改成**排队**：组件登记按键，主循环结束后由 [`Engine::process_key`]
     /// 逐条重放。行为等价 —— 原处理器链在 key_binder 返回 `Accepted` 时就停了，
-    /// 不存在"转发赶不上后续处理器"的差别。
+    /// 不存在"转发赶不上后续处理器"的差别。队列是 **FIFO** 的，多键序列保序。
     pub fn enqueue_synthetic_key(&mut self, key: KeyEvent) {
-        self.synthetic_queue.push(key);
+        self.synthetic_queue.push_back((key, false));
+    }
+
+    /// 同上，但**没人吃下这个键时把该字符直接上屏**。
+    ///
+    /// 对应 C++ `ChordComposer::FinishChord` 里那一支（`chord_composer.cc:228-231`）：
+    /// 和弦编码逐键转发，`ProcessSyntheticKey` 返回 false 就 `CommitText` ——
+    /// 典型场景是 `output_format` 把和弦映射成空格，而空格在空闲态无人接管。
+    pub fn enqueue_synthetic_key_with_fallback(&mut self, key: KeyEvent) {
+        self.synthetic_queue.push_back((key, true));
     }
 
     /// 跑一遍处理器链（[`Engine::process_key`] 与合成按键重放共用）。
@@ -582,7 +656,7 @@ impl Engine {
             processors: Vec::new(),
             segmentors: Vec::new(),
             filters: Vec::new(),
-            synthetic_queue: Vec::new(),
+            synthetic_queue: std::collections::VecDeque::new(),
             build_dir: std::path::PathBuf::new(),
             data_roots: Vec::new(),
             default_config: serde_json::Value::Object(serde_json::Map::new()),

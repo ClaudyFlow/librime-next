@@ -167,6 +167,13 @@ impl KeyEvent {
     pub fn alt(&self) -> bool {
         self.modifier & K_MOD1_MASK != 0
     }
+    pub fn super_key(&self) -> bool {
+        self.modifier & K_SUPER_MASK != 0
+    }
+    /// C++ `KeyEvent::caps()`：`kLockMask` 位（CapsLock 压下的状态）。
+    pub fn caps(&self) -> bool {
+        self.modifier & K_LOCK_MASK != 0
+    }
     pub fn release(&self) -> bool {
         self.modifier & K_RELEASE_MASK != 0
     }
@@ -265,6 +272,37 @@ impl KeyEvent {
         let keycode = keycode_by_name(&repr[start..])?;
         Some(KeyEvent::new(keycode, modifier))
     }
+}
+
+/// C++ `KeySequence::repr()`：把一串按键拼回可被 [`KeyEvent::parse_sequence`] 读回的串。
+///
+/// 三条规则（`key_event.cc:100-114`）：
+/// 1. 单键表示长度就是 1（如 `"a"`）⇒ 原样拼；
+/// 2. 无修饰、可打印、且不是 `{`/`}` 的键 ⇒ 输出该字符本身（`{` 必须转义成 `"{brace}"`，
+///    否则解析时会被当成转义起始）；
+/// 3. 其余 ⇒ `{...}` 包起来，如 `"{Control+space}"`。
+///
+/// 并击输入靠它把"和弦里的键"变成编码串（`chord_composer.cc:180-189`），
+/// 所以**没有分隔符**——`{a,b,c}` 出来就是 `"abc"`。
+pub fn key_sequence_repr(keys: &[KeyEvent]) -> String {
+    let mut out = String::new();
+    for key in keys {
+        let repr = key.repr();
+        if repr.len() == 1 {
+            out.push_str(&repr);
+        } else if key.modifier == 0
+            && (0x20..=0x7e).contains(&key.keycode)
+            && key.keycode != u32::from(b'{')
+            && key.keycode != u32::from(b'}')
+        {
+            out.push(key.keycode as u8 as char);
+        } else {
+            out.push('{');
+            out.push_str(&repr);
+            out.push('}');
+        }
+    }
+    out
 }
 
 /// 键码 → 名字（C++ `RimeGetKeyName()`：取**第一个**匹配项）。
