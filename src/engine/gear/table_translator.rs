@@ -35,8 +35,6 @@
 //!
 //! * `MakeSentence`（`table_translator.cc:383-478`）—— 形码整句输入（多词连打）。
 //!   `enable_sentence` 默认 true，但缺了它只是"多词连打不出整句候选"，逐词输入不受影响。
-//! * `encode_commit_history`（`table_translator.cc:327-353`）—— 从提交历史里学多词短语。
-//!   它要 `Context::commit_history()`，而 LRN 的 `Context` 还没记这份历史。
 //! * `enable_charset_filter` / `ContextualWeighted`（grammar 加权）。
 
 use std::collections::HashSet;
@@ -46,6 +44,7 @@ use crate::dict::dictionary::Dictionary;
 use crate::dict::user_dictionary::{UserDictEntryIterator, UserDictionary};
 use crate::dict::vocabulary::DictEntry;
 use crate::engine::candidate::Candidate;
+use crate::engine::commit_history::CommitHistory;
 use crate::engine::gear::translator::Translator;
 use crate::engine::gear::translator_options::TranslatorOptions;
 use crate::engine::gear::unity_table_encoder::UnityTableEncoder;
@@ -75,6 +74,11 @@ pub struct TableTranslator {
     pub user_dict: Option<UserDictionary>,
     /// `encoder_`：规则编码器（`enable_encoder` 且用户词典可用时才有）。
     pub encoder: Option<UnityTableEncoder>,
+    /// `encode_commit_history`：学短语时顺手把"历史上连续提交的几个词"也编码。
+    /// C++ 默认 **true**（`table_translator.h:45`）。
+    pub encode_commit_history: bool,
+    /// `max_phrase_length`：`encode_commit_history` 拼到多长就停。默认 5。
+    pub max_phrase_length: i32,
 }
 
 impl TableTranslator {
@@ -84,6 +88,8 @@ impl TableTranslator {
             options,
             user_dict: None,
             encoder: None,
+            encode_commit_history: true,
+            max_phrase_length: 5,
         }
     }
 
@@ -219,7 +225,12 @@ impl TableTranslator {
 }
 
 impl Translator for TableTranslator {
-    fn query(&mut self, input: &str, segment: &mut Segment) -> Vec<Candidate> {
+    fn query(
+        &mut self,
+        input: &str,
+        segment: &mut Segment,
+        _history: &crate::engine::commit_history::CommitHistory,
+    ) -> Vec<Candidate> {
         if !self.options.has_any_tag(&segment.tags) {
             return Vec::new();
         }
@@ -304,7 +315,7 @@ impl Translator for TableTranslator {
     ///    （键里再套一层 `\x7fenc\x1f`，下次查不到）。
     /// 2. 多字词再交给编码器算一个"按规则拼出来的码"存进去
     ///    （`elements.len() > 1` 才算 —— 单字不需要造词）。
-    fn memorize(&mut self, elements: &[DictEntry]) -> bool {
+    fn memorize(&mut self, elements: &[DictEntry], history: &CommitHistory) -> bool {
         if self.user_dict.is_none() {
             return false;
         }
@@ -322,19 +333,72 @@ impl Translator for TableTranslator {
 
         // ② 造词：多字短语交给规则编码器
         let encoder_ready = self.encoder.as_ref().is_some_and(|e| e.loaded());
-        if !encoder_ready || elements.len() <= 1 {
+        if !encoder_ready {
             return true;
         }
-        let phrase: String = elements.iter().map(|e| e.text.as_str()).collect();
-        if phrase.is_empty() {
-            return true;
-        }
-        if let Some(encoder) = self.encoder.as_ref() {
-            if let Some(user_dict) = self.user_dict.as_mut() {
-                encoder.encode_phrase(&self.dict, user_dict, &phrase, "1");
+        if elements.len() > 1 {
+            let phrase: String = elements.iter().map(|e| e.text.as_str()).collect();
+            if !phrase.is_empty() {
+                if let Some(encoder) = self.encoder.as_ref() {
+                    if let Some(user_dict) = self.user_dict.as_mut() {
+                        encoder.encode_phrase(&self.dict, user_dict, &phrase, "1");
+                    }
+                }
             }
         }
+
+        // ③ `encode_commit_history`：从历史里把"连续几个形码词"拼成短语也编一遍
+        self.encode_from_history(history);
         true
+    }
+}
+
+impl TableTranslator {
+    /// `encode_commit_history`（`table_translator.cc:326-354`）。
+    ///
+    /// 场景：用户连着打了「中」「国」「人」三个单字（三次提交），各自学过了，
+    /// 但「中国人」这个**短语**没学过。这里从历史尾部往前凑，凑到 2、3、4、5 个字
+    /// 就各编一次码（`"0"` 表示"这几个字连起来用"），下次打整串码就能直接出短语。
+    ///
+    /// 三个照抄的细节：
+    ///
+    /// 1. **末尾的标点先跳过**（`if (it->type == "punct") ++it`）——「中国！」之后
+    ///    仍然能凑出「中国」；
+    /// 2. 只接受 `table` / `user_table` / `sentence` / `uniquified` 四种记录，
+    ///    遇到别的（`script`、`raw`、`punct`）立即停 —— 形码方案里混进拼音词
+    ///    拼出来的短语没有意义；
+    /// 3. **第一次循环不编码**，只把最后一个词记成 `phrase`，从第二次起才
+    ///    "前面再叠一个词"然后编码。
+    fn encode_from_history(&mut self, history: &CommitHistory) {
+        if !self.encode_commit_history || history.is_empty() {
+            return;
+        }
+        let mut records = history.iter_rev().peekable();
+        if records.peek().map(|r| r.kind == "punct").unwrap_or(false) {
+            records.next();
+        }
+        let mut phrase = String::new();
+        for record in records {
+            if !matches!(
+                record.kind.as_str(),
+                "table" | "user_table" | "sentence" | "uniquified"
+            ) {
+                break;
+            }
+            if phrase.is_empty() {
+                // 最后一个词：只记下，不编码
+                phrase = record.text.clone();
+                continue;
+            }
+            phrase = format!("{}{}", record.text, phrase);
+            if phrase.chars().count() as i32 > self.max_phrase_length {
+                break;
+            }
+            if let (Some(encoder), Some(user_dict)) = (self.encoder.as_ref(), self.user_dict.as_mut())
+            {
+                encoder.encode_phrase(&self.dict, user_dict, &phrase, "0");
+            }
+        }
     }
 }
 

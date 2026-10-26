@@ -172,6 +172,13 @@ impl Engine {
     pub fn process_key(&mut self, key: &KeyEvent) -> bool {
         let input_before = self.context.input.clone();
         let mut result = self.run_processor_chain(key);
+        // `ConcreteEngine::ProcessKey`（`engine.cc:180-182`）：**没被任何 processor
+        // 吃掉**的按键记进提交历史 —— 空格、数字、退格这些"物理穿过"的键靠它，
+        // 打完 `3` 再打 `.` 时 punctuator 才知道上一条是数字。合成键（key_binder
+        // 代转的）不上屏，所以不记；C++ 同样用 `synthetic` 参数跳过。
+        if !result {
+            self.context.commit_history.push_key(key);
+        }
         // 组字状态可能改变了 option（如 AsciiComposer 切 ascii_mode），重算启用条件
         self.refresh_component_conditions();
         // 组件代转的按键（key_binder 的 send / send_sequence）：此时处理器列表已归位
@@ -202,9 +209,12 @@ impl Engine {
         }
         // 同样的借用规避：`memorize` 要 `&mut self`，先把列表取到局部
         let mut translators = std::mem::take(&mut self.translators);
+        // 提交历史按值拷一份（≤20 条）：`translators` 已经移出 `self`，
+        // 这里只是为了让下面的循环不必反复借 `self.context`
+        let history = self.context.commit_history.clone();
         for entry in &mut translators {
             if entry.is_enabled() {
-                entry.component.memorize(&elements);
+                entry.component.memorize(&elements, &history);
             }
         }
         self.translators = translators;
@@ -350,6 +360,9 @@ impl Engine {
     fn translate_segments(&mut self) {
         let mut translators = std::mem::take(&mut self.translators);
         let input = self.context.composition.segmentation.input.clone();
+        // 提交历史要按值拷一份：`segs` 借的是 `self.context` 的可变字段，
+        // 不能再同时借 `self.context.commit_history`（最多 20 条，拷贝可忽略）。
+        let history = self.context.commit_history.clone();
         let segs = &mut self.context.composition.segmentation.segments;
         for seg in segs.iter_mut() {
             if seg.status >= SegStatus::Guess {
@@ -369,7 +382,7 @@ impl Engine {
                 if !entry.is_enabled() {
                     continue;
                 }
-                for mut c in entry.component.query(text, seg) {
+                for mut c in entry.component.query(text, seg, &history) {
                     // translator 返回的是**相对本段**的位置，这里还原成绝对偏移
                     c.start += seg.start;
                     c.end += seg.start;

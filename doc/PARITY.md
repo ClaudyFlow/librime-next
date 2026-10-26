@@ -12,7 +12,7 @@
 
 | 层 | LRN | 补丁版 | 判定 |
 |---|---|---|---|
-| 输入组件 | 24 / 35 | 35 / 35 | 落后，缺 11 项；出厂方案实际只引用其中 2 项（`history_translator` 12、`affix_segmentor` 6） |
+| 输入组件 | 25 / 35 | 35 / 35 | 落后，缺 10 项；出厂方案实际只引用其中 1 项（`affix_segmentor` 6） |
 | **整句组句（WordGraph + Poet）** | **有**，`src/engine/gear/poet.rs` + `Dictionary::lookup_from_graph` | 有，`ScriptSyllabifier::BuildSyllableGraph` + `Poet::MakeSentences` | **已对齐**（`b1b0125`）。`nihaoshijie` → 「你好世界」；`nihao` → 「你好」（精确词条不组句） |
 | 用户词典 UserDb 持久化 | **有**，`db.rs` + `level_db.rs`（rusty-leveldb）+ `user_db.rs` + `user_dictionary.rs`；`script_translator` 与 `table_translator` 两条学词链路都已打通，另补 `UnityTableEncoder` + `DictEntryIterator` | LevelDB 实装，`%APPDATA%/Rime-Next/userdb/` 下 4 个 `.userdb` 在用 | **已对齐**（拼音 + 形码双路） |
 | 语法模型 octagram grammar | **有**，`gram_db.rs` + `grammar.rs`（Darts trie + 紧凑 n-gram 编码 + 五元打分） | 有，4 个 `.gram` 共约 470 MB 在用 | **已对齐**（未提交时）。`zhongguoren` → 「中國人」排第一 |
@@ -58,7 +58,7 @@
 | `script_translator` | ✅ | 10 |
 | `r10n_translator`（`ScriptTranslator` 别名） | ✅ | 0 |
 | `reverse_lookup_translator` | ✅ | **18** |
-| `history_translator` | ❌ | **12** |
+| `history_translator` | ✅ | **12** |
 | `echo_translator` | ❌ | 0 |
 | `schema_list_translator` | ❌ | 0 |
 | `switch_translator` | ❌ | 0 |
@@ -184,9 +184,9 @@ grep -E 'r\.Register' /c/code/librime/src/rime/gear/gears_module.cc
 3. ~~UserDb 持久化~~ ✅ 字典层 + `script_translator` 学词闭环 + `table_translator`
    学词闭环（`UnityTableEncoder` + `DictEntryIterator` + `lookup_words`）
 4. ~~`reverse_lookup_translator` + `reverse_lookup_filter`~~ ✅ 18 个文件
-5. `history_translator` —— 12 个文件　**← 继续做**
-6. `affix_segmentor` —— 6 个文件
-7. 其余 8 项（出厂 0 引用，按需再补）
+5. ~~`history_translator`~~ ✅ 12 个文件（连带落地 `commit_history` 底盘）
+6. `affix_segmentor` —— 6 个文件　**← 继续做**
+7. 其余 9 项（出厂 0 引用，按需再补）
 
 | 日期 | 变更 |
 |---|---|
@@ -200,3 +200,4 @@ grep -E 'r\.Register' /c/code/librime/src/rime/gear/gears_module.cc
 | 2026-10-26 | grammar 落地：`gram_db.rs`（Darts + MappedFile）、`grammar.rs`（encode + Octagram 五元打分）、`data_roots` 架构。实测 `zhongguoren`→「中國人」；单测证明 `中国` 6.83 > `中果` -1.55 |
 | 2026-10-26 | **UserDb 字典层落地**：`db.rs`（Db/DbAccessor/Transactional/Source/Sink）、`level_db.rs`（rusty-leveldb + 游标关进 Mutex）、`user_db.rs`（值格式 + `%g` 对齐 + 快照 + merger/importer）、`user_dictionary.rs`（DFS 查询 + 学词 + 事务）。实测：真实 `luna_pinyin.userdb` 读出 1257 条；真实 prism/table 上 `nihao` 捞出用户词「你好」，预测分支捞出「你好吗」 |
 | 2026-10-26 | **学词闭环打通**：`Candidate.entry` 带词条 → `Context::collect_commit_elements` → `Engine::apply_commit` → `Translator::memorize` → `UserDictionary::UpdateEntry`。实测：`nihao` 选「你好」后 `<user>/userdb/luna_pinyin.userdb` 出现 `ni hao \t你好` / `c=1`；新会话再打 `nihao`，首候选 quality 99994（用户词典基数 1e5 + 对数权重），排在词表词条前面 |
+| 2026-10-26 | `history_translator` ✅ + `Context::commit_history` 底盘：组件 **24/35 → 25/35**，引用加权 **454/472 → 466/472（99%）**。顺带解锁 `table_translator` 的 `encode_commit_history`（从历史里拼短语再编码）。`Translator::query` 加 `&CommitHistory` 入参、`memorize` 同理。全量 **469 passed / 0 failed** |

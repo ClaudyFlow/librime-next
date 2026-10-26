@@ -1014,3 +1014,109 @@ fn reverse_lookup_filter_fills_codes() {
     assert_eq!(list[0].comment, "ni", "没注释的候选应被补上反查码");
     assert_eq!(list[1].comment, "已有的", "默认不覆盖别人的注释");
 }
+
+// ── 提交历史（history_translator）──────────────────────────────────────────
+
+/// 提交历史的最小闭环：提交一个词 → 打触发键 → 该词作为候选出现。
+///
+/// 这条链路验证的是 `Context::commit_history` 本身：`commit()` / 整段 `select()`
+/// 都要把记录写进去，`history_translator` 再从里面倒着取。任何一环断了都表现为
+/// "打 z 什么都不出"。
+#[test]
+fn history_translator_offers_recently_committed_words() {
+    let mut session = new_session(&build_dir(), "history_demo");
+    assert!(session.engine.is_some(), "history_demo 引擎应加载");
+
+    // 1. 先正常打「你好」并提交，让它进历史
+    type_ascii(&mut session, "nihao");
+    let candidates = candidate_list(&mut session);
+    let index = candidates
+        .iter()
+        .position(|c| c.text == "你好")
+        .unwrap_or_else(|| {
+            panic!(
+                "nihao 应出「你好」，实际：{:?}",
+                candidates
+                    .iter()
+                    .map(|c| c.text.as_str())
+                    .take(8)
+                    .collect::<Vec<_>>()
+            )
+        });
+    session.choose(index).expect("应能选中「你好」");
+    assert_eq!(session.take_commit().as_deref(), Some("你好"));
+
+    // 2. 打触发键 z，历史候选应出现
+    type_ascii(&mut session, "z");
+    let candidates = candidate_list(&mut session);
+    let learned = candidates
+        .iter()
+        .find(|c| c.text == "你好")
+        .unwrap_or_else(|| {
+            panic!(
+                "打 z 应出刚提交的「你好」，实际：{:?}",
+                candidates
+                    .iter()
+                    .map(|c| (c.kind.as_str(), c.text.as_str(), c.quality))
+                    .take(12)
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(learned.kind, "script", "候选类型沿用记录里的 kind");
+    assert_eq!(learned.quality, 1.0, "quality 来自 history/initial_quality");
+}
+
+/// 触发键是**精确匹配**：打 `zh`（多一个字母）就不该再出历史。
+#[test]
+fn history_translator_requires_exact_trigger() {
+    let mut session = new_session(&build_dir(), "history_demo");
+    type_ascii(&mut session, "nihao");
+    let candidates = candidate_list(&mut session);
+    let index = candidates.iter().position(|c| c.text == "你好").unwrap();
+    session.choose(index).expect("应能选中");
+    session.take_commit();
+
+    type_ascii(&mut session, "zh");
+    let candidates = candidate_list(&mut session);
+    assert!(
+        !candidates.iter().any(|c| c.text == "你好"),
+        "打 zh 不该出历史，实际：{:?}",
+        candidates
+            .iter()
+            .map(|c| (c.kind.as_str(), c.text.as_str()))
+            .take(10)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// `history/size` 是上限，且**最新的排最前**。
+#[test]
+fn history_translator_respects_size_and_order() {
+    let mut session = new_session(&build_dir(), "history_demo");
+    // 依次提交四个单字，每个都成为一条历史记录
+    for (code, word) in [("ni", "你"), ("hao", "好"), ("shi", "是"), ("wo", "我")] {
+        type_ascii(&mut session, code);
+        let candidates = candidate_list(&mut session);
+        let index = candidates
+            .iter()
+            .position(|c| c.text == word)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{code} 应出「{word}」，实际：{:?}",
+                    candidates.iter().map(|c| c.text.as_str()).take(8).collect::<Vec<_>>()
+                )
+            });
+        session.choose(index).expect("应能选中");
+        assert_eq!(session.take_commit().as_deref(), Some(word));
+    }
+
+    type_ascii(&mut session, "z");
+    let candidates = candidate_list(&mut session);
+    // 历史候选的 quality 都是 1（配置值），据此把它们挑出来
+    let history: Vec<&str> = candidates
+        .iter()
+        .filter(|c| c.quality == 1.0)
+        .map(|c| c.text.as_str())
+        .collect();
+    assert_eq!(history, vec!["我", "是", "好"], "size=3 只留最近三条，且新的在前");
+}

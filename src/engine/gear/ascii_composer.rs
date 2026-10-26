@@ -142,11 +142,13 @@ impl AsciiComposer {
         }
         if style == SwitchStyle::CommitCode {
             let code = self.raw_keys.clone();
+            // C++ `kAsciiModeSwitchCommitCode` 走的是 `engine_->CommitText(...)`
+            // （`ascii_composer.cc:436`）—— 要进提交历史，所以用 `commit_raw_text`
             if code.is_empty() {
                 let text = ctx.get_commit_text();
-                ctx.commit_direct(text);
+                ctx.commit_raw_text(text);
             } else {
-                ctx.commit_direct(code);
+                ctx.commit_raw_text(code);
             }
             ctx.clear();
             return;
@@ -321,7 +323,9 @@ impl Processor for AsciiComposer {
                 } else {
                     c.to_ascii_lowercase()
                 };
-                ctx.commit_direct(out.to_string());
+                // C++ `ProcessCapsLock` 这里是 `engine_->CommitText(...)`
+                // （`ascii_composer.cc:321`），要进提交历史
+                ctx.commit_raw_text(out.to_string());
                 return ProcessResult::Accepted;
             }
         }
@@ -338,7 +342,9 @@ impl AsciiComposer {
     /// C++ `CommitAndReset`。
     fn commit_and_reset(&mut self, ctx: &mut crate::engine::context::Context, text: String) {
         self.is_inline_ascii = false;
-        ctx.commit_direct(text);
+        // `CommitAndReset` 用 `engine_->CommitText(text)`（`ascii_composer.cc:89`），
+        // 与裸 `sink()` 的差别就是会记一条 `raw` 进提交历史
+        ctx.commit_raw_text(text);
         ctx.clear();
         self.raw_keys.clear();
         self.reset_modifier_state();

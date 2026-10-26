@@ -1,0 +1,55 @@
+# 提交历史（history_translator）的 e2e 验证方案。
+#
+# 关键配置只有三行：
+#   history/input   —— 触发键。**精确匹配**整段输入，打 `z` 才出历史，打 `zh` 不出
+#   history/size    —— 最多给几条
+#   history/initial_quality —— 质量分，出厂普遍写 1（排在正常候选后面）
+#
+# 和其它方案的区别：这个组件的候选来自 `Context::commit_history`（跨提交的小账本），
+# 而不是任何词典文件 —— 所以只要 schema 能跑、能提交，就能验证。
+schema:
+  schema_id: history_demo
+  name: "提交历史 (e2e 验证)"
+version: "1.0"
+engine:
+  processors:
+    - ascii_composer
+    - recognizer
+    - key_binder
+    - speller
+    - punctuator
+    - selector
+    - navigator
+    - express_editor
+  segmentors:
+    - ascii_segmentor
+    - matcher
+    - abc_segmentor
+    - punct_segmentor
+    - fallback_segmentor
+  translators:
+    - punct_translator
+    - script_translator
+    - history_translator
+  filters:
+    - uniquifier
+speller:
+  alphabet: "zyxwvutsrqponmlkjihgfedcba"
+  delimiter: " '"
+translator:
+  dictionary: luna_pinyin
+  # 词典名与拼写表名不同：`luna_pinyin.table.bin` + `luna_pinyin_simp.prism.bin`
+  prism: luna_pinyin_simp
+history:
+  input: z
+  size: 3
+  initial_quality: 1
+menu:
+  page_size: 9
+switches:
+  - name: ascii_mode
+    states: [ 中文, 西文 ]
+  - name: full_shape
+    states: [ 半角, 全角 ]
+  - name: ascii_punct
+    states: [ 。，, ．， ]

@@ -18,6 +18,7 @@
 #![allow(dead_code)]
 
 pub mod candidate;
+pub mod commit_history;
 pub mod composition;
 pub mod context;
 pub mod gear;

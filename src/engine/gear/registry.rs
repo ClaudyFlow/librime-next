@@ -35,6 +35,7 @@ use crate::engine::gear::ascii_segmentor::AsciiSegmentor;
 use crate::engine::gear::editor::Editor;
 use crate::engine::gear::fallback_segmentor::FallbackSegmentor;
 use crate::engine::gear::filter::{Filter, SingleCharFilter, Uniquifier};
+use crate::engine::gear::history_translator::HistoryTranslator;
 use crate::engine::gear::key_binder::KeyBinder;
 use crate::engine::gear::matcher::Matcher;
 use crate::engine::gear::navigator::Navigator;
@@ -383,6 +384,14 @@ pub fn create_translator(ticket: &Ticket) -> Option<Box<dyn Translator + Send + 
     let options = TranslatorOptions::from_config(ticket.config, &ticket.name_space);
     match ticket.klass.as_str() {
         "punct_translator" => Some(Box::new(PunctTranslator::with_config(ticket.config, false))),
+        "history_translator" => {
+            // 命名空间改写（`translator` → `history`）发生在组件内部，
+            // 所以这里把原始 `name_space` 原样递进去。
+            Some(Box::new(HistoryTranslator::load(
+                ticket.config,
+                &ticket.name_space,
+            )))
+        }
         "reverse_lookup_translator" => {
             // 反查翻译器的命名空间默认就从 `translator` 改写成 `reverse_lookup`
             // （`reverse_lookup_translator.cc:62-64`），改名发生在组件内部，
@@ -398,6 +407,22 @@ pub fn create_translator(ticket: &Ticket) -> Option<Box<dyn Translator + Send + 
                 &prism_name,
             )?;
             let mut translator = TableTranslator::new(dict, options);
+            // 学词时顺带编码"历史上连续几个词"（`table_translator.cc:222`，默认 true）
+            let pointer = |key: &str| format!("/{}/{key}", ticket.name_space);
+            if let Some(v) = ticket
+                .config
+                .pointer(&pointer("encode_commit_history"))
+                .and_then(|v| v.as_bool())
+            {
+                translator.encode_commit_history = v;
+            }
+            if let Some(v) = ticket
+                .config
+                .pointer(&pointer("max_phrase_length"))
+                .and_then(|v| v.as_i64())
+            {
+                translator.max_phrase_length = v as i32;
+            }
             // 用户词典（学词 / 调频）：C++ 里是 `Translator` 基类的 `user_dict_`
             if let Some(user_dict) = create_user_dictionary(ticket, &dict_name) {
                 translator = translator.with_user_dict(user_dict);

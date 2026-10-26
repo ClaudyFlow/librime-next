@@ -173,7 +173,12 @@ impl ReverseLookupTranslator {
 }
 
 impl Translator for ReverseLookupTranslator {
-    fn query(&mut self, input: &str, segment: &mut Segment) -> Vec<Candidate> {
+    fn query(
+        &mut self,
+        input: &str,
+        segment: &mut Segment,
+        _history: &crate::engine::commit_history::CommitHistory,
+    ) -> Vec<Candidate> {
         if !segment.tags.iter().any(|t| *t == self.tag) {
             return Vec::new();
         }
@@ -298,7 +303,7 @@ mod tests {
         let mut t = ReverseLookupTranslator::load(&luna_config(), "translator", &build_dir())
             .expect("应能加载");
         let mut seg = segment_with("abc");
-        assert!(t.query("`hspnz", &mut seg).is_empty(), "没反查标签就不认领");
+        assert!(t.query("`hspnz", &mut seg, &crate::engine::commit_history::CommitHistory::new()).is_empty(), "没反查标签就不认领");
     }
 
     /// 端到端核心断言：`` `h' `` → 笔画「一」（`h` = 橫），注释是它的拼音 `yi`。
@@ -307,7 +312,7 @@ mod tests {
         let mut t = ReverseLookupTranslator::load(&luna_config(), "translator", &build_dir())
             .expect("应能加载");
         let mut seg = segment_with("reverse_lookup");
-        let cands = t.query("`h'", &mut seg);
+        let cands = t.query("`h'", &mut seg, &crate::engine::commit_history::CommitHistory::new());
         assert!(!cands.is_empty(), "`h' 应出候选");
         let yi = cands.iter().find(|c| c.text == "一").unwrap_or_else(|| {
             panic!(
@@ -330,7 +335,7 @@ mod tests {
         let mut t = ReverseLookupTranslator::load(&luna_config(), "translator", &build_dir())
             .expect("应能加载");
         let mut seg = segment_with("reverse_lookup");
-        let cands = t.query("`h", &mut seg);
+        let cands = t.query("`h", &mut seg, &crate::engine::commit_history::CommitHistory::new());
         assert!(cands.iter().any(|c| c.text == "一"), "`h 不带后缀也要能出「一」");
     }
 
@@ -339,7 +344,7 @@ mod tests {
         let mut t = ReverseLookupTranslator::load(&luna_config(), "translator", &build_dir())
             .expect("应能加载");
         let mut seg = segment_with("reverse_lookup");
-        assert!(t.query("`", &mut seg).is_empty(), "只打前缀不该出候选");
+        assert!(t.query("`", &mut seg, &crate::engine::commit_history::CommitHistory::new()).is_empty(), "只打前缀不该出候选");
         assert_eq!(seg.prompt, "〔筆畫〕", "但提示照设");
     }
 }

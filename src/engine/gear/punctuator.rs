@@ -11,10 +11,19 @@
 //! # 本轮刻意没移植的部分
 //!
 //! 原版有一整套 **数字分隔符**逻辑（`digit_separators` / `punct_number` /
-//! `ConvertDigitSeparator` / `ReconvertDigitSeparatorAsPunct`），它依赖
-//! `Context::commit_history()`（「3.14」「1,000」要靠"上一条提交是不是数字"判断）。
-//! lrn 目前没有 commit_history，所以这里**整块不做**，配置照读不误。
-//! 影响：数字后紧跟 `.` `,` 这类符号时，原版会"原样上屏"，lrn 走普通标点路径。
+//! `ConvertDigitSeparator` / `ReconvertDigitSeparatorAsPunct`），用来让
+//! 「3.14」「1,000」「12:30」在原样键入时**不被翻成标点**。
+//!
+//! 它的前置条件（`Context::commit_history()`，"上一条提交是不是数字"）**已经就位**
+//! （`src/engine/commit_history.rs`），剩下挡路的是接口而不是数据：
+//!
+//! * `PunctSegmentor::Proceed` 要给"落在数字后面的分隔符"打 `punct_number` 标签，
+//!   而 [`Segmentor`] trait 只收 `&mut Segmentation`，拿不到 `Context`；
+//! * `Punctuator::ConvertDigitSeparator` 反过来要在**没有组合**时读历史，
+//!   这条 processor 侧倒是拿得到。
+//!
+//! 所以整块暂时不做，配置照读不误。影响：数字后紧跟 `.` `,` 这类符号时，
+//! 原版会"原样上屏"，lrn 走普通标点路径（`3.14` 会变成 `3。14`）。
 
 use serde_json::Value;
 
@@ -199,7 +208,12 @@ fn punct_candidate(text: &str, start: usize, end: usize) -> Candidate {
 }
 
 impl Translator for PunctTranslator {
-    fn query(&mut self, input: &str, _segment: &mut Segment) -> Vec<Candidate> {
+    fn query(
+        &mut self,
+        input: &str,
+        _segment: &mut Segment,
+        _history: &crate::engine::commit_history::CommitHistory,
+    ) -> Vec<Candidate> {
         let Some(definition) = self.config.get_punct_definition(input) else {
             return Vec::new();
         };
@@ -422,6 +436,7 @@ impl Processor for Punctuator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::commit_history::CommitHistory;
 
     fn config() -> Value {
         serde_json::json!({
@@ -444,7 +459,7 @@ mod tests {
     #[test]
     fn translator_expands_alternating_list() {
         let mut t = PunctTranslator::with_config(&config(), false);
-        let cands = t.query("'", &mut Segment::new(0, 0));
+        let cands = t.query("'", &mut Segment::new(0, 0), &CommitHistory::new());
         let texts: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(texts, vec!["、", "‘", "’"]);
     }
@@ -452,15 +467,15 @@ mod tests {
     #[test]
     fn translator_expands_unique_mapping_and_pair() {
         let mut t = PunctTranslator::with_config(&config(), false);
-        assert_eq!(t.query(",", &mut Segment::new(0, 0))[0].text, "，");
+        assert_eq!(t.query(",", &mut Segment::new(0, 0), &CommitHistory::new())[0].text, "，");
         let pair: Vec<String> = t
-            .query("\"", &mut Segment::new(0, 0))
+            .query("\"", &mut Segment::new(0, 0), &CommitHistory::new())
             .into_iter()
             .map(|c| c.text.clone())
             .collect();
         assert_eq!(pair, vec!["“".to_string(), "”".to_string()]);
         // `{ commit: … }`
-        assert_eq!(t.query("`", &mut Segment::new(0, 0))[0].text, "`");
+        assert_eq!(t.query("`", &mut Segment::new(0, 0), &CommitHistory::new())[0].text, "`");
     }
 
     #[test]
@@ -468,15 +483,15 @@ mod tests {
         let mut half = PunctTranslator::with_config(&config(), false);
         let mut full = PunctTranslator::with_config(&config(), true);
         // 半角表里有 `'` 的多选，全角表里没有 → 全角时该键不出候选
-        assert_eq!(half.query("'", &mut Segment::new(0, 0)).len(), 3);
-        assert!(full.query("'", &mut Segment::new(0, 0)).is_empty());
-        assert_eq!(full.query(",", &mut Segment::new(0, 0))[0].text, "，");
+        assert_eq!(half.query("'", &mut Segment::new(0, 0), &CommitHistory::new()).len(), 3);
+        assert!(full.query("'", &mut Segment::new(0, 0), &CommitHistory::new()).is_empty());
+        assert_eq!(full.query(",", &mut Segment::new(0, 0), &CommitHistory::new())[0].text, "，");
     }
 
     #[test]
     fn unknown_punct_is_noop() {
         let mut t = PunctTranslator::with_config(&config(), false);
-        assert!(t.query("z", &mut Segment::new(0, 0)).is_empty());
+        assert!(t.query("z", &mut Segment::new(0, 0), &CommitHistory::new()).is_empty());
     }
 
     #[test]

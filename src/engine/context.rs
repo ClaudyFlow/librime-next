@@ -43,6 +43,11 @@ pub struct Context {
     /// 取走并分发给各 translator 学词。放在 `Context` 里而不是直接回调 Engine，
     /// 是因为 processor（editor）只拿得到 `&mut Context`。
     pub pending_commit_elements: Vec<crate::dict::vocabulary::DictEntry>,
+    /// 最近 20 条上屏记录（C++ `Context::commit_history_`）。
+    ///
+    /// `history_translator` 出"最近输入"、`punctuator` 判数字串、
+    /// `table_translator` 拼短语去编码，都读这一份。
+    pub commit_history: crate::engine::commit_history::CommitHistory,
 }
 
 impl Context {
@@ -154,8 +159,9 @@ impl Context {
             // 整段覆盖：拼接已确认前缀，提交
             let mut text = std::mem::take(&mut self.committed_prefix);
             text.push_str(&cand.text);
-            // 提交前收词条（`clear()` 会把 segmentation 清掉）
+            // 提交前收词条 / 记历史（`clear()` 会把 segmentation 清掉）
             self.collect_commit_elements();
+            self.collect_commit_history();
             self.clear();
             self.commit_text = Some(text.clone());
             Some(SelectResult::Committed(text))
@@ -334,9 +340,20 @@ impl Context {
         }
         let text = self.get_commit_text();
         self.collect_commit_elements();
+        self.collect_commit_history();
         self.clear();
         self.commit_text = Some(text);
         true
+    }
+
+    /// C++ `ConcreteEngine::OnCommit(ctx)` 的第一件事
+    /// （`engine.cc:333`）：把这段组合记进提交历史。
+    ///
+    /// 必须在 `clear()` **之前**调用 —— 记录来自各段的选中候选和 `input`，
+    /// 清场后两者都没了。三个字段互不重叠，所以可以直接分开借。
+    pub fn collect_commit_history(&mut self) {
+        self.commit_history
+            .push_composition(&self.composition, &self.input);
     }
 
     /// 把各段**已选中**候选挂着的词条收进 `pending_commit_elements`。
@@ -378,6 +395,23 @@ impl Context {
             Some(ref mut s) => s.push_str(&text),
             None => self.commit_text = Some(text),
         }
+    }
+
+    /// C++ `ConcreteEngine::CommitText(text)`（`engine.cc:326-331`）：直接提交一段
+    /// 文本，**并记一条 `raw`**。
+    ///
+    /// 与 [`Self::commit_direct`] 的区别正是这条历史记录：`commit_direct` 对应
+    /// 裸的 `sink()(text)`（`editor` 的 `commit_script_text`、`commit_comment` 走它，
+    /// C++ 里这些**不进**历史）；而 `ascii_composer` 的临时西文结算走 `CommitText`，
+    /// 要进 —— 否则打完 `3` 再打 `.` 时「上一条是不是数字」就断了。
+    pub fn commit_raw_text(&mut self, text: String) {
+        self.commit_history.push(
+            crate::engine::commit_history::CommitRecord::new(
+                crate::engine::commit_history::KIND_RAW,
+                text.clone(),
+            ),
+        );
+        self.commit_direct(text);
     }
 
     pub fn get_commit_text(&self) -> String {

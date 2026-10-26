@@ -5,6 +5,7 @@ use crate::dict::dictionary::Dictionary;
 use crate::dict::user_dictionary::UserDictionary;
 use crate::dict::vocabulary::DictEntry;
 use crate::engine::candidate::Candidate;
+use crate::engine::commit_history::CommitHistory;
 use crate::engine::gear::poet::{Poet, Sentence, WordGraph};
 use crate::engine::gear::translator_options::TranslatorOptions;
 use crate::engine::segmentation::Segment;
@@ -33,13 +34,24 @@ const USER_DICT_QUALITY_BASE: f64 = 1.0e5;
 /// 比留个 `prompt` 旁路干净。
 pub trait Translator {
     /// 给定一段输入串，产出候选列表（位置**相对本段**，候选各带覆盖到的 `end`）。
-    fn query(&mut self, input: &str, segment: &mut Segment) -> Vec<Candidate>;
+    ///
+    /// `history` 是本会话的提交历史（C++ 里通过 `engine_->context()` 拿到）。
+    /// 只有 `history_translator` 会真的读它；其余实现忽略。
+    fn query(
+        &mut self,
+        input: &str,
+        segment: &mut Segment,
+        history: &CommitHistory,
+    ) -> Vec<Candidate>;
 
     /// `Translator::Memorize(commit_entry)`：一次提交里选中的词条交回来学。
     ///
     /// C++ 在 `Context::commit()` 里把 `CommitEntry::elements` 播给每个 translator；
     /// 只有带用户词典的实现会真的写库，默认实现什么都不做。
-    fn memorize(&mut self, _elements: &[DictEntry]) -> bool {
+    ///
+    /// `history` 是本会话的提交历史：`table_translator` 的 `encode_commit_history`
+    /// 要拿它把"连续几个词"拼成短语去编码（C++ 里同样是查 `engine_->context()`）。
+    fn memorize(&mut self, _elements: &[DictEntry], _history: &CommitHistory) -> bool {
         false
     }
 }
@@ -303,7 +315,12 @@ impl ScriptTranslator {
 }
 
 impl Translator for ScriptTranslator {
-    fn query(&mut self, input: &str, segment: &mut Segment) -> Vec<Candidate> {
+    fn query(
+        &mut self,
+        input: &str,
+        segment: &mut Segment,
+        _history: &CommitHistory,
+    ) -> Vec<Candidate> {
         if !self.options.has_any_tag(&segment.tags) {
             return Vec::new();
         }
@@ -354,7 +371,7 @@ impl Translator for ScriptTranslator {
 
     /// `TableTranslator::Memorize` / `ScriptTranslator::Memorize`：
     /// 把这次提交里选中的词条逐条 `UpdateEntry(entry, 1)`。
-    fn memorize(&mut self, elements: &[DictEntry]) -> bool {
+    fn memorize(&mut self, elements: &[DictEntry], _history: &CommitHistory) -> bool {
         let Some(user_dict) = self.user_dict.as_mut() else {
             return false;
         };
