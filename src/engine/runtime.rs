@@ -342,24 +342,37 @@ impl Engine {
         if self.filters.is_empty() {
             return;
         }
-        let filters = std::mem::take(&mut self.filters);
-        for seg in self.context.composition.segmentation.segments.iter_mut() {
-            // 先把"这一段该套哪些 filter"算出来，再动 menu —— 否则会同时借用 seg 两次
-            let applicable: Vec<bool> = filters
+        let n = self.context.composition.segmentation.segments.len();
+        for i in 0..n {
+            // 把该段的 `menu` 所有权先 `take` 出来：否则 `apply` 要借 `&self.context`
+            // （不可变）的同时，`seg` 还持有 `self.context` 字段的可变借用，会冲突。
+            let Some(mut menu) = self
+                .context
+                .composition
+                .segmentation
+                .segments
+                .get_mut(i)
+                .and_then(|seg| seg.menu.take())
+            else {
+                continue;
+            };
+            // 这一段该套哪些 filter（只读 `self.context`）
+            let applicable: Vec<bool> = self
+                .filters
                 .iter()
                 .map(|entry| {
-                    entry.is_enabled() && entry.component.applies_to_segment(seg)
+                    let seg = &self.context.composition.segmentation.segments[i];
+                    entry.is_enabled() && entry.component.applies_to_segment(&self.context, seg)
                 })
                 .collect();
-            let Some(menu) = seg.menu.as_mut() else { continue };
-            for (entry, applies) in filters.iter().zip(applicable) {
+            for (entry, applies) in self.filters.iter().zip(applicable) {
                 if !applies {
                     continue;
                 }
-                entry.component.apply(menu.candidates_mut());
+                entry.component.apply(&self.context, menu.candidates_mut());
             }
+            self.context.composition.segmentation.segments[i].menu = Some(menu);
         }
-        self.filters = filters;
     }
 
     /// 已装配的 processor 名单（诊断用：验证 `engine/processors` 真的被读进来了）。

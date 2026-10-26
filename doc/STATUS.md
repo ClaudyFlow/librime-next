@@ -15,7 +15,7 @@
 | `algo/` | ✅ | 公式、编码器、文法规则、拼写器（纯算法） |
 | `dict/` | ✅ 表面全 | prism / table / reverse / marisa / DictCompiler 三件套产出 |
 | `lever/` | ✅ 11/11 | installation_update / config_file_update / schema_update / workspace_update / cleanup_trash / prebuild_all_schemas / backup_config_files / detect_modifications / user_dict_upgrade / user_dict_sync / clean_old_log_files |
-| `engine/` | ◐ 部分（2026-10-26 大幅推进） | 四类组件**全部按配置动态装配**：processor（ascii_composer / recognizer / key_binder / speller / punctuator / selector / navigator / editor）、segmentor（ascii / matcher / abc / punct / fallback）、translator（punct / script / **table 形码✅已验证**）、filter（uniquifier / single_char）；compose 已是 C++ 的 `CalculateSegmentation` + `TranslateSegments` 真模型。**仍缺** simplifier（依赖转换表）、lua_processor / lua_translator / lua_filter、UserDb、commit_history |
+| `engine/` | ◐ 部分（2026-10-26 大幅推进） | 四类组件**全部按配置动态装配**：processor（ascii_composer / recognizer / key_binder / speller / punctuator / selector / navigator / editor）、segmentor（ascii / matcher / abc / punct / fallback）、translator（punct / script / **table 形码✅已验证**）、filter（uniquifier / single_char / **simplifier 简繁✅已验证**）；compose 已是 C++ 的 `CalculateSegmentation` + `TranslateSegments` 真模型。**仍缺** lua_processor / lua_translator / lua_filter、UserDb、commit_history、reverse_lookup_translator / reverse_lookup_filter |
 | `c_api` | ✅ ABI 闭环 | `rime_get_api()` 导出，`RimeApi` 字段与原版 `rime_api.h` 逐字对齐（`data_size=804` 精确吻合），11 项 ABI 检查全过 |
 
 ### 实测部署结果（luna_pinyin_simp）
@@ -55,7 +55,7 @@
 - `build/default.yaml` 同步写入
 - 对比 fixture 基线（2026-10-23 的 15 方案 30 文件），当前数据目录已增至 19 方案，产物数量随之增加
 
-测试基线：`cargo test` → lib 238 + lever 8 + config 2 + engine e2e 6 + key_event 3 + 1，**258 过 / 0 败**。
+测试基线：`cargo test` → lib 321 + lever 1 + config 2 + engine e2e 18 + key_order 3 + algebra 8 + doc 1（忽略），**全过 / 0 败**。
 
 ---
 
@@ -273,3 +273,54 @@ processor 链不再是硬编码的 `Speller + Selector`。
   **真问题**：默认构造用相对路径会污染调用方当前目录，建议宿主必须注入数据目录后才允许跑同步任务。
 - 宿主 `Rime-Next/` 数据目录侧仍是 `schema` / `model` / `eassy` / `theme` / `plugin`
   （`eassy` 是 essay 的历史拼写错误），它们已被装机版 C++ 补丁写死，改名属于安装器迁移，不在本次范围。
+
+---
+
+## 十、simplifier + opencc 最小移植（2026-10-26）
+
+**目标**：让 `luna_pinyin_simp` 的简繁转换过滤器真正在方案链路里工作（此前 filters 只有 uniquifier / single_char）。
+
+### 新增文件
+
+| 文件 | 对照 C++ | 说明 |
+|---|---|---|
+| `src/dict/opencc.rs` | `opencc/` 字典加载 + `SerializedValues` | 最小 OpenCC 引擎：读 `.ocd2`（Marisa trie + 值区）+ `*.json` 的 `conversion_chain`（含 `group` 嵌套），最长匹配转换 |
+| `src/engine/gear/simplifier.rs` | `gear/simplifier.cc` | 简繁转换 filter：`opencc_config`（默认 `t2s.json`）/ `option_name`（配了就只在开关打开时转） |
+
+### ocd2 二进制格式破译（关键坑）
+
+`.ocd2` = 定长 19 字节 magic `OPENCC_MARISA_0.2.5`（**不带** null 结尾）+ Marisa trie
+（自带 `"We love Marisa.\0"` 头）+ `SerializedValues`（`u32 numItems` → `u32 valueTotalLength`
+→ null 结尾值缓冲 → `numItems` 个描述符，每条 `u16 numValues` + 每值 `u16` 长度）。
+
+两个非显然点：
+1. **rsmarisa 的 `io_size()` 与实际写出字节有偏差**，不能用它切分 trie/值区边界 →
+   用 `CountingReader(Rc<AtomicUsize>)` 包装 `io::Read` 精确计数 trie 消耗字节。
+2. **值缓冲要累加条目内所有值的长度**（多 variant 场景），不能只累加第一个，否则后续偏移整体错位（汉→乱码）。
+
+### Filter 调用链升级
+
+`Filter` trait 签名从 `apply(&self, candidates)` 升级为 `applies_to_segment(&self, ctx, seg) -> bool`
+（开关门控）+ `apply(&self, ctx, candidates)`（只转换）。`Runtime::apply_filters` 改为：
+先 `seg.menu.take()` 拿所有权打破借用别名 → 只读 `ctx` 算每段的 `applicable` → 仅对命中的段调 `apply`
+（对齐 C++ runtime 先问开关再调 apply 的语义）。`registry::create_filter` 增加
+`"simplifier" => Simplifier::new(build_dir.parent()/opencc, ...)`，配置节点取 `alias:` 块回退 `/simplifier`。
+
+### 验证（端到端，真实方案链路）
+
+`luna_pinyin_simp` 的 filters 实际是 `simplifier@zh_hans`（option_name=zh_hans，
+opencc_config=t2s.json，开关 `reset:1` 默认开）/ `@zh_hant_hk` / `@zh_hant_tw`（均带 opencc_config）。
+e2e 新测：`type_ascii("yuyan")` 后——
+- `zh_hans=ON`  → 候选 `["语言","预言","寓言","雨燕",...]`（简体）
+- `zh_hans=OFF` → 候选 `["語言","預言","寓言","雨燕","預演","浴鹽",...]`（繁体）
+
+3 个断言测试全过，证明 simplifier 在真实引擎链路里生效且受开关门控。
+（测试用 opencc 数据放 `test/e2e/opencc`，1.2M，与 build 真实数据同源。）
+
+### 仍缺（同一缺口清单顺延）
+
+`reverse_lookup_translator` + `reverse_lookup_filter`、`UserDb` 持久化（替换 `InMemoryUserDb` 桩）、
+`charset_filter` + `commit_history`（cangjie5）、`collapse_composition` / `cjk_minifier` /
+`echo_translator` / `chord_composer`、`lua_*` / `grammar` / `SchemaSwitcher`。
+（e2e 里 `table_translator@custom_phrase` / `reverse_lookup_translator` 创建报错是**预期**——
+未移植组件按设计返回 `None`、链条继续，不影响主线。）

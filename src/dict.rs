@@ -85,6 +85,7 @@ pub mod vocabulary;
 // `.table.bin` 读得出来也建得出来（2026-10-25 dict 编译链全通）。
 pub mod corrector;
 pub mod marisa;
+pub mod opencc;
 pub mod string_table;
 pub mod string_table_builder;
 pub mod table;

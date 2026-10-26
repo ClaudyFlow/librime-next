@@ -11,17 +11,18 @@
 //! **删掉后出现的重复项**，长度变短。对前端而言呈现的都是"同一词条只出现一次"。
 
 use crate::engine::candidate::Candidate;
+use crate::engine::context::Context;
 use crate::engine::segmentation::Segment;
 
 /// 候选过滤器（对照 C++ `Filter`）。
 pub trait Filter {
     /// `Filter::AppliesToSegment`：默认对每段都生效。
-    fn applies_to_segment(&self, _segment: &Segment) -> bool {
+    fn applies_to_segment(&self, _ctx: &Context, _segment: &Segment) -> bool {
         true
     }
 
-    /// 就地改写候选列表。
-    fn apply(&self, candidates: &mut Vec<Candidate>);
+    /// 就地改写候选列表。`ctx` 用于按开关（option）决定是否转换。
+    fn apply(&self, _ctx: &Context, candidates: &mut Vec<Candidate>);
 }
 
 /// `gear/uniquifier.cc`：同一词条只留一条（保留质量最高的那条）。
@@ -34,7 +35,7 @@ impl Uniquifier {
 }
 
 impl Filter for Uniquifier {
-    fn apply(&self, candidates: &mut Vec<Candidate>) {
+    fn apply(&self, _ctx: &Context, candidates: &mut Vec<Candidate>) {
         let mut seen: Vec<String> = Vec::new();
         let mut out: Vec<Candidate> = Vec::with_capacity(candidates.len());
         for cand in candidates.drain(..) {
@@ -62,7 +63,7 @@ impl SingleCharFilter {
 }
 
 impl Filter for SingleCharFilter {
-    fn apply(&self, candidates: &mut Vec<Candidate>) {
+    fn apply(&self, _ctx: &Context, candidates: &mut Vec<Candidate>) {
         let mut single: Vec<Candidate> = Vec::new();
         let mut multi: Vec<Candidate> = Vec::new();
         for cand in candidates.drain(..) {
@@ -88,7 +89,7 @@ mod tests {
     #[test]
     fn uniquifier_keeps_highest_quality_occurrence() {
         let mut list = vec![cand("你好", 1.0), cand("你好", 5.0), cand("你", 0.5)];
-        Uniquifier::new().apply(&mut list);
+        Uniquifier::new().apply(&Context::new(), &mut list);
         let texts: Vec<&str> = list.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(texts, vec!["你好", "你"]);
     }
@@ -96,7 +97,7 @@ mod tests {
     #[test]
     fn single_char_comes_first_within_each_group() {
         let mut list = vec![cand("你好", 1.0), cand("你", 0.5), cand("好", 0.4)];
-        SingleCharFilter::new().apply(&mut list);
+        SingleCharFilter::new().apply(&Context::new(), &mut list);
         let texts: Vec<&str> = list.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(texts, vec!["你", "好", "你好"]);
     }

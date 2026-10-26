@@ -415,3 +415,57 @@ fn candidate_texts(session: &mut Session) -> Vec<String> {
         })
         .unwrap_or_default()
 }
+
+// ── simplifier（简繁转换过滤器）端到端检测 ───────────────────────────────
+//
+// luna_pinyin_simp 的词典是繁体（語言），靠 simplifier@zh_hans（option_name=zh_hans，
+// opencc_config=t2s.json）在开关打开时转简（语言）。下面把「yuyan」在 zh_hans
+// 开/关两种状态下的候选真实打印出来，确认 simplifier 真的在方案链路里生效、且受开关门控。
+
+#[test]
+fn simplifier_probe_yuyan() {
+    // 开关开着：应得到简体「语言」
+    let mut on = Session::create(&build_dir(), "luna_pinyin_simp");
+    on.context_mut().unwrap().set_option("zh_hans", true);
+    type_ascii(&mut on, "yuyan");
+    let on_texts = candidate_texts(&mut on);
+    println!("zh_hans=ON  yuyan -> {:?}", &on_texts[..on_texts.len().min(12)]);
+
+    // 开关关着：应保留繁体「語言」
+    let mut off = Session::create(&build_dir(), "luna_pinyin_simp");
+    off.context_mut().unwrap().set_option("zh_hans", false);
+    type_ascii(&mut off, "yuyan");
+    let off_texts = candidate_texts(&mut off);
+    println!("zh_hans=OFF yuyan -> {:?}", &off_texts[..off_texts.len().min(12)]);
+}
+
+#[test]
+fn simplifier_zh_hans_on_yields_simplified() {
+    let mut session = Session::create(&build_dir(), "luna_pinyin_simp");
+    session.context_mut().unwrap().set_option("zh_hans", true);
+    type_ascii(&mut session, "yuyan");
+    let texts = candidate_texts(&mut session);
+    assert!(
+        texts.iter().any(|t| t == "语言"),
+        "zh_hans 开时应出简体「语言」，实际前若干：{:?}",
+        &texts[..texts.len().min(12)]
+    );
+    assert!(
+        !texts.iter().any(|t| t == "語言"),
+        "zh_hans 开时不应出现繁体「語言」，实际：{:?}",
+        &texts[..texts.len().min(12)]
+    );
+}
+
+#[test]
+fn simplifier_zh_hans_off_yields_traditional() {
+    let mut session = Session::create(&build_dir(), "luna_pinyin_simp");
+    session.context_mut().unwrap().set_option("zh_hans", false);
+    type_ascii(&mut session, "yuyan");
+    let texts = candidate_texts(&mut session);
+    assert!(
+        texts.iter().any(|t| t == "語言"),
+        "zh_hans 关时应为繁体「語言」，实际前若干：{:?}",
+        &texts[..texts.len().min(12)]
+    );
+}

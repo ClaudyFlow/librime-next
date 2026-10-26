@@ -42,6 +42,7 @@ use crate::engine::gear::punctuator::{PunctSegmentor, PunctTranslator, Punctuato
 use crate::engine::gear::processor::Processor;
 use crate::engine::gear::recognizer::Recognizer;
 use crate::engine::gear::segmentor::Segmentor;
+use crate::engine::gear::simplifier::Simplifier;
 use crate::engine::gear::selector::Selector;
 use crate::engine::gear::speller::Speller;
 use crate::engine::gear::table_translator::TableTranslator;
@@ -301,6 +302,27 @@ pub fn create_filter(ticket: &Ticket) -> Option<Box<dyn Filter + Send + Sync>> {
     match ticket.klass.as_str() {
         "uniquifier" => Some(Box::new(Uniquifier::new())),
         "single_char" | "single_char_filter" => Some(Box::new(SingleCharFilter::new())),
+        "simplifier" => {
+            // opencc 数据在 `<shared_data>/opencc`，生产里 `build_dir` 就是
+            // `<shared_data>/build`，所以 `build_dir.parent()/opencc` 即目标目录。
+            let opencc_dir = ticket.build_dir.parent()?.join("opencc");
+            // 配置节点：带 alias 时优先读 `alias:` 块，否则回退到 `simplifier:` 块
+            // （与原版 `Simplifier` 读 `ticket.config` 的方式对齐）。
+            let node = ticket
+                .config
+                .pointer(&format!("/{}", ticket.name_space))
+                .or_else(|| ticket.config.pointer("/simplifier"));
+            let config_name = node
+                .and_then(|n| n.get("opencc_config"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("t2s.json");
+            let option_name = node
+                .and_then(|n| n.get("option_name"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            Simplifier::new(&opencc_dir, config_name, option_name)
+                .map(|s| Box::new(s) as Box<dyn Filter + Send + Sync>)
+        }
         _ => None,
     }
 }

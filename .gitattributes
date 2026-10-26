@@ -5,6 +5,7 @@
 
 # 二进制：不做任何换行/过滤处理
 *.bin binary
+*.ocd2 binary
 *.gz binary
 *.png binary
 *.jpg binary
