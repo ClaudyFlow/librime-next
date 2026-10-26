@@ -1120,3 +1120,122 @@ fn history_translator_respects_size_and_order() {
         .collect();
     assert_eq!(history, vec!["我", "是", "好"], "size=3 只留最近三条，且新的在前");
 }
+
+// ── 用户造词（affix_segmentor）────────────────────────────────────────────
+
+/// 取**最后一段**的候选。用户造词方案里第一段是 `phony` 前缀段（没有菜单），
+/// 真正装着候选的是后面那段。
+fn candidate_list_of_last_segment(session: &mut Session) -> Vec<librime_next::engine::Candidate> {
+    session
+        .context()
+        .and_then(|ctx| {
+            ctx.composition
+                .segmentation
+                .segments
+                .last()
+                .and_then(|seg| seg.menu.as_ref())
+                .map(|m| m.candidates().to_vec())
+        })
+        .unwrap_or_default()
+}
+
+/// 段列表的 `(start, end, tags)` 摘要，便于断言劈段结果。
+fn segment_snapshot(session: &mut Session) -> Vec<(usize, usize, Vec<String>)> {
+    session
+        .context()
+        .map(|ctx| {
+            ctx.composition
+                .segmentation
+                .segments
+                .iter()
+                .map(|s| (s.start, s.end, s.tags.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 打反引号后，`affix_segmentor` 要把这一段劈成「前缀段 + 码段」。
+#[test]
+fn affix_segmentor_splits_prefix_from_code() {
+    let mut session = new_session(&build_dir(), "affix_demo");
+    assert!(session.engine.is_some(), "affix_demo 引擎应加载");
+
+    type_ascii(&mut session, "`ni");
+    let snap = segment_snapshot(&mut session);
+    assert_eq!(snap.len(), 2, "应劈成两段，实际：{snap:?}");
+    assert_eq!((snap[0].0, snap[0].1), (0, 1), "前缀段是反引号");
+    assert!(
+        snap[0].2.iter().any(|t| t == "zaoci_prefix"),
+        "前缀段要打 zaoci_prefix，实际 {:?}",
+        snap[0].2
+    );
+    assert!(
+        snap[0].2.iter().any(|t| t == "phony"),
+        "前缀段必须 phony，否则反引号会被一起提交，实际 {:?}",
+        snap[0].2
+    );
+    assert_eq!((snap[1].0, snap[1].1), (1, 3), "码段是 ni");
+    assert!(
+        snap[1].2.iter().any(|t| t == "zaoci"),
+        "码段要打 zaoci 标签，实际 {:?}",
+        snap[1].2
+    );
+
+    // 前缀段的 prompt 应显示提示文字
+    let prompt = session
+        .context()
+        .and_then(|ctx| ctx.composition.segmentation.segments.first())
+        .map(|s| s.prompt.clone())
+        .unwrap_or_default();
+    assert_eq!(prompt, "〔用户造詞〕");
+}
+
+/// `phony` 的实际作用：提交时**不含**反引号。
+#[test]
+fn affix_prefix_is_not_committed() {
+    let mut session = new_session(&build_dir(), "affix_demo");
+    type_ascii(&mut session, "`ni");
+    let candidates = candidate_list_of_last_segment(&mut session);
+    let index = candidates
+        .iter()
+        .position(|c| c.text == "你")
+        .unwrap_or_else(|| {
+            panic!(
+                "`ni 的码段应出「你」，实际：{:?}",
+                candidates
+                    .iter()
+                    .map(|c| (c.kind.as_str(), c.text.as_str()))
+                    .take(8)
+                    .collect::<Vec<_>>()
+            )
+        });
+    let result = session.choose(index).expect("应能选中「你」");
+    assert!(
+        format!("{result:?}").contains("Committed"),
+        "应整段提交，实际 {result:?}"
+    );
+    assert_eq!(
+        session.take_commit().as_deref(),
+        Some("你"),
+        "phony 前缀不能进提交文本"
+    );
+}
+
+/// 只打前缀（还没打码）时不分段，只改当前段的标签与提示。
+#[test]
+fn affix_prefix_alone_retags_without_splitting() {
+    let mut session = new_session(&build_dir(), "affix_demo");
+    type_ascii(&mut session, "`");
+    let snap = segment_snapshot(&mut session);
+    assert_eq!(snap.len(), 1, "只打前缀不劈段，实际：{snap:?}");
+    assert!(
+        snap[0].2.iter().any(|t| t == "zaoci_prefix"),
+        "当前段改成 zaoci_prefix，实际 {:?}",
+        snap[0].2
+    );
+    assert!(
+        !snap[0].2.iter().any(|t| t == "zaoci"),
+        "原来的 zaoci 标签要去掉，实际 {:?}",
+        snap[0].2
+    );
+}

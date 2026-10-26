@@ -34,6 +34,7 @@ use crate::engine::gear::ascii_composer::AsciiComposer;
 use crate::engine::gear::ascii_segmentor::AsciiSegmentor;
 use crate::engine::gear::editor::Editor;
 use crate::engine::gear::fallback_segmentor::FallbackSegmentor;
+use crate::engine::gear::affix_segmentor::AffixSegmentor;
 use crate::engine::gear::filter::{Filter, SingleCharFilter, Uniquifier};
 use crate::engine::gear::history_translator::HistoryTranslator;
 use crate::engine::gear::key_binder::KeyBinder;
@@ -375,6 +376,10 @@ pub fn create_segmentor(ticket: &Ticket) -> Option<Box<dyn Segmentor + Send + Sy
         "matcher" => Some(Box::new(Matcher::new(ticket.config, &ticket.name_space))),
         "fallback_segmentor" => Some(Box::new(FallbackSegmentor::new())),
         "punct_segmentor" => Some(Box::new(PunctSegmentor::with_config(ticket.config, false))),
+        "affix_segmentor" => Some(Box::new(AffixSegmentor::load(
+            ticket.config,
+            &ticket.name_space,
+        ))),
         _ => None,
     }
 }

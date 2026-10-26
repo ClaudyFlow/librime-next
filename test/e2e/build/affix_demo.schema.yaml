@@ -1,0 +1,63 @@
+# 用户造词（affix_segmentor）的 e2e 验证方案。
+#
+# 关键点：
+#   * `recognizer` 给整段输入打 `zaoci` 标签（`^[a-z]*`[a-z`]*$`）
+#   * `affix_segmentor@zaoci` 必须在 `abc_segmentor` **之前** —— 它抢先把
+#     "前缀 + 码" 劈开，否则 abc_segmentor 会把整串都吃掉
+#   * 前缀段带 `phony` 标签，所以提交时**不会**把反引号一起上屏
+schema:
+  schema_id: affix_demo
+  name: "用户造词 (e2e 验证)"
+version: "1.0"
+engine:
+  processors:
+    - ascii_composer
+    - recognizer
+    - key_binder
+    - speller
+    - punctuator
+    - selector
+    - navigator
+    - express_editor
+  segmentors:
+    - ascii_segmentor
+    - matcher
+    - affix_segmentor@zaoci
+    - abc_segmentor
+    - punct_segmentor
+    - fallback_segmentor
+  translators:
+    - punct_translator
+    - script_translator
+    - script_translator@zaoci   # 认领 `zaoci` 标签的码段
+  filters:
+    - uniquifier
+speller:
+  alphabet: "`zyxwvutsrqponmlkjihgfedcba"
+  delimiter: " '"
+recognizer:
+  patterns:
+    zaoci: "^[a-z]*`[a-z`]*$"
+  # `disable_user_dict_for_patterns` 在这个验证方案里不需要
+translator:
+  dictionary: luna_pinyin
+  prism: luna_pinyin_simp
+# 前缀段与码段的配置**共用同一个命名空间**，这不是巧合：`affix_segmentor@zaoci`
+# 读 `prefix`/`tips`/`tag`，而 `script_translator@zaoci` 读 `dictionary`/`prism`/`tag`
+# —— `tag: zaoci` 这一行同时决定了「码段打什么标签」和「哪个翻译器认领它」。
+# 真实方案里 `zaoci: __include: translator` 就是把整段翻译器配置继承过来。
+zaoci:
+  dictionary: luna_pinyin
+  prism: luna_pinyin_simp
+  prefix: "`"
+  tips: "〔用户造詞〕"
+  tag: zaoci
+menu:
+  page_size: 9
+switches:
+  - name: ascii_mode
+    states: [ 中文, 西文 ]
+  - name: full_shape
+    states: [ 半角, 全角 ]
+  - name: ascii_punct
+    states: [ 。，, ．， ]
