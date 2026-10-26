@@ -22,7 +22,7 @@
 //!              其它根      → <root>/schema/<系列…>/<id>.yaml
 //!         ④ 后缀 .schema.yaml / .dict.yaml → 同 ③
 //!         ⑤ 后缀 .txt        → <root>/eassy/<id><后缀>      （essay 按 id 平铺，不建系列夹）
-//!         ⑥ 后缀 .theme.toml → <root>/theme/<系列…>/<id><后缀>（主题按系列分层）
+//!         ⑥ 后缀 .theme.toml / .theme.yaml → <root>/theme/<系列…>/<id><后缀>（主题按系列分层）
 //!         ⑦ 后缀 .lua        → <root>/plugin/<id>/<id>.lua  （字面 id 保留点号；
 //!             rime-lua 实际走 package.path 点号即目录，C++ 此分支暂无调用方、保持原样）
 //! ```
@@ -297,8 +297,10 @@ pub fn resolve(root: &Path, resource_id: &str, prefix: &str, suffix: &str) -> Pa
     if suffix.ends_with(".txt") {
         return root.join(EASSY_DIR).join(&base);
     }
-    // ⑥ .theme.toml → theme/<系列…>/<id>.theme.toml（主题按系列分层；C++ resource.cc:112-113）
-    if suffix.ends_with(".theme.toml") {
+    // ⑥ .theme.toml / .theme.yaml → theme/<系列…>/<id><后缀>（主题按系列分层；C++ resource.cc:112-113）
+    //    2026-10-27：主题文件改用 YAML（全仓库退出 TOML），后缀要一并认 —— 否则
+    //    `*.theme.yaml` 会落到"未归类资源"分支，被摆到根目录而不是 `theme/<系列>/`。
+    if suffix.ends_with(".theme.toml") || suffix.ends_with(".theme.yaml") {
         return root
             .join(THEME_DIR)
             .join(series_subdir(resource_id))
@@ -477,6 +479,16 @@ mod tests {
         assert_eq!(
             resolve(&root, "yuling.five", "", ".theme.toml"),
             root.join("theme/yuling/five/yuling.five.theme.toml")
+        );
+        // 2026-10-27：主题改用 YAML，`.theme.yaml` 必须走同一条规则 ——
+        // 否则会被当成"未归类资源"摆到根目录，宿主渲染器就找不着皮肤了。
+        assert_eq!(
+            resolve(&root, "weasel", "", ".theme.yaml"),
+            root.join("theme/weasel/weasel.theme.yaml")
+        );
+        assert_eq!(
+            resolve(&root, "yuling.five", "", ".theme.yaml"),
+            root.join("theme/yuling/five/yuling.five.theme.yaml")
         );
         // .lua → plugin/<id>/<id>.lua（字面 id 保留点号，C++ resource.cc:114-115）
         assert_eq!(

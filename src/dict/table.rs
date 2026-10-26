@@ -2557,8 +2557,19 @@ mod tests {
         let alphabet = prism.metadata().expect("metadata").alphabet.clone();
         let trie: &DoubleArray = prism.trie();
         let mut keys = Vec::new();
+        // 深度防御（与 prism.rs 的 enumerate_keys 同款）：metadata 的 max_key_length
+        // 是合法键的上限；没有它，新构建的真机 prism（含纠错拼写、节点数百万级）
+        // 会让"每个前缀都 clone 一份"的枚举吃掉数 GB（下面 count 变体的注释所言）。
+        let max_key_length = prism
+            .metadata()
+            .map(|metadata| metadata.max_key_length as usize)
+            .unwrap_or(64)
+            .max(1);
         let mut stack: Vec<(usize, Vec<u8>)> = vec![(0, Vec::new())];
         while let Some((node_pos, prefix)) = stack.pop() {
+            if prefix.len() >= max_key_length {
+                continue;
+            }
             for &c in &alphabet {
                 let mut next_node_pos = node_pos;
                 let mut next_key_pos = 0usize;
@@ -2644,10 +2655,14 @@ mod tests {
         // prism 侧的拼写集合 = darts 的全部键
         let keys = prism_keys(&prism);
         let prism_spellings: BTreeSet<String> = keys.iter().map(|(key, _)| key.clone()).collect();
+        // Prism 5.0 的 trie 含纠错拼写：枚举总数 ≥ num_spellings；不变式是
+        // 按 value 去重后恰为 num_spellings 个 id（prism.rs reads_real_yuling_prism 同款）。
+        let distinct_values: std::collections::BTreeSet<SyllableId> =
+            keys.iter().map(|(_, value)| *value).collect();
         assert_eq!(
-            prism_spellings.len(),
+            distinct_values.len(),
             prism_metadata.num_spellings as usize,
-            "枚举出的键数应等于 num_spellings"
+            "枚举出的键按 value 去重应等于 num_spellings"
         );
         for (key, value) in keys.iter().take(1000) {
             assert_eq!(prism.get_value(key), Some(*value), "{key}");

@@ -1554,7 +1554,14 @@ mod tests {
             metadata.max_key_length,
             by_length
         );
-        assert_eq!(enumerated.len(), metadata.num_spellings as usize);
+        // Prism 5.0 的 trie 里除了主拼写还存**纠错拼写**（correction/fuzzy 展开），
+        // 枚举总数 ≥ num_spellings（真机 yuling 2026-10-26：829,502 键 vs 134,042 主拼写，
+        // 探针验证：真实编码 2000/2000 命中、value 全在界内、非拼写前缀零误命中）。
+        // 真正的不变式是：枚举出的键按 value 去重后**恰好**是 num_spellings 个 id
+        // （④ 里已断言"枚举出来的键必须能原值查回"），此处只对去重数断言。
+        let distinct_values: std::collections::BTreeSet<i32> =
+            enumerated.iter().map(|(_, value)| *value).collect();
+        assert_eq!(distinct_values.len(), metadata.num_spellings as usize);
         assert_eq!(longest, metadata.max_key_length as usize);
 
         // ---- ⑤ 遍历 spelling_map（0..num_spellings） --------------------------

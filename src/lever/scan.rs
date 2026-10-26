@@ -45,7 +45,7 @@ pub enum ResourceKind {
     Dict,
     /// `<id>.yaml`：根目录扁平配置（default/weasel/symbols…），不走系列
     Config,
-    /// `<id>.theme.toml`：主题 —— 严格系列校验
+    /// `<id>.theme.yaml`（旧：`<id>.theme.toml`）：主题 —— 严格系列校验
     Theme,
     /// `<id>.lua`：脚本 —— 分组校验（`plugin/<组>/<任意>.lua`）
     Lua,
@@ -142,7 +142,7 @@ pub fn classify(path: &Path, data_root: &Path) -> Option<ScannedFile> {
         ResourceKind::Schema
     } else if file_name.ends_with(".dict.yaml") {
         ResourceKind::Dict
-    } else if file_name.ends_with(".theme.toml") {
+    } else if file_name.ends_with(".theme.toml") || file_name.ends_with(".theme.yaml") {
         ResourceKind::Theme
     } else if file_name.ends_with(".lua") {
         ResourceKind::Lua
@@ -167,7 +167,12 @@ pub fn classify(path: &Path, data_root: &Path) -> Option<ScannedFile> {
     let id = match kind {
         ResourceKind::Schema => file_name.strip_suffix(".schema.yaml").unwrap().to_string(),
         ResourceKind::Dict => file_name.strip_suffix(".dict.yaml").unwrap().to_string(),
-        ResourceKind::Theme => file_name.strip_suffix(".theme.toml").unwrap().to_string(),
+        // 2026-10-27：主题改用 YAML，两种后缀都要能剥（旧 .toml 仍认，存量文件还能扫到）。
+        ResourceKind::Theme => file_name
+            .strip_suffix(".theme.toml")
+            .or_else(|| file_name.strip_suffix(".theme.yaml"))
+            .unwrap()
+            .to_string(),
         ResourceKind::Lua => file_name.strip_suffix(".lua").unwrap().to_string(),
         ResourceKind::PluginData | ResourceKind::Essay => {
             file_name.strip_suffix(".txt").unwrap().to_string()
@@ -527,6 +532,30 @@ mod tests {
         assert_eq!(scanned.kind, ResourceKind::BuildBin);
         assert_eq!(scanned.resource_id, "a.b.table");
         assert!(scanned.placed_correctly, "{}", scanned.note);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 2026-10-27：主题文件改用 YAML（全仓库退出 TOML）。`.theme.yaml` 必须和旧的
+    /// `.theme.toml` 一样被认成 **Theme** 并按系列分层 —— 否则会落到通用 `.yaml`
+    /// 分支（Config），被当成"未归类配置"摆到根目录。
+    #[test]
+    fn theme_yaml_is_classified_as_theme() {
+        let root = temp("theme-yaml");
+        let _ = std::fs::remove_dir_all(&root);
+
+        for (file, id) in [
+            ("theme/weasel/weasel.theme.yaml", "weasel"),
+            ("theme/yuling/five/yuling.five.theme.yaml", "yuling.five"),
+            ("theme/weasel/weasel.theme.toml", "weasel"),
+        ] {
+            let path = root.join(file);
+            touch(&path);
+            let scanned = classify(&path, &root).expect("应识别");
+            assert_eq!(scanned.kind, ResourceKind::Theme, "{file}");
+            assert_eq!(scanned.resource_id, id, "{file}");
+            assert!(scanned.placed_correctly, "{}: {}", file, scanned.note);
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }
