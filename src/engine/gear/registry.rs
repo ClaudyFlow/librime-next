@@ -52,7 +52,16 @@ const MAX_CONDITION_DEPTH: usize = 32;
 /// C++ `Ticket`：创建组件时的身份证件。
 ///
 /// * `klass` —— 类名（`- lua_processor@promote_candidate` 取 `@` 前的部分）
-/// * `name_space` —— 完整 prescription（也就是列表项本身）
+/// * `name_space` —— 配置命名空间。**默认是组件类名**（`processor` / `segmentor` /
+///   `translator` / `filter`），只有 `klass@alias` 的 `alias` 才会覆盖它
+///   （`src/rime/ticket.cc:16-22`）。
+///
+/// # 为什么这条容易搞错
+///
+/// 直觉上 `- table_translator` 的命名空间该是 `table_translator`，于是去读
+/// `table_translator/dictionary`；但方案文件里配置节点一律叫 `translator:`，
+/// 所以 C++ 让命名空间**退回到组件类名**。形如 `- table_translator@my_table`
+/// 才是显式指定读 `my_table/dictionary`。
 pub struct Ticket<'a> {
     pub klass: String,
     pub name_space: String,
@@ -63,16 +72,26 @@ pub struct Ticket<'a> {
 }
 
 impl<'a> Ticket<'a> {
-    /// 从列表项的 prescription 里分出 `klass`（`@` 之前）与命名空间（整条）。
-    fn from_prescription(prescription: &str, name_space: &str, config: &'a Value, build_dir: &'a Path) -> Self {
-        let klass = prescription
-            .split('@')
-            .next()
-            .unwrap_or(prescription)
-            .to_string();
+    /// 从列表项的 prescription 里分出 `klass`（`@` 之前）与命名空间（`@` 之后的
+    /// alias，没有就用 `component_type`）。
+    fn from_prescription(
+        component_type: &str,
+        prescription: &str,
+        config: &'a Value,
+        build_dir: &'a Path,
+    ) -> Self {
+        let (klass, alias) = match prescription.split_once('@') {
+            Some((k, a)) => (k.to_string(), a.to_string()),
+            None => (prescription.to_string(), String::new()),
+        };
+        let name_space = if alias.is_empty() {
+            component_type.to_string()
+        } else {
+            alias
+        };
         Ticket {
             klass,
-            name_space: name_space.to_string(),
+            name_space,
             config,
             build_dir,
         }
@@ -257,7 +276,8 @@ where
             );
             continue;
         };
-        let ticket = Ticket::from_prescription(&prescription, &prescription, config, build_dir);
+        let ticket =
+            Ticket::from_prescription(component_type, &prescription, config, build_dir);
         let Some(component) = make(&ticket) else {
             eprintln!("[registry] error creating {component_type}: '{prescription}'");
             continue;
@@ -327,36 +347,24 @@ pub fn create_translator(ticket: &Ticket) -> Option<Box<dyn Translator + Send + 
     }
 }
 
-/// translator 的字典名：先查 `<prescription>` 命名空间，回退顶层 `translator:`
-/// （librime 把 `script_translator` 的配置放在顶层，见 [`crate::engine::schema::Schema::first_translator_dict`]）。
+/// translator 的字典名：C++ `Dictionary::Create` 只读 `ticket.name_space/dictionary`
+/// （`src/rime/dict/dictionary.cc:430`），读不到就组件创建失败。
+///
+/// 因为 [`Ticket::name_space`] 默认是组件类名 `translator`，这条实际读的是方案里
+/// 的 `translator/dictionary`，与 `translator:` 节点吻合。`prism` 不给时与词典同名
+/// （librime 里拼音方案常另行指定，如 `luna_pinyin` + `luna_pinyin_simp`）。
 fn translator_dict_name(ticket: &Ticket) -> Option<(String, String)> {
-    if !ticket.name_space.is_empty() {
-        // prescription 形如 `script_translator` 或 `translator@xxx`；librime 里
-        // engine/translators 列的就是**命名空间名**，配置节点在 `/<ns>/dictionary`。
-        if let Some(dict) = ticket
-            .config
-            .pointer(&format!("/{}/dictionary", ticket.name_space))
-            .and_then(|v| v.as_str())
-        {
-            let prism = ticket
-                .config
-                .pointer(&format!("/{}/prism", ticket.name_space))
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-                .unwrap_or_else(|| dict.to_string());
-            return Some((dict.to_string(), prism));
-        }
-    }
-    if let Some(dict) = ticket.config.pointer("/translator/dictionary").and_then(|v| v.as_str()) {
-        let prism = ticket
-            .config
-            .pointer("/translator/prism")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .unwrap_or_else(|| dict.to_string());
-        return Some((dict.to_string(), prism));
-    }
-    None
+    let dict = ticket
+        .config
+        .pointer(&format!("/{}/dictionary", ticket.name_space))
+        .and_then(|v| v.as_str())?;
+    let prism = ticket
+        .config
+        .pointer(&format!("/{}/prism", ticket.name_space))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| dict.to_string());
+    Some((dict.to_string(), prism))
 }
 
 /// Wrapper[registry]方案里的四个列表都装配一遍（对照 `InitializeComponents`）。
@@ -483,8 +491,34 @@ mod tests {
     #[test]
     fn unknown_klass_returns_none() {
         let config = json!({});
-        let ticket = Ticket::from_prescription("lua_processor@foo", "lua_processor@foo", &config, Path::new(""));
+        let ticket = Ticket::from_prescription("processor", "lua_processor@foo", &config, Path::new(""));
         assert_eq!(ticket.klass, "lua_processor");
+        assert_eq!(ticket.name_space, "foo", "@ 后的 alias 覆盖默认命名空间");
         assert!(create_processor(&ticket).is_none());
+    }
+
+    /// C++ `Ticket(engine, ns, prescription)`：命名空间**默认是组件类名**，
+    /// 所以方案里 `- table_translator` 读的是 `translator/dictionary`。
+    #[test]
+    fn name_space_defaults_to_component_type() {
+        let config = json!({});
+        let t = Ticket::from_prescription("translator", "table_translator", &config, Path::new(""));
+        assert_eq!(t.klass, "table_translator");
+        assert_eq!(t.name_space, "translator");
+
+        let t = Ticket::from_prescription("processor", "recognizer", &config, Path::new(""));
+        assert_eq!(t.name_space, "processor");
+    }
+
+    /// 修这条之前的 bug：命名空间被写成整条 prescription，于是去读
+    /// `table_translator/dictionary`（方案里根本没有这个节点）。
+    #[test]
+    fn table_translator_reads_the_translator_node() {
+        let config = json!({"translator": {"dictionary": "stroke", "prism": "stroke"}});
+        let t = Ticket::from_prescription("translator", "table_translator", &config, Path::new(""));
+        assert_eq!(
+            translator_dict_name(&t),
+            Some(("stroke".to_string(), "stroke".to_string()))
+        );
     }
 }

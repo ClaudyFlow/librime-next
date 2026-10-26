@@ -36,3 +36,4 @@ pub mod segmentor;
 pub mod selector;
 pub mod speller;
 pub mod translator;
+pub mod translator_options;
