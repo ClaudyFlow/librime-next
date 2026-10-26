@@ -614,7 +614,12 @@ fn run_config_file_update(deployer: &mut Deployer, file_name: &str, version_key:
     // `default` 资源（编译时 `__include`/`__patch` 的基准，schema 靠它拿
     // `default/menu`、`default/navigator`、`default/selector`）。
     let defaults_path = default_config_path(deployer);
-    match config::compile(&source, &defaults_path, &[]) {
+    // 共享目录必须始终在解析根里（C++ 的 ConfigCompiler 拿的 resolver 恒为
+    // [user_data_dir, shared_data_dir] 双根）。defaults_path 指向用户副本时
+    // （真机：default.yaml 在用户目录），compile 的根去重后只剩 user 单根，
+    // `symbols`/`luna_pinyin_simp` 等只在共享目录的资源全部解析失败
+    // （真机 2026-10-26：default 编译 11 处 "resource could not be loaded: symbols"）。
+    match config::compile(&source, &defaults_path, &[deployer.shared_data_dir.clone()]) {
         Ok(compiled) => match write_compiled_schema(&compiled, &output) {
             Ok(()) => {
                 log_info(&format!("updated config file '{file_name}' -> {}", output.display()));

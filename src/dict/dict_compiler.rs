@@ -433,6 +433,13 @@ impl DictCompiler {
 
 /// `classified_dict_source`（`dict_compiler.cc:56-86`，C++ 的 static 函数）：
 /// 先用户目录后共享目录，**没有扁平回退**；找不到返回 `None`。
+///
+/// [Weasel-Next 宽容项 2026-10-26] 裸 id 的系列路径失手后，再扫两个数据根的
+/// `schema/<一级子目录>/`（兄弟方案目录）。场景：用户目录里留着**旧版无前缀**
+/// `import_tables`（`- yustar.quick`）的词典头，而带前缀写法的新版在共享目录
+/// `schema/yuhao/` 下——旧副本按优先级胜出后，系列规则
+/// `schema/yustar/quick/…` 找不到文件，真机 deploy 因此 18/2。
+/// 只扫一级目录、只认完整文件名，不会把扁平文件捞回来。
 pub fn classified_dict_source(
     user_data_dir: &Path,
     shared_data_dir: &Path,
@@ -456,6 +463,21 @@ pub fn classified_dict_source(
         nested = nested.join(&file_name);
         if nested.is_file() {
             return Some(nested);
+        }
+    }
+    // 宽容搜索：裸 id 在兄弟方案目录里找（见函数头注释）。
+    if !explicit {
+        for root in [user_data_dir, shared_data_dir] {
+            let schema_dir = root.join("schema");
+            let Ok(entries) = std::fs::read_dir(&schema_dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let candidate = entry.path().join(&file_name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
         }
     }
     None

@@ -1385,8 +1385,20 @@ mod tests {
             .map(|metadata| metadata.alphabet.clone())
             .unwrap_or_default();
         let mut keys = Vec::new();
+        // 深度上限 = metadata 的 max_key_length（合法 trie 的任何 key 都不超过它）。
+        // 没有 2026-10-26 深夜重建的 yuling.prism.bin 时，这层防御是必须的：
+        // double-array 的稀疏单元里可能存在 self-loop 弧（traverse 返回有效值但
+        // node_pos 不前进），无界 BFS 会以前缀无限增长的方式吃光内存。
+        let max_key_length = prism
+            .metadata()
+            .map(|metadata| metadata.max_key_length as usize)
+            .unwrap_or(64)
+            .max(1);
         let mut stack: Vec<(usize, Vec<u8>)> = vec![(0, Vec::new())];
         while let Some((node_pos, prefix)) = stack.pop() {
+            if prefix.len() >= max_key_length {
+                continue;
+            }
             for &c in &alphabet {
                 let mut next_node_pos = node_pos;
                 let mut next_key_pos = 0usize;

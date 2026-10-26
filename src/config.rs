@@ -110,20 +110,25 @@ pub fn compile(
         .unwrap_or(file_name)
         .to_string();
 
-    // roots 顺序 = librime 的 [user_data_dir, shared_data_dir]；再补 CLI 的搜索目录
+    // roots 顺序 = librime 的 [user_data_dir, shared_data_dir]；再补 CLI 的搜索目录。
+    //
+    // 数据根的推导：源文件在 `<数据根>/schema/…` 下时，数据根 = 那一级 `schema`
+    // 目录的父目录；源文件在数据根本身（`default.yaml` 等根级配置）时，
+    // 数据根 = 源文件所在目录。**不能**无条件跳 grandparent——那会把根级源文件的
+    // 根推到数据根的上一级（真机 2026-10-26：symbols.yaml 因此被找到
+    // `%APPDATA%\symbols.yaml`，少了 Rime-Next 一级）。
     let mut roots: Vec<PathBuf> = Vec::new();
     if let Some(parent) = schema_path.parent() {
         let mut root = parent.to_path_buf();
-        if let Some(grandparent) = parent.parent() {
-            root = grandparent.to_path_buf();
-            if grandparent
-                .file_name()
-                .map_or(false, |name| name == "schema")
-            {
-                if let Some(great) = grandparent.parent() {
-                    root = great.to_path_buf();
+        let mut cursor = Some(parent);
+        while let Some(dir) = cursor {
+            if dir.file_name().map_or(false, |name| name == "schema") {
+                if let Some(data_root) = dir.parent() {
+                    root = data_root.to_path_buf();
                 }
+                break;
             }
+            cursor = dir.parent();
         }
         roots.push(root);
     }
