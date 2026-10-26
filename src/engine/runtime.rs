@@ -21,6 +21,7 @@ use crate::engine::gear::filter::Filter;
 use crate::engine::gear::matcher::Matcher;
 use crate::engine::gear::processor::{ProcessResult, Processor};
 use crate::engine::gear::registry::{ComponentEntry, install_engine_components};
+use crate::engine::gear::schema_list_translator;
 use crate::engine::gear::segmentor::{Segmentor, SegmentorView};
 use crate::engine::gear::selector::Selector;
 use crate::engine::gear::speller::Speller;
@@ -29,6 +30,7 @@ use crate::engine::key_event::KeyEvent;
 use crate::engine::menu::Menu;
 use crate::engine::schema::Schema;
 use crate::engine::segmentation::{SegStatus, Segmentation};
+use crate::engine::switcher::{self, Switcher};
 
 /// 引擎（对照 C++ `Engine`）。
 ///
@@ -50,6 +52,20 @@ pub struct Engine {
     /// （`Deployer::staging_dir`），而 `model/<语言>.gram` 在用户目录、`opencc/` 在共享目录
     /// —— 两东西不在同一个根下，必须两个都查。
     data_roots: Vec<std::path::PathBuf>,
+    /// `default.yaml` 的配置树：switcher 的方案清单与菜单设置都在里面。
+    ///
+    /// C++ 是 `Switcher` 作为 `Engine` 时那个 `.default` schema 的 config；LRN 的
+    /// switcher 不做独立引擎，配置树由这里托管。
+    pub default_config: serde_json::Value,
+    /// 用户目录（`data_roots[0]`）：`user.yaml` 读写的位置。
+    pub user_dir: Option<std::path::PathBuf>,
+    /// 组件登记的方案切换请求。
+    ///
+    /// C++ 的 `Switcher` 直接 `engine->ApplySchema()`；Rust 里 `Switcher` 自己就在
+    /// `processors` 列表里（已被 `mem::take` 到局部），同步重建会被遍历结束时的
+    /// `self.processors = processors` 覆盖掉 —— 所以只登记，由
+    /// [`Engine::process_key`] 在列表归位后执行。
+    pending_schema: Option<String>,
 }
 
 impl Engine {
@@ -68,12 +84,23 @@ impl Engine {
         schema_id: &str,
         data_roots: &[std::path::PathBuf],
     ) -> Option<Engine> {
-        let schema = Schema::open(build_dir, schema_id)?;
-        let data_roots = if data_roots.is_empty() {
+        let data_roots: Vec<std::path::PathBuf> = if data_roots.is_empty() {
             build_dir.parent().map(Path::to_path_buf).into_iter().collect()
         } else {
             data_roots.to_vec()
         };
+        let user_dir = data_roots.first().cloned();
+        let default_config = switcher::load_default_config(&data_roots);
+        // `.default` / 空 id：C++ 的 `Switcher` 在这个位置替引擎挑一个方案
+        // （`engine.cc:570-574`：`if (schema_->schema_id() == ".default")` 用
+        // `switcher_->CreateSchema()` 的结果）。挑法是"上次用过的，否则清单第一条"。
+        let resolved_id = if schema_id == ".default" || schema_id.is_empty() {
+            let previous = switcher::load_previous_schema(user_dir.as_deref());
+            schema_list_translator::pick_initial_schema(&default_config, previous.as_deref())?
+        } else {
+            schema_id.to_string()
+        };
+        let schema = Schema::open(build_dir, &resolved_id)?;
         let mut engine = Engine {
             schema,
             context: Context::new(),
@@ -84,6 +111,9 @@ impl Engine {
             synthetic_queue: Vec::new(),
             build_dir: build_dir.to_path_buf(),
             data_roots,
+            default_config,
+            user_dir,
+            pending_schema: None,
         };
         engine.initialize_components();
         Some(engine)
@@ -124,6 +154,25 @@ impl Engine {
         } else {
             self.processors = processors;
         }
+        // switcher 永远排**第一个**（C++ `engine.cc:565-570` 先 push `switcher_` 再
+        // 装方案里的 processors），这样 `F4` / `Control+grave` 不会被 speller 先吃掉。
+        //
+        // 它不吃 `engine/processors` 的配置，所以不走 registry；构造时要把上次保存的
+        // 开关状态读回来（C++ `ConcreteEngine` 构造里 `switcher_->RestoreSavedOptions()`，
+        // `engine.cc:156`），否则用户设的简繁/全半角重启就丢。
+        let switcher = Switcher::new(
+            self.default_config.clone(),
+            &self.build_dir,
+            self.user_dir.clone(),
+        );
+        switcher.restore_saved_options(&mut self.context);
+        self.processors.insert(
+            0,
+            ComponentEntry::new(
+                Box::new(switcher) as Box<dyn Processor + Send + Sync>,
+                "switcher",
+            ),
+        );
         if segmentors.is_empty() {
             // 回退：方案没列 `engine/segmentors`（测试环境 / 极简方案）。
             // 顺序照抄 librime 的默认名单：abc → matcher → fallback。
@@ -195,6 +244,10 @@ impl Engine {
         // 提交可能发生在任何一个 processor 里（editor 的 space / enter / 数字键），
         // 处理器只拿得到 `&mut Context`，所以学词在这里补。
         self.apply_commit();
+        // 方案切换：处理链跑完、`self.processors` 已归位，这时重建才不会被打断。
+        if let Some(schema_id) = self.pending_schema.take() {
+            self.apply_schema(&schema_id);
+        }
         result
     }
 
@@ -264,6 +317,9 @@ impl Engine {
                 self.schema = schema;
                 self.initialize_components();
                 self.context.clear();
+                // C++ `engine.cc:377`：切成功后 `switcher_->SetActiveSchema()`，
+                // 记下"上次用的方案"与访问时间 —— 菜单里的方案排序靠它。
+                switcher::record_active_schema(self.user_dir.as_deref(), schema_id);
                 true
             }
             None => {
@@ -271,6 +327,28 @@ impl Engine {
                 false
             }
         }
+    }
+
+    /// 登记一次方案切换请求（供 `switcher` 这类组件用）。
+    ///
+    /// 不能在组件里直接调 [`Self::apply_schema`]：那时 `processors` 列表正被
+    /// `mem::take` 在局部遍历，重建会写进 `self.processors`，但遍历结束又会被那份
+    /// 旧列表覆盖 —— 切换静默失效。登记后由 [`Self::process_key`] 统一执行。
+    pub fn request_schema(&mut self, schema_id: String) {
+        self.pending_schema = Some(schema_id);
+    }
+
+    /// C++ `Switcher::SelectNextSchema`：方案清单里的下一个方案。
+    ///
+    /// `key_binder` 的 `select: .next` 走这里（`key_binder.cc:155` 临时建一个
+    /// `Switcher` 再调它）。返回 `None` = 清单里只有一个方案。
+    pub fn next_schema_id(&self) -> Option<String> {
+        let switcher = Switcher::new(
+            self.default_config.clone(),
+            &self.build_dir,
+            self.user_dir.clone(),
+        );
+        switcher.next_schema(&self.schema.schema_id)
     }
 
     /// 设定开关（给组件之外的调用方复用）。
@@ -507,6 +585,9 @@ impl Engine {
             synthetic_queue: Vec::new(),
             build_dir: std::path::PathBuf::new(),
             data_roots: Vec::new(),
+            default_config: serde_json::Value::Object(serde_json::Map::new()),
+            user_dir: None,
+            pending_schema: None,
         }
     }
 }

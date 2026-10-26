@@ -1,9 +1,29 @@
-patch:
-  schema_list:
-    -
-      {schema: luna_pinyin_simp}
-__build_info:
-  rime_version: 1.17.0
-  timestamps:
-    default: 1792907566
-    default.custom: 0
+# e2e 数据根的 `default.yaml` —— 与**生产环境同格式**（源文件格式）。
+#
+# 这一点很重要：`Config::Create("default")` 读的是**源**文件，`schema_list` 与
+# `switcher` 都在顶层。只有当它被部署任务处理过之后，产物才会出现 `patch:` 段
+# （`__patch` 被展开的结果）。之前这份 fixture 写的是**产物**样子，于是
+# switcher 读 `schema_list` 时什么也找不到 —— 引擎能跑，菜单是空的。
+#
+# 三个方案都能在本目录加载（各自有 .schema.yaml + .bin）：
+#   luna_pinyin_simp —— 拼音，默认方案
+#   wubi86           —— 五笔（形码整句 / 字符集过滤的验证方案）
+#   stroke           —— 笔画（结构简单，切换测试用）
+schema_list:
+  - { schema: luna_pinyin_simp }
+  - { schema: wubi86 }
+  - { schema: stroke }
+
+switcher:
+  caption: 〔方案選單〕
+  hotkeys:
+    - F4
+    - Control+grave
+  save_options:
+    - full_shape
+    - ascii_punct
+
+menu:
+  page_size: 5
+
+config_version: "2023.7.26"

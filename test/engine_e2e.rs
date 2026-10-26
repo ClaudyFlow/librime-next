@@ -1592,3 +1592,243 @@ fn echo_fallback_can_be_committed_as_is() {
         "兜底候选存在的意义就是让这段能原样上屏"
     );
 }
+
+// ── 方案 / 开关菜单（`Switcher`）─────────────────────────────────────────
+//
+// `F4`（X11 keysym 0xffc1）唤起。菜单其实就是一个**空段**（`[0, 0)`）+ 菜单：
+// 候选全是 0..0 的"动作条目"，选中后执行、菜单收起。
+//
+// 顺序照抄 C++：方案在前（当前方案第一），开关在后。这个顺序不是排出来的，
+// 是建菜单时按"先 schema_list_translator、后 switch_translator"拼的 —— 所以
+// `Menu::prepare()` 特意没调。
+
+const XK_F4: u32 = 0xffc1;
+
+/// 建会话并保留用户目录路径（菜单会往 `user.yaml` 写东西，要验）。
+fn new_session_tracking_user(build: &std::path::Path, schema: &str) -> (Session, PathBuf) {
+    let user_dir = fresh_user_dir(schema);
+    let session = Session::create_with_roots(build, schema, &[user_dir.clone(), build.to_path_buf()]);
+    (session, user_dir)
+}
+
+/// 从第 0 条往下走 `steps` 步（菜单没有环绕，用 clamp）。
+fn walk_down(session: &mut Session, steps: usize) {
+    for _ in 0..steps {
+        session.process_key(0xff54, 0); // XK_Down
+    }
+}
+
+#[test]
+fn f4_opens_the_switcher_menu() {
+    let mut session = new_session(&build_dir(), "luna_pinyin_simp");
+    assert!(session.process_key(XK_F4, 0), "F4 应被消费");
+
+    {
+        let ctx = session.context().expect("引擎可读");
+        assert!(ctx.is_composing(), "菜单算「组合中」，宿主才会画候选窗");
+        assert_eq!(ctx.composition.segmentation.segments.len(), 1);
+        let seg = &ctx.composition.segmentation.segments[0];
+        assert_eq!(seg.prompt, "〔方案選單〕", "提示语来自 switcher/caption");
+        assert_eq!((seg.start, seg.end), (0, 0), "空段：菜单不覆盖任何输入");
+        assert_eq!(ctx.input, "", "菜单展开时输入串是空的");
+    }
+
+    let texts = candidate_texts(&mut session);
+    assert_eq!(
+        &texts[..3],
+        &[
+            "朙月拼音·简化字",
+            "五笔86 (e2e 验证)",
+            "五筆畫 (e2e 验证)"
+        ],
+        "方案在前且当前方案第一，实际：{texts:?}"
+    );
+    assert!(texts.contains(&"中文".to_string()), "应有 ascii_mode 开关");
+    assert!(texts.contains(&"半角".to_string()), "应有 full_shape 开关");
+    assert!(
+        texts.iter().any(|t| t == "傳統漢字"),
+        "单选组应铺开：{texts:?}"
+    );
+}
+
+#[test]
+fn escape_closes_the_switcher() {
+    let mut session = new_session(&build_dir(), "luna_pinyin_simp");
+    session.process_key(XK_F4, 0);
+    assert!(session.process_key(0xff1b, 0), "Escape 应被消费");
+
+    let ctx = session.context().expect("引擎可读");
+    assert!(!ctx.is_composing(), "退出后不该还在组合");
+    assert!(ctx.composition.segmentation.segments.is_empty());
+    assert!(
+        !ctx.get_option("dumb"),
+        "dumb 要清掉，否则后续输入永远上不了屏"
+    );
+}
+
+#[test]
+fn pressing_the_hotkey_again_jumps_to_the_next_schema() {
+    let mut session = new_session(&build_dir(), "luna_pinyin_simp");
+    session.process_key(XK_F4, 0);
+    session.process_key(XK_F4, 0); // 再按一次 → 高亮下一个方案
+
+    let ctx = session.context().expect("引擎可读");
+    assert_eq!(
+        ctx.composition.segmentation.segments[0].selected_index,
+        1,
+        "应跳到第二个方案候选"
+    );
+    // 菜单还在（只是高亮变了）
+    assert!(ctx.is_composing());
+}
+
+#[test]
+fn switcher_toggles_a_switch_and_persists_it() {
+    let (mut session, user_dir) = new_session_tracking_user(&build_dir(), "luna_pinyin_simp");
+    session.process_key(XK_F4, 0);
+
+    let texts = candidate_texts(&mut session);
+    let index = texts
+        .iter()
+        .position(|t| t == "半角")
+        .expect("菜单里应有 full_shape");
+    walk_down(&mut session, index);
+    assert!(session.process_key(0xff0d, 0), "回车应被消费");
+
+    let ctx = session.context().expect("引擎可读");
+    assert!(ctx.get_option("full_shape"), "full_shape 应被打开");
+    assert!(!ctx.is_composing(), "选中后菜单收起");
+
+    // full_shape 在 save_options 里 ⇒ 必须落盘到 user.yaml
+    let saved = std::fs::read_to_string(user_dir.join("user.yaml")).unwrap_or_default();
+    assert!(
+        saved.contains("full_shape"),
+        "开关状态应写进 user.yaml，实际内容：{saved:?}"
+    );
+}
+
+#[test]
+fn switcher_selects_a_radio_option() {
+    let mut session = new_session(&build_dir(), "luna_pinyin_simp");
+    session.process_key(XK_F4, 0);
+
+    let texts = candidate_texts(&mut session);
+    let index = texts
+        .iter()
+        .position(|t| t == "臺灣字形")
+        .expect("单选组应铺出臺灣字形");
+    walk_down(&mut session, index);
+    session.process_key(0xff0d, 0);
+
+    let ctx = session.context().expect("引擎可读");
+    assert!(ctx.get_option("zh_hant_tw"), "应选中臺灣字形");
+    assert!(!ctx.get_option("zh_hans"), "单选组里其余必须关掉");
+}
+
+#[test]
+fn switcher_switches_the_schema() {
+    let mut session = new_session(&build_dir(), "luna_pinyin_simp");
+    session.process_key(XK_F4, 0);
+
+    let texts = candidate_texts(&mut session);
+    let index = texts
+        .iter()
+        .position(|t| t.starts_with("五笔86"))
+        .expect("菜单里应有五笔");
+    walk_down(&mut session, index);
+    assert!(session.process_key(0xff0d, 0));
+
+    assert_eq!(
+        session.schema_id(),
+        Some("wubi86"),
+        "应切到五笔（引擎整个重建）"
+    );
+    // 切完还能正常打字 —— 这一步能过说明组件是按新方案重新装配过的
+    assert!(session.process_key(b'w' as u32, 0));
+    let texts = candidate_texts(&mut session);
+    assert!(!texts.is_empty(), "切完方案应能出候选，实际 {texts:?}");
+}
+
+#[test]
+fn switcher_remembers_the_schema_for_next_time() {
+    let (mut session, user_dir) = new_session_tracking_user(&build_dir(), "luna_pinyin_simp");
+    session.process_key(XK_F4, 0);
+    let texts = candidate_texts(&mut session);
+    let index = texts
+        .iter()
+        .position(|t| t.starts_with("五笔86"))
+        .expect("菜单里应有五笔");
+    walk_down(&mut session, index);
+    session.process_key(0xff0d, 0);
+
+    let saved = std::fs::read_to_string(user_dir.join("user.yaml")).unwrap_or_default();
+    assert!(
+        saved.contains("previously_selected_schema") && saved.contains("wubi86"),
+        "应记下上次选的方案（菜单排序靠它），实际：{saved:?}"
+    );
+    assert!(
+        saved.contains("schema_access_time"),
+        "访问时间也要记，否则菜单按 recency 排不出来",
+    );
+}
+
+
+#[test]
+fn next_schema_id_walks_the_schema_list() {
+    // `key_binder` 的 `select: .next` 靠它（C++ 临时建 `Switcher` 调 `SelectNextSchema`）
+    let session = new_session(&build_dir(), "luna_pinyin_simp");
+    let engine = session.engine.as_ref().expect("引擎可读");
+    assert_eq!(
+        engine.next_schema_id().as_deref(),
+        Some("wubi86"),
+        "清单是 luna → wubi86 → stroke，下一个应是五笔"
+    );
+
+    let session = new_session(&build_dir(), "wubi86");
+    let engine = session.engine.as_ref().expect("引擎可读");
+    // ⚠️ 反直觉：`.next` 不是"清单里的下一个"，而是"菜单第二条"。而菜单里
+    // **当前方案永远排第一**（`LoadSchemaList` 先 Append 当前，再遍历其余），
+    // 所以第二条永远是"清单里第一个不是当前方案的"。从 wubi86 出发是 luna，
+    // 不是 stroke —— 这就是那条规则的体现。
+    assert_eq!(
+        engine.next_schema_id().as_deref(),
+        Some("luna_pinyin_simp"),
+        "当前方案占第一条，取的是「除当前外的第一条」"
+    );
+}
+
+#[test]
+fn default_schema_id_is_resolved_from_the_schema_list() {
+    // C++ `engine.cc:570-574`：`schema_id == ".default"` 时由 `switcher_->CreateSchema()`
+    // 挑一个。宿主没指定方案时走这条路。
+    let session = new_session(&build_dir(), ".default");
+    assert_eq!(
+        session.schema_id(),
+        Some("luna_pinyin_simp"),
+        "没有历史记录时取清单第一条"
+    );
+}
+
+#[test]
+fn default_schema_prefers_the_previously_selected_one() {
+    let user_dir = fresh_user_dir("defaultpick");
+    std::fs::write(
+        user_dir.join("user.yaml"),
+        // 用 raw 多行字符串：这里的换行必须是真换行，不能靠转义序列
+        r#"var:
+  previously_selected_schema: stroke
+"#,
+    )
+    .unwrap();
+    let session = Session::create_with_roots(
+        &build_dir(),
+        ".default",
+        &[user_dir, build_dir()],
+    );
+    assert_eq!(
+        session.schema_id(),
+        Some("stroke"),
+        "上次用的是笔画，就该接着用"
+    );
+}
+

@@ -371,13 +371,21 @@ fn unset_option(engine: &mut Engine, option: &str) {
     }
 }
 
-/// C++ `select_schema`：`.next` 要走 Switcher（还没移植），其余换方案。
+/// C++ `select_schema`（`key_binder.cc:148-160`）。
+///
+/// `.next` 不是方案 id，而是"清单里的下一个"：C++ 临时建一个 `Switcher`
+/// 调 `SelectNextSchema()`（`key_binder.cc:155`），走的是方案菜单的第 2 条。
+///
+/// 两条分支都**只登记**不直接切 —— `key_binder` 自己就在 `processors` 链里，
+/// 同步 `apply_schema` 会被遍历结束时的列表归位覆盖掉（见 `Engine::request_schema`）。
 fn select_schema(engine: &mut Engine, schema: &str) {
     if schema == ".next" {
-        eprintln!("[key_binder] select: .next 需要 Switcher，尚未移植，忽略");
+        if let Some(next) = engine.next_schema_id() {
+            engine.request_schema(next);
+        }
         return;
     }
-    engine.apply_schema(schema);
+    engine.request_schema(schema.to_string());
 }
 
 #[cfg(test)]

@@ -58,11 +58,19 @@ fn real_schema_assembles_processors_from_config() {
         names.contains(&"punctuator"),
         "应有 punctuator，实际 {names:?}"
     );
-    // processor 名单与方案配置同序：ascii_composer → recognizer → key_binder → speller …
+    // processor 名单与方案配置同序，但 **switcher 永远插在最前面**：
+    // C++ `ConcreteEngine::InitializeComponents`（`engine.cc:565-570`）先 push
+    // `switcher_`，再按 `engine/processors` 装 —— 因为 `F4` / `Control+grave`
+    // 不能被 speller 先吃掉。
     assert_eq!(
         names.first().copied(),
+        Some("switcher"),
+        "名单头应是 switcher：{names:?}"
+    );
+    assert_eq!(
+        names.get(1).copied(),
         Some("ascii_composer"),
-        "名单头应是 ascii_composer：{names:?}"
+        "方案里的第一个 processor 要紧跟其后：{names:?}"
     );
 
     // 分段器名单同样来自配置（真实 luna_pinyin_simp 的 `engine/segmentors`

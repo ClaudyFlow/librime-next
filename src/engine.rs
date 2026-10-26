@@ -11,6 +11,7 @@
 //! * `composition` —— 组合串（= Segmentation + preedit 计算）
 //! * `context`     —— 会话级状态：input / caret / composition / commit / options
 //! * `schema`      —— 方案（包装编译后的 Config 树，提供 engine 组件清单）
+//! * `switcher`    —— 方案 / 开关菜单（`F4`、`Control+grave`）
 //! * `gear`        —— 处理器/翻译器/选择器（一次按键的核心链路）
 //! * `runtime`     —— `Engine`（持有 Schema + Context + 组件，驱动 Compose）
 //! * `session`     —— `Session`（引擎 + 提交通道，c_api 每个会话一个）
@@ -29,6 +30,7 @@ pub mod runtime;
 pub mod schema;
 pub mod segmentation;
 pub mod session;
+pub mod switcher;
 pub mod switches;
 
 pub use candidate::{Candidate, Page};

@@ -12,7 +12,7 @@
 
 | 层 | LRN | 补丁版 | 判定 |
 |---|---|---|---|
-| 输入组件 | 31 / 35 | 35 / 35 | 数量上仍缺 4 项，但**出厂 124 个方案引用的组件已 100% 覆盖**（引用加权 472/472）；剩下 4 项出厂 0 引用 |
+| 输入组件 | 33 / 35 | 35 / 35 | 数量上仍缺 2 项（`chord_composer`、`streaming_chord_processor`，都是并击输入，出厂 0 引用）。**出厂 124 个方案引用的组件已 100% 覆盖**（引用加权 472/472） |
 | **整句组句（WordGraph + Poet）** | **有**，`src/engine/gear/poet.rs` + `Dictionary::lookup_from_graph` | 有，`ScriptSyllabifier::BuildSyllableGraph` + `Poet::MakeSentences` | **已对齐**（`b1b0125`）。`nihaoshijie` → 「你好世界」；`nihao` → 「你好」（精确词条不组句） |
 | 用户词典 UserDb 持久化 | **有**，`db.rs` + `level_db.rs`（rusty-leveldb）+ `user_db.rs` + `user_dictionary.rs`；`script_translator` 与 `table_translator` 两条学词链路都已打通，另补 `UnityTableEncoder` + `DictEntryIterator` | LevelDB 实装，`%APPDATA%/Rime-Next/userdb/` 下 4 个 `.userdb` 在用 | **已对齐**（拼音 + 形码双路） |
 | 语法模型 octagram grammar | **有**，`gram_db.rs` + `grammar.rs`（Darts trie + 紧凑 n-gram 编码 + 五元打分） | 有，4 个 `.gram` 共约 470 MB 在用 | **已对齐**（未提交时）。`zhongguoren` → 「中國人」排第一 |
@@ -60,8 +60,8 @@
 | `reverse_lookup_translator` | ✅ | **18** |
 | `history_translator` | ✅ | **12** |
 | `echo_translator` | ✅ | 0（兜底回显；出厂没列，但它是"输入了方案里没有的字母"时唯一的退路） |
-| `schema_list_translator` | ❌ | 0 |
-| `switch_translator` | ❌ | 0 |
+| `schema_list_translator` | ✅ | 0（经 `Switcher` 调用；出厂不列进 `engine/translators`，C++ 的 `Query` 也只对 Switcher 有效） |
+| `switch_translator` | ✅ | 0（同上，靠 `Switcher` 撑起 `F4` 菜单里的开关部分） |
 
 ### filter（6）
 
@@ -239,9 +239,11 @@ grep -E 'r\.Register' /c/code/librime/src/rime/gear/gears_module.cc
 9. ~~`charset_filter` / `cjk_minifier`~~ ✅ 组件 0 引用，但 `table_translator` 的
    `enable_charset_filter` 内联路径有 3 个出厂方案在用
 10. ~~`echo_translator`~~ ✅ 出厂 0 引用，但它是"输入了方案里没有的字母"时唯一的退路
-11. 其余 4 项（`chord_composer`、`streaming_chord_processor`、`schema_list_translator`、
-    `switch_translator`；出厂 0 引用。后两者依赖 **Switcher 会话**，而 Switcher 是
-    `F4` 切换方案 / `Control+grave` 方案菜单的底座 —— 属"组件 0 引用但功能 100% 在用"）
+11. ~~`Switcher` 底座 + `schema_list_translator` / `switch_translator`~~ ✅ 组件
+    **31/35 → 33/35**。这两个组件出厂引用是 0，但它们撑起的 `F4` / `Control+grave`
+    方案菜单**每个用户都会用** —— 属"组件 0 引用但功能 100% 在用"。顺带接上
+    `key_binder` 的 `select: .next`（原先打"尚未移植，忽略"的日志）
+12. 其余 2 项（`chord_composer`、`streaming_chord_processor`；并击输入，出厂 0 引用）
 
 | 日期 | 变更 |
 |---|---|
@@ -262,3 +264,4 @@ grep -E 'r\.Register' /c/code/librime/src/rime/gear/gears_module.cc
 | 2026-10-26 | `charset_filter` / `cjk_minifier` ✅（字符集过滤）：`gear/charset_filter.rs`，CJK 扩展 A–J + 兼容汉字/补充的区间表照抄（`U+3300..33FF`、`U+FE30..FE4F` 两行 C++ 是注释掉的，同样不启用）。两条入口：组件本体（0 引用）+ `table_translator` 的 `enable_charset_filter` 内联（**wubi86 / cangjie5 / cangjie5_express 三个出厂方案在用**，`extended_charset` 可关闭）。组件 **28/35 → 30/35**。e2e：`wqvbwq` 不再出「𠛈」（U+206C8 扩展 B），开 `extended_charset` 后回来。全量 **518 passed / 0 failed** |
 | 2026-10-26 | `default.yaml` 的解析路径对齐：补丁版全程走 `Config::Require("config")->Create("default")`，那个解析器的根是**用户目录、回退根是共享目录**（`service.cc:167-172`）。LRN 原来两处（编译 schema 的基准配置、方案清单的回退来源）都硬写成 `shared_data_dir/default.yaml`，用户改过 `%APPDATA%/Rime-Next/default.yaml` 时会被忽略。改成 `default_config_path()` 用户优先 + 共享回退。全量 **519 passed / 0 failed** |
 | 2026-10-26 | `echo_translator` ✅（兜底回显）：组件 **30/35 → 31/35**。C++ 靠 `EchoTranslation::Compare` 检查 `other->exhausted()` 实现"别处有料就自尽"，LRN 的翻译器之间没有协商通道，改用 `Translator::is_fallback()` 标记 + runtime 延后合并，语义等价（单一 `quality` 排序做不到"根本不出现"）。e2e：`vvv` 切不出音节 → 只剩 raw 候选「vvv」且能原样上屏；`nihao` → 有「你好」时兜底让位。全量 **525 passed / 0 failed** |
+| 2026-10-26 | **`Switcher` 方案菜单** ✅：`src/engine/switcher.rs` + `gear/switch_translator.rs` + `gear/schema_list_translator.rs`，组件 **31/35 → 33/35**。C++ 的 `Switcher` 同时是 `Processor` 和独立 `Engine`（靠 `set_active_engine` 让宿主切读它的 context），Rust 没有多继承，**菜单直接写主引擎的 `Context`** 就不需要那套转发。方案切换要"登记 + 延迟执行"（组件自己就在 processors 链里，同步重建会被列表归位覆盖）。e2e 8 条：`F4` 开菜单（方案在前·当前方案第一·开关在后）、Esc 关、再按 F4 跳下一个方案、开关翻转并落盘 `user.yaml`、单选组互斥、切方案后引擎重建仍能打字、`.default` 按 `previously_selected_schema` 挑方案。`Menu::prepare` 这里刻意**不调** —— 候选顺序是建菜单时算好的。全量 **557 passed / 0 failed** |
