@@ -70,6 +70,7 @@ pub mod dict_compiler;
 pub mod dict_settings;
 pub mod dictionary;
 pub mod entry_collector;
+pub mod gram_db;
 pub mod level_db;
 pub mod mapped_file;
 pub mod preset_vocabulary;

@@ -1,0 +1,43 @@
+# e2e 专用：验证 `grammar/language` → `model/<language>.gram` 这条链路。
+#
+# 故意做成最小方案：只留 script_translator + speller，去除 simplifier 等滤镜，
+# 好处是候选顺序只受「词条权重 + 语法分」影响，断言不会被简繁转换干扰。
+# 词典复用 luna_pinyin 的产物，不额外造 bin。
+schema:
+  schema_id: luna_pinyin_grammar
+  name: 语法模型测试
+  version: "1"
+  description: |
+    仅用于 e2e：启用 octagram 语法模型。
+
+# ⚠️ 字形必须与方案输出一致：本方案词典是繁体（中國），所以配繁体模型。
+# 配成 hans 会让 encode 后的键与模型里的键对不上，语法分全部退化成常量。
+grammar:
+  language: zh-hant-t-essay-bgc
+
+engine:
+  processors:
+    - ascii_composer
+    - speller
+    - punctuator
+    - selector
+    - navigator
+    - express_editor
+  segmentors:
+    - ascii_segmentor
+    - abc_segmentor
+    - fallback_segmentor
+  translators:
+    - script_translator
+  filters: []
+
+speller:
+  alphabet: zyxwvutsrqponmlkjihgfedcba
+  delimiter: " '"
+
+translator:
+  dictionary: luna_pinyin
+  prism: luna_pinyin_simp
+
+menu:
+  page_size: 5

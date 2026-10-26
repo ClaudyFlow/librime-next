@@ -20,6 +20,19 @@ impl Session {
         }
     }
 
+    /// [`Self::create`] 的带数据根版本：`data_roots` 按"用户目录优先、共享目录其次"传入，
+    /// 供 `simplifier`（opencc）与 `script_translator`（`.gram`）找外部数据。
+    pub fn create_with_roots(
+        build_dir: &Path,
+        schema_id: &str,
+        data_roots: &[std::path::PathBuf],
+    ) -> Session {
+        Session {
+            engine: Engine::create_with_roots(build_dir, schema_id, data_roots),
+            commit_text: None,
+        }
+    }
+
     /// 处理一次按键（keycode + mask）。返回是否被消费；待提交文本经 `take_commit` 取走。
     pub fn process_key(&mut self, keycode: u32, mask: u32) -> bool {
         let key = KeyEvent::new(keycode, mask);

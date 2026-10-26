@@ -49,6 +49,24 @@ impl Global {
             PathBuf::from(&self.shared_data_dir).join("build")
         }
     }
+
+    /// 数据根列表，按 C++ `ResourceResolver` 的顺序：**用户目录优先、共享目录其次**。
+    ///
+    /// `simplifier`（`opencc/`）与 `script_translator`（`model/*.gram`）靠它找外部数据 ——
+    /// 两者不一定在同一个根下：出厂布局里 `model/` 跟用户目录走、`opencc/` 在共享目录。
+    fn data_roots(&self) -> Vec<PathBuf> {
+        let mut roots: Vec<PathBuf> = Vec::new();
+        for dir in [&self.user_data_dir, &self.shared_data_dir] {
+            if dir.is_empty() {
+                continue;
+            }
+            let path = PathBuf::from(dir);
+            if !roots.contains(&path) {
+                roots.push(path);
+            }
+        }
+        roots
+    }
 }
 
 fn global() -> &'static Mutex<Global> {
@@ -536,8 +554,9 @@ unsafe extern "C" fn rime_create_session() -> RimeSessionId {
     let id = g.next_id;
     g.next_id += 1;
     let build_dir = g.build_dir();
+    let roots = g.data_roots();
     let default_schema = default_schema_id(&g);
-    let session = Session::create(&build_dir, &default_schema);
+    let session = Session::create_with_roots(&build_dir, &default_schema, &roots);
     g.sessions.insert(id, session);
     id
 }
@@ -943,8 +962,9 @@ unsafe extern "C" fn rime_select_schema(id: RimeSessionId, schema_id: *const c_c
     let Some(sid) = read_cstr(schema_id) else { return 0 };
     let mut g = global().lock().unwrap();
     let build_dir = g.build_dir();
+    let roots = g.data_roots();
     if let Some(s) = g.sessions.get_mut(&id) {
-        *s = Session::create(&build_dir, &sid);
+        *s = Session::create_with_roots(&build_dir, &sid, &roots);
         1
     } else {
         0

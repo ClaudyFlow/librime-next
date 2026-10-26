@@ -43,12 +43,36 @@ pub struct Engine {
     /// 组件请求引擎代转的按键队列（见 [`Engine::enqueue_synthetic_key`]）。
     synthetic_queue: Vec<KeyEvent>,
     build_dir: std::path::PathBuf,
+    /// 数据根列表，按 **C++ `ResourceResolver` 的查找顺序**：用户目录优先、共享目录其次。
+    ///
+    /// 为什么不能只留 `build_dir.parent()`：生产环境里 `build_dir` 是 `<用户目录>/build`
+    /// （`Deployer::staging_dir`），而 `model/<语言>.gram` 在用户目录、`opencc/` 在共享目录
+    /// —— 两东西不在同一个根下，必须两个都查。
+    data_roots: Vec<std::path::PathBuf>,
 }
 
 impl Engine {
     /// 加载方案并装配组件（对照 `Engine::Create` + `InitializeComponents`）。
+    ///
+    /// 数据根缺省取 `build_dir.parent()` 一个 —— 单根布局（e2e 沙箱）就够用。
+    /// 生产路径请用 [`Self::create_with_roots`] 把用户目录与共享目录都传进来。
     pub fn create(build_dir: &Path, schema_id: &str) -> Option<Engine> {
+        let roots: Vec<std::path::PathBuf> = build_dir.parent().map(Path::to_path_buf).into_iter().collect();
+        Self::create_with_roots(build_dir, schema_id, &roots)
+    }
+
+    /// [`Self::create`] 的带数据根版本。`data_roots` 为空时回退 `build_dir.parent()`。
+    pub fn create_with_roots(
+        build_dir: &Path,
+        schema_id: &str,
+        data_roots: &[std::path::PathBuf],
+    ) -> Option<Engine> {
         let schema = Schema::open(build_dir, schema_id)?;
+        let data_roots = if data_roots.is_empty() {
+            build_dir.parent().map(Path::to_path_buf).into_iter().collect()
+        } else {
+            data_roots.to_vec()
+        };
         let mut engine = Engine {
             schema,
             context: Context::new(),
@@ -58,6 +82,7 @@ impl Engine {
             filters: Vec::new(),
             synthetic_queue: Vec::new(),
             build_dir: build_dir.to_path_buf(),
+            data_roots,
         };
         engine.initialize_components();
         Some(engine)
@@ -67,7 +92,7 @@ impl Engine {
     /// `engine/translators`，按名单逐个构造。
     fn initialize_components(&mut self) {
         let (processors, segmentors, translators, filters) =
-            install_engine_components(&self.schema.config, &self.build_dir);
+            install_engine_components(&self.schema.config, &self.build_dir, &self.data_roots);
         self.filters = filters;
         if translators.is_empty() {
             // 方案没列 `engine/translators`（或列表里全是还没移植的 translator）：
@@ -419,6 +444,7 @@ impl Engine {
             filters: Vec::new(),
             synthetic_queue: Vec::new(),
             build_dir: std::path::PathBuf::new(),
+            data_roots: Vec::new(),
         }
     }
 }

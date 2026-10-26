@@ -525,3 +525,48 @@ fn sentence_commit_yields_full_text() {
         "整句上屏应是「你好世界」，实际：{commit:?}"
     );
 }
+
+// ── 语法模型（octagram grammar）端到端检测 ──────────────────────────────
+//
+// `grammar/language` → `<数据根>/model/<language>.gram`。模型不在编译产物目录里，
+// 所以必须走 `create_with_roots` 把用户目录一并传进去。
+
+/// `%APPDATA%/Rime-Next` —— 语法模型的出厂落点；没有模型时返回 `None` 让测试跳过。
+fn rime_next_root() -> Option<PathBuf> {
+    let appdata = std::env::var_os("APPDATA")?;
+    let root = PathBuf::from(appdata).join("Rime-Next");
+    let gram = root.join("model/zh-hant-t-essay-bgc.gram");
+    gram.is_file().then_some(root)
+}
+
+#[test]
+fn grammar_schema_loads_and_makes_sentence() {
+    let Some(root) = rime_next_root() else {
+        eprintln!("跳过：%APPDATA%/Rime-Next/model 下没有 zh-hant-t-essay-bgc.gram");
+        return;
+    };
+    let mut session =
+        Session::create_with_roots(&build_dir(), "luna_pinyin_grammar", std::slice::from_ref(&root));
+    type_ascii(&mut session, "zhongguoren");
+    let texts = candidate_texts(&mut session);
+    println!("grammar: zhongguoren -> {:?}", &texts[..texts.len().min(8)]);
+    // 词典是繁体，整句自然是繁体（本方案故意不挂 simplifier）。
+    assert_eq!(
+        texts.first().map(String::as_str),
+        Some("\u{4e2d}\u{570b}\u{4eba}"),
+        "整句「中國人」应排第一，实际：{:?}",
+        &texts[..texts.len().min(8)]
+    );
+}
+
+#[test]
+fn grammar_schema_works_without_model_root() {
+    // 找不到模型时应退化为 constant penalty，但方案本身仍能打字。
+    let mut session = Session::create(&build_dir(), "luna_pinyin_grammar");
+    type_ascii(&mut session, "zhongguo");
+    let texts = candidate_texts(&mut session);
+    assert!(
+        !texts.is_empty(),
+        "缺语法模型时仍应产出候选（退回 non_collocation_penalty）"
+    );
+}

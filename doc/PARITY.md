@@ -13,9 +13,9 @@
 | 层 | LRN | 补丁版 | 判定 |
 |---|---|---|---|
 | 输入组件 | 22 / 35 | 35 / 35 | 落后，缺 13 项；出厂方案实际只引用其中 3 项 |
-| **整句组句（WordGraph + Poet）** | **无**，`ScriptTranslator` 只枚举前缀切分逐段查表出词级候选 | 有，`ScriptSyllabifier::BuildSyllableGraph` + `Poet::MakeSentences` | **落后**，输入 `nihaoshijie` 出不了「你好世界」整句 |
+| **整句组句（WordGraph + Poet）** | **有**，`src/engine/gear/poet.rs` + `Dictionary::lookup_from_graph` | 有，`ScriptSyllabifier::BuildSyllableGraph` + `Poet::MakeSentences` | **已对齐**（`b1b0125`）。`nihaoshijie` → 「你好世界」；`nihao` → 「你好」（精确词条不组句） |
 | 用户词典 UserDb 持久化 | 占位桩（`src/dict/user_db.rs` 仅一行注释） | LevelDB 实装，`%APPDATA%/Rime-Next/userdb/` 下 4 个 `.userdb` 在用 | **落后**，影响全部方案的学词与调频 |
-| 语法模型 octagram grammar | 无（`src/lever/paths.rs` 只有 `.gram` 摆放规则） | 有，4 个 `.gram` 共约 470 MB 在用 | **落后**，整块功能缺失；**依赖上一行**，没有整句就没有可打分的候选序列 |
+| 语法模型 octagram grammar | **有**，`gram_db.rs` + `grammar.rs`（Darts trie + 紧凑 n-gram 编码 + 五元打分） | 有，4 个 `.gram` 共约 470 MB 在用 | **已对齐**（未提交时）。`zhongguoren` → 「中國人」排第一 |
 | TOML 解析 | 0 行（方案清单读 `schema.yaml`） | 手写 `toml_lite.cc` +259 行 | **领先**，补丁版这 259 行可归零 |
 
 ## 二、组件明细（35 项，含 2 个别名）
@@ -94,13 +94,28 @@ LRN 缺 lua 与补丁版**行为等价**，不列缺口。
 
 **ABI**。`rime_get_api` 的 100 个函数指针一致，可直接换 dll。
 
-## 四、待确认事项
+## 四、移植 grammar 的三条硬约束（踩过坑，写下来）
+
+**1. `grammar/language` 必须与方案输出字形一致。** 繁体词条配 `zh-hans-*` 模型时，
+编码后的键与模型里的键对不上，语法分全部退化成 `non_collocation_penalty`，表现为
+"模型加载成功、排序毫无变化"。e2e 里 `luna_pinyin`（繁体词典）必须配
+`zh-hant-t-essay-bgc`，期望输出是「中國人」而不是「中国人」。
+
+**2. `.gram` 与 `opencc/` 不在同一个根下。** 出厂布局里 `model/` 跟**用户目录**、
+`opencc/` 在**共享目录**。所以 `Engine` 持有的是 `data_roots: [user_data_dir, shared_data_dir]`
+而不是单个 `build_dir.parent()`；`Octagram::load` 与 `Simplifier` 都遍历这个列表查找。
+
+**3. `.gram` 的键是编码后的紧凑形式，不是明文 UTF-8。** `GramDb::lookup` 必须内部走
+`grammar::encode`（`U+0000`→`0xE0`、ASCII 原样、`0x4000..0xA000`→两字节，
+其余 `0xE0|n` + n×7bit）。第一版直接拿明文查 trie，5 组常见词全部 0 命中。
+
+## 五、待确认事项
 
 补丁版 patch 快照（Oct 25）里方案清单仍写 `schema/schema.toml`（靠 `toml_lite.cc` 解析），
 而 LRN 读 `<user>/schema/schema.yaml`。当前 `%APPDATA%/Rime-Next/schema/` 下**两个文件都在**。
 需要核实补丁版 dll 的实际读取路径，避免换引擎时方案清单来源不一致。
 
-## 五、重跑数据的命令
+## 六、重跑数据的命令
 
 ```bash
 # 出厂引用文件数（对每个组件名跑一次）
@@ -118,13 +133,13 @@ strings -a "$D" | grep -cx '<组件名>'   # 1=有, 0=无
 grep -E 'r\.Register' /c/code/librime/src/rime/gear/gears_module.cc
 ```
 
-## 六、推进顺序与变更记录
+## 七、推进顺序与变更记录
 
 按表的工作顺序（依赖优先，其次影响面）：
 
-1. **整句组句** `WordGraph` + `Poet` —— grammar 的前置；无此项则输入长词只能逐词选
-2. octagram grammar —— 4 个方案直接依赖，470 MB 模型在用；挂在第 1 项之上
-3. UserDb 持久化 —— 全部方案的学词/调频
+1. ~~整句组句 `WordGraph` + `Poet`~~ ✅ `b1b0125`
+2. ~~octagram grammar~~ ✅ 4 个方案直接依赖，470 MB 模型在用
+3. UserDb 持久化 —— 全部方案的学词/调频　**← 下一个要做**
 4. `reverse_lookup_translator` + `reverse_lookup_filter` —— 18 个文件
 5. `history_translator` —— 12 个文件
 6. `affix_segmentor` —— 6 个文件
@@ -134,3 +149,5 @@ grep -E 'r\.Register' /c/code/librime/src/rime/gear/gears_module.cc
 |---|---|
 | 2026-10-26 | 建表。基准：组件 22/35、整句缺、UserDb 缺、grammar 缺、TOML 领先。simplifier + opencc 已端到端验证（`66ab7ab`） |
 | 2026-10-26 | 补「整句组句」一层：核查 `ScriptTranslator` 为纯词级，`Poet`/`WordGraph` 未移植，grammar 因此无落点。定为第 1 优先级 |
+| 2026-10-26 | 整句组句落地（`b1b0125`）：`poet.rs` 560 行 + `lookup_from_graph` + `match_extra_code`。实测 `nihaoshijie`→「你好世界」、`nihao`→「你好」、`choose(0)` commit 全文 |
+| 2026-10-26 | grammar 落地：`gram_db.rs`（Darts + MappedFile）、`grammar.rs`（encode + Octagram 五元打分）、`data_roots` 架构。实测 `zhongguoren`→「中國人」；单测证明 `中国` 6.83 > `中果` -1.55 |

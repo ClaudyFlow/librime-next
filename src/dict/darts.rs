@@ -175,6 +175,46 @@ impl DoubleArray {
         out
     }
 
+    /// `commonPrefixSearch(key, results, max, length, node_pos)`（`darts.h:441`）的
+    /// **带起点**版本：从已经走到的 `node_pos` 继续往下搜。
+    ///
+    /// 语法模型（`.gram`）靠这个做两级查询：先用 [`Self::traverse`] 把前文 context
+    /// 在 trie 里走一遍，再从那个节点搜当前词 word 的所有前缀键
+    /// （`gram_db.cc:105-116`）。
+    pub fn common_prefix_search_from(
+        &self,
+        key: &[u8],
+        node_pos: usize,
+        max_results: usize,
+    ) -> Vec<(u32, usize)> {
+        let mut out = Vec::new();
+        let Some(mut unit) = self.unit(node_pos) else {
+            return out;
+        };
+        // C++：进入该节点的**子层**基址，再逐字符异或。
+        let mut pos = node_pos ^ unit.offset() as usize;
+        for (i, &c) in key.iter().enumerate() {
+            pos ^= usize::from(c);
+            let Some(next) = self.unit(pos) else {
+                break;
+            };
+            if next.label() != u32::from(c) {
+                break;
+            }
+            unit = next;
+            pos ^= unit.offset() as usize;
+            if unit.has_leaf() {
+                let Some(leaf) = self.unit(pos) else {
+                    break;
+                };
+                if out.len() < max_results {
+                    out.push((leaf.value(), i + 1));
+                }
+            }
+        }
+        out
+    }
+
     /// `traverse(key, node_pos, key_pos, length)`（`darts.h:487`）。
     ///
     /// `node_pos` / `key_pos` 是**进出参**：成功走完时 `key_pos == key.len()`、

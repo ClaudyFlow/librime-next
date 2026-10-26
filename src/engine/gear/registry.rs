@@ -24,7 +24,7 @@
 //! `match` 工厂 —— 没移植的组件返回 `None`，行为等同 C++ 里 `Require` 失败
 //! （打日志 + 跳过该列表项），**不会让整个链条断掉**。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -38,6 +38,7 @@ use crate::engine::gear::key_binder::KeyBinder;
 use crate::engine::gear::filter::{Filter, SingleCharFilter, Uniquifier};
 use crate::engine::gear::matcher::Matcher;
 use crate::engine::gear::navigator::Navigator;
+use crate::engine::gear::poet::Poet;
 use crate::engine::gear::punctuator::{PunctSegmentor, PunctTranslator, Punctuator};
 use crate::engine::gear::processor::Processor;
 use crate::engine::gear::recognizer::Recognizer;
@@ -72,6 +73,10 @@ pub struct Ticket<'a> {
     pub config: &'a Value,
     /// 运行时产物根目录（`build_dir`），translator 要在这里打开词典。
     pub build_dir: &'a Path,
+    /// 数据根列表，按 C++ `ResourceResolver` 的顺序：**用户目录优先、共享目录其次**。
+    ///
+    /// `opencc/` 与 `model/<语言>.gram` 不是编译产物，不在 `build_dir` 里，只能沿这串根找。
+    pub data_roots: &'a [PathBuf],
 }
 
 impl<'a> Ticket<'a> {
@@ -82,6 +87,7 @@ impl<'a> Ticket<'a> {
         prescription: &str,
         config: &'a Value,
         build_dir: &'a Path,
+        data_roots: &'a [PathBuf],
     ) -> Self {
         let (klass, alias) = match prescription.split_once('@') {
             Some((k, a)) => (k.to_string(), a.to_string()),
@@ -97,6 +103,7 @@ impl<'a> Ticket<'a> {
             name_space,
             config,
             build_dir,
+            data_roots,
         }
     }
 }
@@ -256,10 +263,12 @@ fn parse_component_spec(item: &Value) -> Option<(String, Option<Condition>)> {
 
 /// C++ `CreateComponentsFromList`：读 `<config_key>` 列表，逐项构造 + 解析条件。
 ///
-/// `build_dir` 留给 translator（要在运行时产物目录里开词典）；processor 传空路径。
+/// `build_dir` 留给 translator（要在运行时产物目录里开词典）；
+/// `data_roots` 留给需要外部数据目录的组件（`simplifier` 的 opencc、`script_translator` 的 `.gram`）。
 pub fn create_components_from_list<T, F>(
     config: &Value,
     build_dir: &Path,
+    data_roots: &[PathBuf],
     config_key: &str,
     component_type: &str,
     mut make: F,
@@ -279,8 +288,13 @@ where
             );
             continue;
         };
-        let ticket =
-            Ticket::from_prescription(component_type, &prescription, config, build_dir);
+        let ticket = Ticket::from_prescription(
+            component_type,
+            &prescription,
+            config,
+            build_dir,
+            data_roots,
+        );
         let Some(component) = make(&ticket) else {
             eprintln!("[registry] error creating {component_type}: '{prescription}'");
             continue;
@@ -303,9 +317,6 @@ pub fn create_filter(ticket: &Ticket) -> Option<Box<dyn Filter + Send + Sync>> {
         "uniquifier" => Some(Box::new(Uniquifier::new())),
         "single_char" | "single_char_filter" => Some(Box::new(SingleCharFilter::new())),
         "simplifier" => {
-            // opencc 数据在 `<shared_data>/opencc`，生产里 `build_dir` 就是
-            // `<shared_data>/build`，所以 `build_dir.parent()/opencc` 即目标目录。
-            let opencc_dir = ticket.build_dir.parent()?.join("opencc");
             // 配置节点：带 alias 时优先读 `alias:` 块，否则回退到 `simplifier:` 块
             // （与原版 `Simplifier` 读 `ticket.config` 的方式对齐）。
             let node = ticket
@@ -320,6 +331,16 @@ pub fn create_filter(ticket: &Ticket) -> Option<Box<dyn Filter + Send + Sync>> {
                 .and_then(|n| n.get("option_name"))
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
+            // opencc 数据在 `<root>/opencc`。`build_dir` 在生产里是 `<用户目录>/build`，
+            // 而 opencc 落在**共享目录** —— 所以必须按 roots 逐个试，不能只看 `build_dir.parent()`。
+            for root in ticket.data_roots {
+                if let Some(simplifier) = Simplifier::new(&root.join("opencc"), config_name, option_name.clone())
+                {
+                    return Some(Box::new(simplifier));
+                }
+            }
+            // 单根布局（roots 为空）时的回退：兼容直接构造 Ticket 的调用方。
+            let opencc_dir = ticket.build_dir.parent()?.join("opencc");
             Simplifier::new(&opencc_dir, config_name, option_name)
                 .map(|s| Box::new(s) as Box<dyn Filter + Send + Sync>)
         }
@@ -375,7 +396,14 @@ pub fn create_translator(ticket: &Ticket) -> Option<Box<dyn Translator + Send + 
                 &dict_name,
                 &prism_name,
             )?;
-            Some(Box::new(ScriptTranslator::with_options(dict, options)))
+            let mut translator = ScriptTranslator::with_options(dict, options);
+            // 语法模型：`grammar/language` → `<root>/model/<language>.gram`。
+            // 没有 `grammar/language` 的方桘就不装，`Poet` 走动态规划（等价 C++ 无 grammar）。
+            let roots: Vec<&Path> = ticket.data_roots.iter().map(PathBuf::as_path).collect();
+            if let Some(octagram) = crate::engine::gear::grammar::create(ticket.config, &roots) {
+                translator = translator.with_poet(Poet::new(Some(Box::new(octagram))));
+            }
+            Some(Box::new(translator))
         }
         _ => None,
     }
@@ -405,6 +433,7 @@ fn translator_dict_name(ticket: &Ticket) -> Option<(String, String)> {
 pub fn install_engine_components(
     config: &Value,
     build_dir: &Path,
+    data_roots: &[PathBuf],
 ) -> (
     Vec<ComponentEntry<Box<dyn Processor + Send + Sync>>>,
     Vec<ComponentEntry<Box<dyn Segmentor + Send + Sync>>>,
@@ -414,6 +443,7 @@ pub fn install_engine_components(
     let processors = create_components_from_list(
         config,
         build_dir,
+        data_roots,
         "engine/processors",
         "processor",
         create_processor,
@@ -421,6 +451,7 @@ pub fn install_engine_components(
     let segmentors = create_components_from_list(
         config,
         build_dir,
+        data_roots,
         "engine/segmentors",
         "segmentor",
         create_segmentor,
@@ -428,6 +459,7 @@ pub fn install_engine_components(
     let translators = create_components_from_list(
         config,
         build_dir,
+        data_roots,
         "engine/translators",
         "translator",
         create_translator,
@@ -435,6 +467,7 @@ pub fn install_engine_components(
     let filters = create_components_from_list(
         config,
         build_dir,
+        data_roots,
         "engine/filters",
         "filter",
         create_filter,
@@ -507,6 +540,7 @@ mod tests {
         let list = create_components_from_list(
             &config,
             Path::new(""),
+            &[],
             "engine/processors",
             "processor",
             create_processor,
@@ -525,7 +559,13 @@ mod tests {
     #[test]
     fn unknown_klass_returns_none() {
         let config = json!({});
-        let ticket = Ticket::from_prescription("processor", "lua_processor@foo", &config, Path::new(""));
+        let ticket = Ticket::from_prescription(
+            "processor",
+            "lua_processor@foo",
+            &config,
+            Path::new(""),
+            &[],
+        );
         assert_eq!(ticket.klass, "lua_processor");
         assert_eq!(ticket.name_space, "foo", "@ 后的 alias 覆盖默认命名空间");
         assert!(create_processor(&ticket).is_none());
@@ -536,11 +576,11 @@ mod tests {
     #[test]
     fn name_space_defaults_to_component_type() {
         let config = json!({});
-        let t = Ticket::from_prescription("translator", "table_translator", &config, Path::new(""));
+        let t = Ticket::from_prescription("translator", "table_translator", &config, Path::new(""), &[]);
         assert_eq!(t.klass, "table_translator");
         assert_eq!(t.name_space, "translator");
 
-        let t = Ticket::from_prescription("processor", "recognizer", &config, Path::new(""));
+        let t = Ticket::from_prescription("processor", "recognizer", &config, Path::new(""), &[]);
         assert_eq!(t.name_space, "processor");
     }
 
@@ -549,7 +589,7 @@ mod tests {
     #[test]
     fn table_translator_reads_the_translator_node() {
         let config = json!({"translator": {"dictionary": "stroke", "prism": "stroke"}});
-        let t = Ticket::from_prescription("translator", "table_translator", &config, Path::new(""));
+        let t = Ticket::from_prescription("translator", "table_translator", &config, Path::new(""), &[]);
         assert_eq!(
             translator_dict_name(&t),
             Some(("stroke".to_string(), "stroke".to_string()))
