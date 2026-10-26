@@ -148,7 +148,7 @@ pub trait Calculation: Send + Sync {
 /// 与 C++ 的差异：C++ 用返回 `NULL` 表示"这条规则不成立"；这里用 `Err(RuleError)`
 /// 把"为什么不成立"（哪一段、第几个字节、什么语法）带出来，调用方要么当 `None`
 /// （[`Calculus::parse`]），要么把诊断打出去（[`Calculus::try_parse`]）。
-pub type Factory = fn(&[String]) -> Result<Box<dyn Calculation>, RuleError>;
+pub type Factory = fn(&[String]) -> Result<Box<dyn Calculation + Send + Sync>, RuleError>;
 
 /// `Calculus`：规则文本 → `Calculation`。`calculus.cc:18-46`。
 pub struct Calculus {
@@ -183,7 +183,7 @@ impl Calculus {
     }
 
     /// `calculus.cc:32-46`：解析一条规则文本。`None` 等价 C++ 返回 `NULL`。
-    pub(super) fn parse(&self, definition: &str) -> Option<Box<dyn Calculation>> {
+    pub(super) fn parse(&self, definition: &str) -> Option<Box<dyn Calculation + Send + Sync>> {
         self.try_parse(definition).ok()
     }
 
@@ -191,7 +191,7 @@ impl Calculus {
     ///
     /// 这是"不允许静默降级"的落点：不支持的语法不是返回 `None` 就算了，而是带着
     /// 证据返回；`Projection::from_rules` 会把这段诊断原样拼进错误信息。
-    pub fn try_parse(&self, definition: &str) -> Result<Box<dyn Calculation>, RuleError> {
+    pub fn try_parse(&self, definition: &str) -> Result<Box<dyn Calculation + Send + Sync>, RuleError> {
         // `calculus.cc:33`：`find_first_not_of("zyxwvutsrqponmlkjihgfedcba")`
         // —— 那个集合正好是 a..z，所以等价于"第一个非小写字母"的字节。
         let Some(sep) = definition.bytes().position(|b| !b.is_ascii_lowercase()) else {
@@ -268,7 +268,7 @@ pub struct Transliteration {
     char_map: HashMap<char, char>,
 }
 
-fn parse_transliteration(args: &[String]) -> Result<Box<dyn Calculation>, RuleError> {
+fn parse_transliteration(args: &[String]) -> Result<Box<dyn Calculation + Send + Sync>, RuleError> {
     // `calculus.cc:51-52`
     if args.len() < 3 {
         return Err(RuleError::invalid(format!(
@@ -336,7 +336,7 @@ pub struct Transformation {
     replacement: String,
 }
 
-fn parse_transformation(args: &[String]) -> Result<Box<dyn Calculation>, RuleError> {
+fn parse_transformation(args: &[String]) -> Result<Box<dyn Calculation + Send + Sync>, RuleError> {
     // `calculus.cc:112-117`
     if args.len() < 3 || args[1].is_empty() {
         return Err(RuleError::invalid(
@@ -379,7 +379,7 @@ pub struct Erasion {
     pattern: regex::Regex,
 }
 
-fn parse_erasion(args: &[String]) -> Result<Box<dyn Calculation>, RuleError> {
+fn parse_erasion(args: &[String]) -> Result<Box<dyn Calculation + Send + Sync>, RuleError> {
     // `calculus.cc:137-141`
     if args.len() < 2 || args[1].is_empty() {
         return Err(RuleError::invalid("`erase` 需要 1 个非空模式"));
@@ -425,7 +425,7 @@ pub struct Derivation {
 fn make_derivation_like(
     args: &[String],
     ctor: fn(regex::Regex, String) -> Box<dyn Calculation>,
-) -> Result<Box<dyn Calculation>, RuleError> {
+) -> Result<Box<dyn Calculation + Send + Sync>, RuleError> {
     if args.len() < 3 || args[1].is_empty() {
         return Err(RuleError::invalid(
             "派生类规则需要 2 个参数（模式/替换串），且模式不能为空",
@@ -436,7 +436,7 @@ fn make_derivation_like(
     Ok(ctor(pattern, args[2].clone()))
 }
 
-fn parse_derivation(args: &[String]) -> Result<Box<dyn Calculation>, RuleError> {
+fn parse_derivation(args: &[String]) -> Result<Box<dyn Calculation + Send + Sync>, RuleError> {
     // `calculus.cc:158-166`
     if args.len() < 3 || args[1].is_empty() {
         return Err(RuleError::invalid(
@@ -526,7 +526,7 @@ pub struct Fuzzing {
     inner: Derivation,
 }
 
-fn parse_fuzzing(args: &[String]) -> Result<Box<dyn Calculation>, RuleError> {
+fn parse_fuzzing(args: &[String]) -> Result<Box<dyn Calculation + Send + Sync>, RuleError> {
     // `calculus.cc:201-207`
     if args.len() < 3 || args[1].is_empty() {
         return Err(RuleError::invalid(
@@ -572,7 +572,7 @@ pub struct Abbreviation {
     inner: Derivation,
 }
 
-fn parse_abbreviation(args: &[String]) -> Result<Box<dyn Calculation>, RuleError> {
+fn parse_abbreviation(args: &[String]) -> Result<Box<dyn Calculation + Send + Sync>, RuleError> {
     // `calculus.cc:225-231`
     if args.len() < 3 || args[1].is_empty() {
         return Err(RuleError::invalid(
@@ -648,7 +648,7 @@ pub struct Reorder {
     dedup: bool,
 }
 
-fn parse_reorder(args: &[String]) -> Result<Box<dyn Calculation>, RuleError> {
+fn parse_reorder(args: &[String]) -> Result<Box<dyn Calculation + Send + Sync>, RuleError> {
     // `calculus.cc:260-272`
     if args.len() < 2 || args[1].is_empty() {
         return Err(RuleError::invalid("`reorder` 需要 1 个非空的键序串"));

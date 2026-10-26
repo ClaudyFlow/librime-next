@@ -148,7 +148,10 @@ int main(int argc, char** argv) {
   for (int i = 0; i < ctx.menu.num_candidates && i < 10; ++i) {
     printf("    cand[%d] = \"%s\"\n", i, ctx.menu.candidates[i].text);
   }
-  check(ctx.composition.length == 5, "preedit 长度为 5（\"nihao\"）");
+  /* 真实 librime 的 preedit：script_translator 的候选 preedit 按音节加分隔符
+   * （luna_pinyin 的 speller/delimiter 是空格）→ "ni hao"（长度 6）。
+   * 旧简化引擎回显原始输入 "nihao"（长度 5），那条预期已过时。 */
+  check(ctx.composition.length == 6, "preedit 长度为 6（\"ni hao\"，音节分隔符）");
   check(ctx.menu.num_candidates > 0, "菜单里有候选（%d 条）",
         ctx.menu.num_candidates);
 

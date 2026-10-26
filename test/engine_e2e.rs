@@ -2012,3 +2012,66 @@ fn streaming_chord_breaks_syllables_on_timeout() {
         "停顿超过超时阈值 ⇒ 认定前一音节结束，插 speller 的隔音符"
     );
 }
+
+// ---------------------------------------------------------------------------
+// table_translator（形码）端到端：wubi86
+//
+// 依赖真实源布局 `C:\code\Weasel-Next\Rime-Next`（仅本机有）：
+// 沙箱部署 wubi86 → 在 staging 产物上建会话 → 打 `aaaa` → 应出「工」并可提交。
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wubi86_table_translator_end_to_end() {
+    let shared = PathBuf::from(r"C:\code\Weasel-Next\Rime-Next");
+    if !shared.is_dir() {
+        eprintln!("跳过：真实源布局不存在（{}）", shared.display());
+        return;
+    }
+    use librime_next::lever::deployer::Deployer;
+    use librime_next::lever::deployment_tasks::DeploymentTask;
+
+    let work = std::env::temp_dir().join(format!("wubi-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    let sandbox_user = work.join("user");
+    let staging = work.join("build");
+    std::fs::create_dir_all(&sandbox_user).unwrap();
+
+    let mut deployer = Deployer::with_data_dirs(&shared, &sandbox_user);
+    deployer.staging_dir = staging.clone();
+    let ok = DeploymentTask::SchemaUpdate {
+        source_path: shared.join("schema").join("wubi86").join("wubi86.schema.yaml"),
+        verbose: false,
+    }
+    .run(&mut deployer);
+    assert!(ok, "wubi86 SchemaUpdate 应成功");
+
+    let mut session = Session::create(&staging, "wubi86");
+    assert!(session.engine.is_some(), "wubi86 引擎应能加载（table_translator 链）");
+
+    for ch in "aaaa".chars() {
+        assert!(session.process_key(ch as u32, 0), "wubi 键 {ch} 应被消费");
+    }
+    let ctx = session.context().expect("应有上下文");
+    let texts: Vec<String> = ctx
+        .composition
+        .segmentation
+        .segments
+        .iter()
+        .filter_map(|s| s.menu.as_ref())
+        .flat_map(|m| m.candidates().iter().map(|c| c.text.clone()).collect::<Vec<_>>())
+        .collect();
+    assert!(
+        texts.iter().any(|t| t == "工"),
+        "aaaa 应出「工」，实际前若干个：{:?}",
+        &texts[..texts.len().min(10)]
+    );
+
+    // 选首候选（质量最高，即「工」）→ express_editor 的 _auto_commit 直接上屏
+    let _ = session.choose(0);
+    assert_eq!(
+        session.take_commit().as_deref(),
+        Some("工"),
+        "选词后应提交「工」"
+    );
+    let _ = std::fs::remove_dir_all(&work);
+}
