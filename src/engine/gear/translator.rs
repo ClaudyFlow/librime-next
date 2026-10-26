@@ -7,6 +7,7 @@ use crate::dict::vocabulary::DictEntry;
 use crate::engine::candidate::Candidate;
 use crate::engine::gear::poet::{Poet, Sentence, WordGraph};
 use crate::engine::gear::translator_options::TranslatorOptions;
+use crate::engine::segmentation::Segment;
 
 /// 整句候选在 `quality` 上的基数，远大于词级的 `音节数 * 1000 + weight` 量级。
 ///
@@ -24,11 +25,15 @@ const USER_DICT_QUALITY_BASE: f64 = 1.0e5;
 
 /// 翻译器（对照 C++ `Translator::Query(input, segment)`）。
 ///
-/// `seg_tags` 是本段命中的标签集：翻译器用它决定是否认领这段
-/// （C++ 里是 `segment.HasAnyTagIn(tags_)`，tags 来自 [`TranslatorOptions`]）。
+/// 传整段 `Segment` 而不是只传 `start` + `tags`：C++ 的 `Query` 拿的是
+/// `const Segment*`，`reverse_lookup_translator` 会 `const_cast` 往里写
+/// `prompt`（"usually translators do not modify the segment directly; prompt text
+/// is best set by a processor or a segmentor"，但它自己就是例外：打了反查前缀
+/// `` ` `` 之后要在输入区显示〔笔画〕）。Rust 侧直接把 `&mut Segment` 交出去，
+/// 比留个 `prompt` 旁路干净。
 pub trait Translator {
     /// 给定一段输入串，产出候选列表（位置**相对本段**，候选各带覆盖到的 `end`）。
-    fn query(&mut self, input: &str, start: usize, seg_tags: &[String]) -> Vec<Candidate>;
+    fn query(&mut self, input: &str, segment: &mut Segment) -> Vec<Candidate>;
 
     /// `Translator::Memorize(commit_entry)`：一次提交里选中的词条交回来学。
     ///
@@ -298,13 +303,8 @@ impl ScriptTranslator {
 }
 
 impl Translator for ScriptTranslator {
-    fn query(
-        &mut self,
-        input: &str,
-        _start: usize,
-        seg_tags: &[String],
-    ) -> Vec<Candidate> {
-        if !self.options.has_any_tag(seg_tags) {
+    fn query(&mut self, input: &str, segment: &mut Segment) -> Vec<Candidate> {
+        if !self.options.has_any_tag(&segment.tags) {
             return Vec::new();
         }
         let mut out: Vec<Candidate> = self.sentence_candidates(input);

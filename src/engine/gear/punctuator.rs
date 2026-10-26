@@ -199,11 +199,14 @@ fn punct_candidate(text: &str, start: usize, end: usize) -> Candidate {
 }
 
 impl Translator for PunctTranslator {
-    fn query(&mut self, input: &str, start: usize, _seg_tags: &[String]) -> Vec<Candidate> {
+    fn query(&mut self, input: &str, _segment: &mut Segment) -> Vec<Candidate> {
         let Some(definition) = self.config.get_punct_definition(input) else {
             return Vec::new();
         };
-        let end = start + input.len();
+        // 候选坐标**相对本段**（`runtime.rs` 会加 `segment.start`）。原来这里传的是
+        // 绝对位置，多段输入时会被加两次。
+        let start = 0;
+        let end = input.len();
         // ① 唯一映射（`'` : '、'）
         if let Some(text) = definition.as_str() {
             return vec![punct_candidate(text, start, end)];
@@ -441,7 +444,7 @@ mod tests {
     #[test]
     fn translator_expands_alternating_list() {
         let mut t = PunctTranslator::with_config(&config(), false);
-        let cands = t.query("'", 0, &[]);
+        let cands = t.query("'", &mut Segment::new(0, 0));
         let texts: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(texts, vec!["、", "‘", "’"]);
     }
@@ -449,15 +452,15 @@ mod tests {
     #[test]
     fn translator_expands_unique_mapping_and_pair() {
         let mut t = PunctTranslator::with_config(&config(), false);
-        assert_eq!(t.query(",", 0, &[])[0].text, "，");
+        assert_eq!(t.query(",", &mut Segment::new(0, 0))[0].text, "，");
         let pair: Vec<String> = t
-            .query("\"", 0, &[])
+            .query("\"", &mut Segment::new(0, 0))
             .into_iter()
             .map(|c| c.text.clone())
             .collect();
         assert_eq!(pair, vec!["“".to_string(), "”".to_string()]);
         // `{ commit: … }`
-        assert_eq!(t.query("`", 0, &[])[0].text, "`");
+        assert_eq!(t.query("`", &mut Segment::new(0, 0))[0].text, "`");
     }
 
     #[test]
@@ -465,15 +468,15 @@ mod tests {
         let mut half = PunctTranslator::with_config(&config(), false);
         let mut full = PunctTranslator::with_config(&config(), true);
         // 半角表里有 `'` 的多选，全角表里没有 → 全角时该键不出候选
-        assert_eq!(half.query("'", 0, &[]).len(), 3);
-        assert!(full.query("'", 0, &[]).is_empty());
-        assert_eq!(full.query(",", 0, &[])[0].text, "，");
+        assert_eq!(half.query("'", &mut Segment::new(0, 0)).len(), 3);
+        assert!(full.query("'", &mut Segment::new(0, 0)).is_empty());
+        assert_eq!(full.query(",", &mut Segment::new(0, 0))[0].text, "，");
     }
 
     #[test]
     fn unknown_punct_is_noop() {
         let mut t = PunctTranslator::with_config(&config(), false);
-        assert!(t.query("z", 0, &[]).is_empty());
+        assert!(t.query("z", &mut Segment::new(0, 0)).is_empty());
     }
 
     #[test]

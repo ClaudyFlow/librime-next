@@ -910,3 +910,107 @@ fn table_translator_wubi86_learns_committed_word() {
             .collect::<Vec<_>>()
     );
 }
+
+// ── 反查（reverse_lookup_translator）──────────────────────────────────────
+
+/// 反查闭环：`` `h `` → 笔画段（tag = `reverse_lookup`）→ 「一」→ 注释 `yi` → 提交。
+///
+/// 这条链路要同时用到两份**方向相反**的词典：`stroke`（码 → 字）出候选，
+/// `luna_pinyin.reverse.bin`（字 → 码）出注释。任何一边没接上都会表现为
+/// "候选出得来但注释空"或"根本没候选"。
+#[test]
+fn reverse_lookup_finds_word_by_stroke_code() {
+    let mut session = new_session(&build_dir(), "reverse_lookup_demo");
+    assert!(session.engine.is_some(), "reverse_lookup_demo 引擎应加载");
+
+    type_ascii(&mut session, "`h");
+    let candidates = candidate_list(&mut session);
+    assert!(!candidates.is_empty(), "`h 应出候选");
+    let yi = candidates
+        .iter()
+        .find(|c| c.text == "一")
+        .unwrap_or_else(|| {
+            panic!(
+                "`h 应出「一」（stroke 里 h = 橫），实际：{:?}",
+                candidates
+                    .iter()
+                    .map(|c| (c.kind.as_str(), c.text.as_str(), c.comment.as_str()))
+                    .take(10)
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(yi.kind, "reverse_lookup", "候选类型应是 reverse_lookup");
+    assert_eq!(yi.comment, "yi", "注释来自 luna_pinyin 反查表");
+    assert_eq!(yi.preedit, "`一", "preedit 是完整输入经 xlit 后的结果");
+
+    // 反查段要带 prompt（C++ 在 Query 里主动改 segment.prompt）
+    let prompt = session
+        .context()
+        .and_then(|ctx| ctx.composition.segmentation.segments.first())
+        .map(|seg| seg.prompt.clone())
+        .unwrap_or_default();
+    assert_eq!(prompt, "〔筆畫〕", "打反查前缀后段上应有提示");
+
+    // 选中 → 整段提交
+    let index = candidates.iter().position(|c| c.text == "一").unwrap();
+    let result = session.choose(index).expect("应能选中「一」");
+    assert!(
+        format!("{result:?}").contains("Committed"),
+        "选「一」应整段提交，实际 {result:?}"
+    );
+    assert_eq!(session.take_commit().as_deref(), Some("一"));
+}
+
+/// 只打前缀（还没打码）时不该出候选 —— C++ 的 `if (start < input.length())`。
+#[test]
+fn reverse_lookup_prefix_alone_yields_nothing() {
+    let mut session = new_session(&build_dir(), "reverse_lookup_demo");
+    type_ascii(&mut session, "`");
+    assert!(
+        candidate_list(&mut session).is_empty(),
+        "只打 `` ` `` 不该有候选"
+    );
+    let prompt = session
+        .context()
+        .and_then(|ctx| ctx.composition.segmentation.segments.first())
+        .map(|seg| seg.prompt.clone())
+        .unwrap_or_default();
+    assert_eq!(prompt, "〔筆畫〕", "但提示照设");
+}
+
+/// 没有 `reverse_lookup` 标签的普通段，反查翻译器不认领。
+#[test]
+fn reverse_lookup_does_not_claim_plain_segments() {
+    let mut session = new_session(&build_dir(), "reverse_lookup_demo");
+    type_ascii(&mut session, "h");
+    let candidates = candidate_list(&mut session);
+    assert!(
+        candidates.iter().all(|c| c.kind != "reverse_lookup"),
+        "不带反引号的段不该有 reverse_lookup 候选，实际：{:?}",
+        candidates
+            .iter()
+            .map(|c| (c.kind.as_str(), c.text.as_str()))
+            .take(6)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// 反查过滤器：给候选补上"反查码"注释（出厂 0 引用，这里单独验证行为）。
+#[test]
+fn reverse_lookup_filter_fills_codes() {
+    use librime_next::engine::gear::filter::Filter;
+    use librime_next::engine::gear::reverse_lookup_filter::ReverseLookupFilter;
+    use librime_next::engine::Candidate;
+    use serde_json::json;
+
+    let build = build_dir();
+    let config = json!({ "reverse_lookup": { "dictionary": "luna_pinyin" } });
+    let mut filter = ReverseLookupFilter::load(&config, "filter", &build);
+    let mut list = vec![
+        Candidate::new("script", 0, 3, "你".to_string(), 1.0),
+        Candidate::new("script", 0, 3, "好".to_string(), 1.0).with_comment("已有的"),
+    ];
+    filter.apply(&librime_next::engine::Context::new(), &mut list);
+    assert_eq!(list[0].comment, "ni", "没注释的候选应被补上反查码");
+    assert_eq!(list[1].comment, "已有的", "默认不覆盖别人的注释");
+}

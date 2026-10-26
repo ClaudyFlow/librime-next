@@ -363,13 +363,13 @@ impl Engine {
                 continue;
             }
             let mut menu = Menu::new();
-            // 段标签决定翻译器是否认领这段（C++ `segment.HasAnyTagIn(tags_)`）
-            let seg_tags = seg.tags.clone();
+            // 段标签决定翻译器是否认领这段（C++ `segment.HasAnyTagIn(tags_)`）——
+            // 标签现在由 translator 自己从 `segment.tags` 读，不再单独传。
             for entry in &mut translators {
                 if !entry.is_enabled() {
                     continue;
                 }
-                for mut c in entry.component.query(text, seg.start, &seg_tags) {
+                for mut c in entry.component.query(text, seg) {
                     // translator 返回的是**相对本段**的位置，这里还原成绝对偏移
                     c.start += seg.start;
                     c.end += seg.start;
@@ -404,20 +404,23 @@ impl Engine {
             else {
                 continue;
             };
-            // 这一段该套哪些 filter（只读 `self.context`）
-            let applicable: Vec<bool> = self
-                .filters
-                .iter()
+            // 这一段该套哪些 filter
+            // `apply` 取 `&mut self`：`Context` 不可变借用与 `filters` 可变借用是
+            // 不同字段，分开绑一次就能同时用。
+            let context = &self.context;
+            let filters = &mut self.filters;
+            let applicable: Vec<bool> = filters
+                .iter_mut()
                 .map(|entry| {
-                    let seg = &self.context.composition.segmentation.segments[i];
-                    entry.is_enabled() && entry.component.applies_to_segment(&self.context, seg)
+                    let seg = &context.composition.segmentation.segments[i];
+                    entry.is_enabled() && entry.component.applies_to_segment(context, seg)
                 })
                 .collect();
-            for (entry, applies) in self.filters.iter().zip(applicable) {
+            for (entry, applies) in filters.iter_mut().zip(applicable) {
                 if !applies {
                     continue;
                 }
-                entry.component.apply(&self.context, menu.candidates_mut());
+                entry.component.apply(context, menu.candidates_mut());
             }
             self.context.composition.segmentation.segments[i].menu = Some(menu);
         }

@@ -12,7 +12,7 @@
 
 | 层 | LRN | 补丁版 | 判定 |
 |---|---|---|---|
-| 输入组件 | 22 / 35 | 35 / 35 | 落后，缺 13 项；出厂方案实际只引用其中 3 项 |
+| 输入组件 | 24 / 35 | 35 / 35 | 落后，缺 11 项；出厂方案实际只引用其中 2 项（`history_translator` 12、`affix_segmentor` 6） |
 | **整句组句（WordGraph + Poet）** | **有**，`src/engine/gear/poet.rs` + `Dictionary::lookup_from_graph` | 有，`ScriptSyllabifier::BuildSyllableGraph` + `Poet::MakeSentences` | **已对齐**（`b1b0125`）。`nihaoshijie` → 「你好世界」；`nihao` → 「你好」（精确词条不组句） |
 | 用户词典 UserDb 持久化 | **有**，`db.rs` + `level_db.rs`（rusty-leveldb）+ `user_db.rs` + `user_dictionary.rs`；`script_translator` 与 `table_translator` 两条学词链路都已打通，另补 `UnityTableEncoder` + `DictEntryIterator` | LevelDB 实装，`%APPDATA%/Rime-Next/userdb/` 下 4 个 `.userdb` 在用 | **已对齐**（拼音 + 形码双路） |
 | 语法模型 octagram grammar | **有**，`gram_db.rs` + `grammar.rs`（Darts trie + 紧凑 n-gram 编码 + 五元打分） | 有，4 个 `.gram` 共约 470 MB 在用 | **已对齐**（未提交时）。`zhongguoren` → 「中國人」排第一 |
@@ -57,7 +57,7 @@
 | `table_translator` | ✅ | 19 |
 | `script_translator` | ✅ | 10 |
 | `r10n_translator`（`ScriptTranslator` 别名） | ✅ | 0 |
-| `reverse_lookup_translator` | ❌ | **18** |
+| `reverse_lookup_translator` | ✅ | **18** |
 | `history_translator` | ❌ | **12** |
 | `echo_translator` | ❌ | 0 |
 | `schema_list_translator` | ❌ | 0 |
@@ -72,7 +72,7 @@
 | `single_char_filter` | ✅ | 2 |
 | `charset_filter` | ❌ | 0（`enable_charset_filter` 是 option 名，不是组件） |
 | `cjk_minifier`（`CharsetFilter` 别名） | ❌ | 0 |
-| `reverse_lookup_filter` | ❌ | 0 |
+| `reverse_lookup_filter` | ✅ | 0 |
 
 ### formatter（1）
 
@@ -130,6 +130,29 @@ e2e `table_translator_wubi86_learns_committed_word` 走完"打 `wq` → 选「�
    靠继承实现。Rust 做不出自引用，改成收集器走入参（`dfs_encode(collector, ...)`），
    编码器只负责公式/排除项/尾锚，收集器由调用方给（`BoundTableEncoder::new(collector)`）。
 
+**反查（`reverse_lookup_*`）已补齐**（2026-10-26）。移植时踩到的五个点：
+
+1. **一份输入、两份方向相反的词典。** 正查取 `reverse_lookup/dictionary`（`stroke`，
+   码 → 字：`h` → 「一」），反查表取 `reverse_lookup/target`（默认 `translator`）→
+   `translator/dictionary`（`luna_pinyin`）的 `.reverse.bin`（字 → 码：给候选补注释 `yi`）。
+   过滤器反过来 —— 它读 `reverse_lookup/dictionary` **自己的**反查表。这不是笔误，
+   两边要显示的"码"本来就不是同一套。
+2. **`ReverseDb::open` 之后必须 `load()`。** 只 open 只是把文件映射进来，
+   两个 trie 都是空的，`lookup` 恒返回 `None` —— 表现为"候选出得来、注释永远是空的"。
+   C++ 对应 `ReverseLookupDictionary::Load()` 里的 `db_->Load()`。
+3. **`enable_completion` 的默认值是反的。** C++ 写的是
+   `if (!config->GetBool(ns + "/enable_completion", &enabled)) set_enable_completion(false);`
+   —— `GetBool` 返回 false 表示**键不存在**，所以"没配"等于强制关，覆盖
+   `TranslatorOptions` 里的默认 true。反查默认不做前缀补全。
+4. **`Translator::query` 必须能写 `segment.prompt`。** C++ 在 `Query` 里
+   `const_cast<Segment*>(&segment)->prompt = tips_`，好让输入区显示〔筆畫〕。
+   LRN 原来只传 `(input, start, seg_tags)`，写不了段。签名改成
+   `query(input, &mut Segment)` —— 顺带所有翻译器都能直接读 `segment.tags`，
+   不再需要单独传一份 `seg_tags`。
+5. **候选坐标必须相对本段。** `Engine::translate_segment` 统一加 `segment.start`。
+   `table_translator` 与 `punct_translator` 原来传的是**绝对**位置，多段输入会被加两次
+   （单段输入 `start == 0` 时看不出来，所以一直没暴露）。这次一并修正。
+
 补丁版 patch 快照（Oct 25）里方案清单仍写 `schema/schema.toml`（靠 `toml_lite.cc` 解析），
 而 LRN 读 `<user>/schema/schema.yaml`。当前 `%APPDATA%/Rime-Next/schema/` 下**两个文件都在**。
 需要核实补丁版 dll 的实际读取路径，避免换引擎时方案清单来源不一致。
@@ -160,8 +183,8 @@ grep -E 'r\.Register' /c/code/librime/src/rime/gear/gears_module.cc
 2. ~~octagram grammar~~ ✅ `86aad8c`
 3. ~~UserDb 持久化~~ ✅ 字典层 + `script_translator` 学词闭环 + `table_translator`
    学词闭环（`UnityTableEncoder` + `DictEntryIterator` + `lookup_words`）
-4. `reverse_lookup_translator` + `reverse_lookup_filter` —— 18 个文件　**← 继续做**
-5. `history_translator` —— 12 个文件
+4. ~~`reverse_lookup_translator` + `reverse_lookup_filter`~~ ✅ 18 个文件
+5. `history_translator` —— 12 个文件　**← 继续做**
 6. `affix_segmentor` —— 6 个文件
 7. 其余 8 项（出厂 0 引用，按需再补）
 
@@ -171,6 +194,7 @@ grep -E 'r\.Register' /c/code/librime/src/rime/gear/gears_module.cc
 | 2026-10-26 | 整句组句 ✅（`b1b0125`）；grammar ✅（`86aad8c`）；UserDb 字典层 ✅（`019da51`） |
 | 2026-10-26 | `script_translator` 学词闭环 ✅（`5387a9d`） |
 | 2026-10-26 | `table_translator` 学词闭环 ✅：`unity_table_encoder.rs`(230行) + `dict_entry_iterator.rs`(492行) + `Dictionary::lookup_words` + `TableTranslator::query` 三路合流。质量公式改为 `exp(weight)`。全量 **434 passed / 0 failed** |
+| 2026-10-26 | `reverse_lookup_translator` + `reverse_lookup_filter` ✅：组件 **22/35 → 24/35**，引用加权 **436/472 → 454/472（96%）**。顺带把 `Translator::query` 改成收 `&mut Segment`（要写 `prompt`），并修正 `table`/`punct` 候选坐标的二次偏移。全量 **450 passed / 0 failed** |
 | 2026-10-26 | 补「整句组句」一层：核查 `ScriptTranslator` 为纯词级，`Poet`/`WordGraph` 未移植，grammar 因此无落点。定为第 1 优先级 |
 | 2026-10-26 | 整句组句落地（`b1b0125`）：`poet.rs` 560 行 + `lookup_from_graph` + `match_extra_code`。实测 `nihaoshijie`→「你好世界」、`nihao`→「你好」、`choose(0)` commit 全文 |
 | 2026-10-26 | grammar 落地：`gram_db.rs`（Darts + MappedFile）、`grammar.rs`（encode + Octagram 五元打分）、`data_roots` 架构。实测 `zhongguoren`→「中國人」；单测证明 `中国` 6.83 > `中果` -1.55 |

@@ -42,7 +42,7 @@ impl Filter for Simplifier {
         }
     }
 
-    fn apply(&self, _ctx: &Context, candidates: &mut Vec<Candidate>) {
+    fn apply(&mut self, _ctx: &Context, candidates: &mut Vec<Candidate>) {
         for cand in candidates.iter_mut() {
             cand.text = self.opencc.convert(&cand.text);
         }
@@ -67,7 +67,7 @@ mod tests {
 
     #[test]
     fn always_on_converts_text() {
-        let s = Simplifier::new(&opencc_dir(), "s2t.json", None).expect("加载 s2t");
+        let mut s = Simplifier::new(&opencc_dir(), "s2t.json", None).expect("加载 s2t");
         let mut list = vec![cand("汉语")];
         s.apply(&Context::new(), &mut list);
         assert_eq!(list[0].text, "漢語");
@@ -75,7 +75,7 @@ mod tests {
 
     #[test]
     fn t2s_converts_text() {
-        let s = Simplifier::new(&opencc_dir(), "t2s.json", None).expect("加载 t2s");
+        let mut s = Simplifier::new(&opencc_dir(), "t2s.json", None).expect("加载 t2s");
         let mut list = vec![cand("漢語")];
         s.apply(&Context::new(), &mut list);
         assert_eq!(list[0].text, "汉语");
@@ -83,7 +83,7 @@ mod tests {
 
     #[test]
     fn gated_by_option() {
-        let s = Simplifier::new(&opencc_dir(), "t2s.json", Some("zh_simp".to_string()))
+        let mut s = Simplifier::new(&opencc_dir(), "t2s.json", Some("zh_simp".to_string()))
             .expect("加载 t2s");
         let seg = Segment::new(0, 0);
 
@@ -107,7 +107,7 @@ mod tests {
 
     #[test]
     fn applies_to_segment_reflects_option() {
-        let s = Simplifier::new(&opencc_dir(), "t2s.json", Some("zh_simp".to_string()))
+        let mut s = Simplifier::new(&opencc_dir(), "t2s.json", Some("zh_simp".to_string()))
             .expect("加载 t2s");
         let seg = Segment::new(0, 0);
         assert!(!s.applies_to_segment(&Context::new(), &seg), "关着不该套用");

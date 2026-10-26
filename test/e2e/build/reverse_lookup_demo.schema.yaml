@@ -1,0 +1,58 @@
+# 反查（reverse_lookup_translator）的 e2e 验证方案。
+#
+# 只有这一个方案同时需要两份词典、且方向相反：
+#   * reverse_lookup/dictionary = stroke  —— 码 → 字（`h` 出「一」）
+#   * translator/dictionary     = luna_pinyin —— 字 → 码（「一」的注释 `yi`，
+#     取自 luna_pinyin.reverse.bin）
+#
+# speller 的 alphabet 必须含反引号与单引号，否则 speller 会先把这两个键当非法键
+# 吃掉，recognizer 就切不出反查段。
+schema:
+  schema_id: reverse_lookup_demo
+  name: "反查 (e2e 验证)"
+engine:
+  processors:
+    - ascii_composer
+    - recognizer
+    - key_binder
+    - speller
+    - punctuator
+    - selector
+    - navigator
+    - express_editor
+  segmentors:
+    - ascii_segmentor
+    - matcher
+    - abc_segmentor
+    - punct_segmentor
+    - fallback_segmentor
+  translators:
+    - punct_translator
+    - reverse_lookup_translator
+  filters:
+    - uniquifier
+speller:
+  alphabet: "`abcdefghijklmnopqrstuvwxyz'"
+  delimiter: " "
+recognizer:
+  patterns:
+    reverse_lookup: "`[a-z]*'?$"
+reverse_lookup:
+  dictionary: stroke
+  enable_completion: true
+  prefix: "`"
+  suffix: "'"
+  tips: 〔筆畫〕
+  preedit_format:
+    - xlit/hspnz/一丨丿丶乙/
+translator:
+  dictionary: luna_pinyin
+menu:
+  page_size: 9
+switches:
+  - name: ascii_mode
+    states: [ 中文, 西文 ]
+  - name: full_shape
+    states: [ 半角, 全角 ]
+  - name: ascii_punct
+    states: [ 。，, ．， ]

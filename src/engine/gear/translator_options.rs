@@ -30,6 +30,12 @@ pub struct TranslatorOptions {
     pub tags: Vec<String>,
     /// `enable_completion`：输入没打完时是否也给候选（默认 true）。
     pub enable_completion: bool,
+    /// `strict_spelling`：音节拼写必须严格正确（模糊音/纠错不参与切分）。
+    ///
+    /// 只有 `reverse_lookup_translator` 的非补全路径用到 —— 它要自己建音节图
+    /// （`Syllabifier(delimiters, true, strict_spelling)`），而
+    /// `script_translator` 走的是 `DictEntryIterator` 那条前缀扫，不建图。
+    pub strict_spelling: bool,
     /// `initial_quality`：叠加到每条候选质量分上的基数（默认 0）。
     pub initial_quality: f64,
     /// `preedit_format`：候选在输入区显示的文本（如笔画方案的 `xlit/hspnz/⼀⼁⼃⼂⼄/`）。
@@ -47,6 +53,7 @@ impl TranslatorOptions {
             delimiters: String::new(),
             tags: vec!["abc".to_string()],
             enable_completion: true,
+            strict_spelling: false,
             initial_quality: 0.0,
             preedit_formatter: Projection::default(),
             comment_formatter: Projection::default(),
@@ -76,6 +83,12 @@ impl TranslatorOptions {
             .and_then(Value::as_f64)
         {
             options.initial_quality = v;
+        }
+        if let Some(v) = config
+            .pointer(&format!("/{}/strict_spelling", name_space))
+            .and_then(Value::as_bool)
+        {
+            options.strict_spelling = v;
         }
 
         // tag / tags：配了 `tag` 就替换第一个；**没配** `tag` 就把默认的 `abc` 清空，

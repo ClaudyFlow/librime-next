@@ -42,6 +42,8 @@ use crate::engine::gear::poet::Poet;
 use crate::engine::gear::processor::Processor;
 use crate::engine::gear::punctuator::{PunctSegmentor, PunctTranslator, Punctuator};
 use crate::engine::gear::recognizer::Recognizer;
+use crate::engine::gear::reverse_lookup_filter::ReverseLookupFilter;
+use crate::engine::gear::reverse_lookup_translator::ReverseLookupTranslator;
 use crate::engine::gear::segmentor::Segmentor;
 use crate::engine::gear::selector::Selector;
 use crate::engine::gear::simplifier::Simplifier;
@@ -311,6 +313,11 @@ pub fn create_filter(ticket: &Ticket) -> Option<Box<dyn Filter + Send + Sync>> {
     match ticket.klass.as_str() {
         "uniquifier" => Some(Box::new(Uniquifier::new())),
         "single_char" | "single_char_filter" => Some(Box::new(SingleCharFilter::new())),
+        "reverse_lookup_filter" => Some(Box::new(ReverseLookupFilter::load(
+            ticket.config,
+            &ticket.name_space,
+            ticket.build_dir,
+        ))),
         "simplifier" => {
             // 配置节点：带 alias 时优先读 `alias:` 块，否则回退到 `simplifier:` 块
             // （与原版 `Simplifier` 读 `ticket.config` 的方式对齐）。
@@ -376,6 +383,13 @@ pub fn create_translator(ticket: &Ticket) -> Option<Box<dyn Translator + Send + 
     let options = TranslatorOptions::from_config(ticket.config, &ticket.name_space);
     match ticket.klass.as_str() {
         "punct_translator" => Some(Box::new(PunctTranslator::with_config(ticket.config, false))),
+        "reverse_lookup_translator" => {
+            // 反查翻译器的命名空间默认就从 `translator` 改写成 `reverse_lookup`
+            // （`reverse_lookup_translator.cc:62-64`），改名发生在组件内部，
+            // 所以这里把原始 `name_space` 原样递进去。
+            ReverseLookupTranslator::load(ticket.config, &ticket.name_space, ticket.build_dir)
+                .map(|t| Box::new(t) as Box<dyn Translator + Send + Sync>)
+        }
         "table_translator" => {
             let (dict_name, prism_name) = translator_dict_name(ticket)?;
             let dict = crate::dict::dictionary::Dictionary::open(

@@ -49,6 +49,7 @@ use crate::engine::candidate::Candidate;
 use crate::engine::gear::translator::Translator;
 use crate::engine::gear::translator_options::TranslatorOptions;
 use crate::engine::gear::unity_table_encoder::UnityTableEncoder;
+use crate::engine::segmentation::Segment;
 
 /// C++ `kInitialSearchLimit`（`table_translator.cc:119`）：首屏取几个 prism 键。
 const K_INITIAL_SEARCH_LIMIT: usize = 10;
@@ -218,8 +219,8 @@ impl TableTranslator {
 }
 
 impl Translator for TableTranslator {
-    fn query(&mut self, input: &str, start: usize, seg_tags: &[String]) -> Vec<Candidate> {
-        if !self.options.has_any_tag(seg_tags) {
+    fn query(&mut self, input: &str, segment: &mut Segment) -> Vec<Candidate> {
+        if !self.options.has_any_tag(&segment.tags) {
             return Vec::new();
         }
         // C++：`boost::trim_right_if(code, is_any_of(delimiters_))`
@@ -227,8 +228,11 @@ impl Translator for TableTranslator {
         if code.is_empty() {
             return Vec::new();
         }
-        // C++ 的 `end` 是 `segment.start + input.length()`；`start` 是段起点。
-        let end = start + input.len();
+        // 候选坐标一律**相对本段**：`Engine::translate_segment` 会统一加上
+        // `segment.start` 还原成绝对偏移（见 `runtime.rs` 里那句 `c.start += seg.start`）。
+        // 这里原来写的是 `segment.start + input.len()`，和调用方约定撞车 ——
+        // 单段输入（`start == 0`）看不出来，多段输入会把偏移算成两倍。
+        let end = input.len();
         let preedit = input.to_string();
 
         // ① 用户侧（精确 + 构造 + 补全）
@@ -263,11 +267,11 @@ impl Translator for TableTranslator {
                 let Some(entry) = uter.peek().cloned() else {
                     break;
                 };
-                out.push(self.make_candidate(&entry, true, start, end, &preedit));
+                out.push(self.make_candidate(&entry, true, 0, end, &preedit));
                 if !uter.next() {
                     // 用户侧读完了，剩下的全从词表取
                     while let Some(entry) = iter.peek().cloned() {
-                        out.push(self.make_candidate(&entry, false, start, end, &preedit));
+                        out.push(self.make_candidate(&entry, false, 0, end, &preedit));
                         if !iter.next() {
                             break;
                         }
@@ -278,10 +282,10 @@ impl Translator for TableTranslator {
                 let Some(entry) = iter.peek().cloned() else {
                     break;
                 };
-                out.push(self.make_candidate(&entry, false, start, end, &preedit));
+                out.push(self.make_candidate(&entry, false, 0, end, &preedit));
                 if !iter.next() {
                     while let Some(entry) = uter.peek().cloned() {
-                        out.push(self.make_candidate(&entry, true, start, end, &preedit));
+                        out.push(self.make_candidate(&entry, true, 0, end, &preedit));
                         if !uter.next() {
                             break;
                         }

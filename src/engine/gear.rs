@@ -34,6 +34,8 @@ pub mod processor;
 pub mod punctuator;
 pub mod recognizer;
 pub mod registry;
+pub mod reverse_lookup_filter;
+pub mod reverse_lookup_translator;
 pub mod segmentor;
 pub mod selector;
 pub mod simplifier;

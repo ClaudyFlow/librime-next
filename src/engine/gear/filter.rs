@@ -22,7 +22,11 @@ pub trait Filter {
     }
 
     /// 就地改写候选列表。`ctx` 用于按开关（option）决定是否转换。
-    fn apply(&self, _ctx: &Context, candidates: &mut Vec<Candidate>);
+    ///
+    /// 取 `&mut self` 是为了 `Projection`（`comment_format` / `preedit_format`）——
+    /// C++ 的 `Projection::Apply` 是 const 方法，Rust 侧的 `apply_str` 要
+    /// `&mut self`（内部 `Vec<Box<dyn Calculation>>` 逐个 `apply`）。
+    fn apply(&mut self, _ctx: &Context, candidates: &mut Vec<Candidate>);
 }
 
 /// `gear/uniquifier.cc`：同一词条只留一条（保留质量最高的那条）。
@@ -35,7 +39,7 @@ impl Uniquifier {
 }
 
 impl Filter for Uniquifier {
-    fn apply(&self, _ctx: &Context, candidates: &mut Vec<Candidate>) {
+    fn apply(&mut self, _ctx: &Context, candidates: &mut Vec<Candidate>) {
         let mut seen: Vec<String> = Vec::new();
         let mut out: Vec<Candidate> = Vec::with_capacity(candidates.len());
         for cand in candidates.drain(..) {
@@ -63,7 +67,7 @@ impl SingleCharFilter {
 }
 
 impl Filter for SingleCharFilter {
-    fn apply(&self, _ctx: &Context, candidates: &mut Vec<Candidate>) {
+    fn apply(&mut self, _ctx: &Context, candidates: &mut Vec<Candidate>) {
         let mut single: Vec<Candidate> = Vec::new();
         let mut multi: Vec<Candidate> = Vec::new();
         for cand in candidates.drain(..) {

@@ -164,7 +164,6 @@ impl Dictionary {
 
         let mut collector = DictEntryCollector::new();
         for (end_pos, pages) in self.table.query(graph, start_pos) {
-            let bucket = collector.entry(end_pos).or_default();
             for page in pages {
                 let mut accessor = page;
                 let index_code = accessor.index_code().clone();
