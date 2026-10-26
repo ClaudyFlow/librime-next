@@ -320,10 +320,19 @@ e2e 新测：`type_ascii("yuyan")` 后——
 3 个断言测试全过，证明 simplifier 在真实引擎链路里生效且受开关门控。
 （测试用 opencc 数据放 `test/e2e/opencc`，1.2M，与 build 真实数据同源。）
 
-### 仍缺（同一缺口清单顺延）
+### 仍缺（2026-10-27 复核：本清单已全部落地，缺口以 PARITY.md 为准）
 
-`reverse_lookup_translator` + `reverse_lookup_filter`、`UserDb` 持久化（替换 `InMemoryUserDb` 桩）、
-`charset_filter` + `commit_history`（cangjie5）、`collapse_composition` / `cjk_minifier` /
-`echo_translator` / `chord_composer`、`lua_*` / `grammar` / `SchemaSwitcher`。
+⚠️ 这一节曾长期**过期未更新**：下面列的每一项在 `doc/PARITY.md` 第七节里都已标记 ✅
+（`reverse_lookup_*`、`UserDb` 持久化、`charset_filter` + `commit_history`、`cjk_minifier`、
+`echo_translator`、`chord_composer`、`grammar`、`Switcher` 底座）。组件计数 **35/35**，
+出厂引用加权 **472/472**。以后看缺口只看 `PARITY.md`，本节不再重复维护。
+
+当前**组件层面无缺口**。两项说明：
+
+- `lua_*`：补丁版产物 `rime.dll` 里根本没有 lua 组件（符号检查 0 命中），LRN 缺 lua 与
+  补丁版**行为等价**，按 PARITY 的判定口径不算缺口。
+- `collapse_composition`：C++ 上游与 LRN 两侧都查无此组件（全仓 `grep` 0 命中），
+  这一条是早期笔记里的误记，已从清单移除。
+
 （e2e 里 `table_translator@custom_phrase` / `reverse_lookup_translator` 创建报错是**预期**——
 未移植组件按设计返回 `None`、链条继续，不影响主线。）
