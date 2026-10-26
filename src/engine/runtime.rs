@@ -12,6 +12,7 @@
 use std::path::Path;
 
 use crate::dict::dictionary::Dictionary;
+use crate::engine::candidate::Candidate;
 use crate::engine::composition::Composition;
 use crate::engine::context::Context;
 use crate::engine::gear::abc_segmentor::AbcSegmentor;
@@ -386,18 +387,30 @@ impl Engine {
                 continue;
             }
             let mut menu = Menu::new();
+            // 兜底候选（`echo_translator`）：**只在正经候选全空时**才进菜单。
+            // C++ 里这件事由 `EchoTranslation::Compare` 检查 `other->exhausted()`
+            // 完成，LRN 没有翻译器之间的协商通道，所以在这里延后合并。
+            let mut fallback: Vec<Candidate> = Vec::new();
             // 段标签决定翻译器是否认领这段（C++ `segment.HasAnyTagIn(tags_)`）——
             // 标签现在由 translator 自己从 `segment.tags` 读，不再单独传。
             for entry in &mut translators {
                 if !entry.is_enabled() {
                     continue;
                 }
+                let is_fallback = entry.component.is_fallback();
                 for mut c in entry.component.query(text, seg, &history) {
                     // translator 返回的是**相对本段**的位置，这里还原成绝对偏移
                     c.start += seg.start;
                     c.end += seg.start;
-                    menu.add(c);
+                    if is_fallback {
+                        fallback.push(c);
+                    } else {
+                        menu.add(c);
+                    }
                 }
+            }
+            if menu.is_empty() {
+                menu.add_all(fallback);
             }
             menu.prepare();
             seg.menu = Some(menu);

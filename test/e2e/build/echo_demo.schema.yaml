@@ -1,0 +1,53 @@
+# 兜底翻译器（echo_translator）的 e2e 验证方案。
+#
+# 这个组件的行为是**条件性**的：它永远能产出一条 `raw` 候选（原样回显输入），
+# 但只有当同段的正经翻译器交白卷时，这条候选才允许出现在菜单里。
+#
+# 所以验证要两个方向的输入：
+#   `nihao` —— 音节切得开、词表有词 ⇒ 出「你好」，**不出** raw 候选
+#   `qqq`   —— luna_pinyin 的拼写表里没有 `qq` 这个音节，script_translator 空
+#              ⇒ 只剩 echo 的 raw 候选「qqq」（从而这段可以被确认、原样上屏）
+#
+# 出厂方案很少列 echo_translator，但它对"输入了方案里没有的字母"这种场景是唯一的
+# 退路 —— 没有它，段会卡在组合状态里只能 Escape。
+schema:
+  schema_id: echo_demo
+  name: "兜底回显 (e2e 验证)"
+version: "1.0"
+engine:
+  processors:
+    - ascii_composer
+    - recognizer
+    - key_binder
+    - speller
+    - punctuator
+    - selector
+    - navigator
+    - express_editor
+  segmentors:
+    - ascii_segmentor
+    - matcher
+    - abc_segmentor
+    - punct_segmentor
+    - fallback_segmentor
+  translators:
+    - punct_translator
+    - script_translator
+    - echo_translator
+  filters:
+    - uniquifier
+speller:
+  alphabet: "zyxwvutsrqponmlkjihgfedcba"
+  delimiter: " '"
+translator:
+  dictionary: luna_pinyin
+  prism: luna_pinyin_simp
+menu:
+  page_size: 9
+switches:
+  - name: ascii_mode
+    states: [ 中文, 西文 ]
+  - name: full_shape
+    states: [ 半角, 全角 ]
+  - name: ascii_punct
+    states: [ 。，, ．， ]

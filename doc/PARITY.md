@@ -12,7 +12,7 @@
 
 | 层 | LRN | 补丁版 | 判定 |
 |---|---|---|---|
-| 输入组件 | 30 / 35 | 35 / 35 | 数量上仍缺 5 项，但**出厂 124 个方案引用的组件已 100% 覆盖**（引用加权 472/472）；剩下 5 项出厂 0 引用 |
+| 输入组件 | 31 / 35 | 35 / 35 | 数量上仍缺 4 项，但**出厂 124 个方案引用的组件已 100% 覆盖**（引用加权 472/472）；剩下 4 项出厂 0 引用 |
 | **整句组句（WordGraph + Poet）** | **有**，`src/engine/gear/poet.rs` + `Dictionary::lookup_from_graph` | 有，`ScriptSyllabifier::BuildSyllableGraph` + `Poet::MakeSentences` | **已对齐**（`b1b0125`）。`nihaoshijie` → 「你好世界」；`nihao` → 「你好」（精确词条不组句） |
 | 用户词典 UserDb 持久化 | **有**，`db.rs` + `level_db.rs`（rusty-leveldb）+ `user_db.rs` + `user_dictionary.rs`；`script_translator` 与 `table_translator` 两条学词链路都已打通，另补 `UnityTableEncoder` + `DictEntryIterator` | LevelDB 实装，`%APPDATA%/Rime-Next/userdb/` 下 4 个 `.userdb` 在用 | **已对齐**（拼音 + 形码双路） |
 | 语法模型 octagram grammar | **有**，`gram_db.rs` + `grammar.rs`（Darts trie + 紧凑 n-gram 编码 + 五元打分） | 有，4 个 `.gram` 共约 470 MB 在用 | **已对齐**（未提交时）。`zhongguoren` → 「中國人」排第一 |
@@ -59,7 +59,7 @@
 | `r10n_translator`（`ScriptTranslator` 别名） | ✅ | 0 |
 | `reverse_lookup_translator` | ✅ | **18** |
 | `history_translator` | ✅ | **12** |
-| `echo_translator` | ❌ | 0 |
+| `echo_translator` | ✅ | 0（兜底回显；出厂没列，但它是"输入了方案里没有的字母"时唯一的退路） |
 | `schema_list_translator` | ❌ | 0 |
 | `switch_translator` | ❌ | 0 |
 
@@ -238,8 +238,10 @@ grep -E 'r\.Register' /c/code/librime/src/rime/gear/gears_module.cc
    cangjie5 / yujoy 系出厂方案里都是 true
 9. ~~`charset_filter` / `cjk_minifier`~~ ✅ 组件 0 引用，但 `table_translator` 的
    `enable_charset_filter` 内联路径有 3 个出厂方案在用
-10. 其余 5 项（`chord_composer`、`streaming_chord_processor`、`echo_translator`、
-    `schema_list_translator`、`switch_translator`；出厂 0 引用，按需再补）
+10. ~~`echo_translator`~~ ✅ 出厂 0 引用，但它是"输入了方案里没有的字母"时唯一的退路
+11. 其余 4 项（`chord_composer`、`streaming_chord_processor`、`schema_list_translator`、
+    `switch_translator`；出厂 0 引用。后两者依赖 **Switcher 会话**，而 Switcher 是
+    `F4` 切换方案 / `Control+grave` 方案菜单的底座 —— 属"组件 0 引用但功能 100% 在用"）
 
 | 日期 | 变更 |
 |---|---|
@@ -259,3 +261,4 @@ grep -E 'r\.Register' /c/code/librime/src/rime/gear/gears_module.cc
 | 2026-10-26 | `table_translator::MakeSentence` ✅（形码整句）：在码串上按 `consume_trailing_delimiters` 建 WordGraph（用户词 / 构造词 / 词表三路，全部**只认精确命中**），接 `Poet::with_left_associative` 求最短路，产出「整句」候选 + 手选首词候选（码长降序、同长用户词优先）。新增 `enable_sentence` / `sentence_over_completion` / `max_homographs` 三个配置项。e2e：`wq;vb` → 「你好」（注释 ☯、preedit 不插空格）、`wq;vb;wq` → 「你好你」、词级有候选时不出整句。全量 **511 passed / 0 failed** |
 | 2026-10-26 | `charset_filter` / `cjk_minifier` ✅（字符集过滤）：`gear/charset_filter.rs`，CJK 扩展 A–J + 兼容汉字/补充的区间表照抄（`U+3300..33FF`、`U+FE30..FE4F` 两行 C++ 是注释掉的，同样不启用）。两条入口：组件本体（0 引用）+ `table_translator` 的 `enable_charset_filter` 内联（**wubi86 / cangjie5 / cangjie5_express 三个出厂方案在用**，`extended_charset` 可关闭）。组件 **28/35 → 30/35**。e2e：`wqvbwq` 不再出「𠛈」（U+206C8 扩展 B），开 `extended_charset` 后回来。全量 **518 passed / 0 failed** |
 | 2026-10-26 | `default.yaml` 的解析路径对齐：补丁版全程走 `Config::Require("config")->Create("default")`，那个解析器的根是**用户目录、回退根是共享目录**（`service.cc:167-172`）。LRN 原来两处（编译 schema 的基准配置、方案清单的回退来源）都硬写成 `shared_data_dir/default.yaml`，用户改过 `%APPDATA%/Rime-Next/default.yaml` 时会被忽略。改成 `default_config_path()` 用户优先 + 共享回退。全量 **519 passed / 0 failed** |
+| 2026-10-26 | `echo_translator` ✅（兜底回显）：组件 **30/35 → 31/35**。C++ 靠 `EchoTranslation::Compare` 检查 `other->exhausted()` 实现"别处有料就自尽"，LRN 的翻译器之间没有协商通道，改用 `Translator::is_fallback()` 标记 + runtime 延后合并，语义等价（单一 `quality` 排序做不到"根本不出现"）。e2e：`vvv` 切不出音节 → 只剩 raw 候选「vvv」且能原样上屏；`nihao` → 有「你好」时兜底让位。全量 **525 passed / 0 failed** |

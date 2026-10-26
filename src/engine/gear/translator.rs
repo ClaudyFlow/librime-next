@@ -40,6 +40,16 @@ pub trait Translator {
     /// 在这里刷新。默认实现什么都不做。
     fn sync_context(&mut self, _ctx: &crate::engine::context::Context) {}
 
+    /// 本翻译器的候选是**兜底**性质：只有同一段的正经候选全空时才补上。
+    ///
+    /// C++ 靠 `Translation::Compare` 让翻译器之间互相窥视（`echo_translator` 的
+    /// `EchoTranslation::Compare` 会检查 `other->exhausted()`），LRN 的翻译器各自
+    /// 返回 `Vec` 后统一塞进 `Menu` 排序，没有这种协商通道。用一个显式标记让
+    /// runtime 延后合并，语义与 C++ 等价。默认 `false`。
+    fn is_fallback(&self) -> bool {
+        false
+    }
+
     /// 给定一段输入串，产出候选列表（位置**相对本段**，候选各带覆盖到的 `end`）。
     ///
     /// `history` 是本会话的提交历史（C++ 里通过 `engine_->context()` 拿到）。

@@ -36,6 +36,7 @@ use crate::engine::gear::editor::Editor;
 use crate::engine::gear::fallback_segmentor::FallbackSegmentor;
 use crate::engine::gear::affix_segmentor::AffixSegmentor;
 use crate::engine::gear::charset_filter::CharsetFilter;
+use crate::engine::gear::echo_translator::EchoTranslator;
 use crate::engine::gear::filter::{Filter, SingleCharFilter, Uniquifier};
 use crate::engine::gear::history_translator::HistoryTranslator;
 use crate::engine::gear::key_binder::KeyBinder;
@@ -398,6 +399,7 @@ pub fn create_translator(ticket: &Ticket) -> Option<Box<dyn Translator + Send + 
     let options = TranslatorOptions::from_config(ticket.config, &ticket.name_space);
     match ticket.klass.as_str() {
         "punct_translator" => Some(Box::new(PunctTranslator::new(ticket.config))),
+        "echo_translator" => Some(Box::new(EchoTranslator::new())),
         "history_translator" => {
             // 命名空间改写（`translator` → `history`）发生在组件内部，
             // 所以这里把原始 `name_space` 原样递进去。

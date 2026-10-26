@@ -1535,3 +1535,60 @@ fn table_translator_word_match_suppresses_sentence() {
             .collect::<Vec<_>>()
     );
 }
+
+// ── 兜底翻译器（`echo_translator`）───────────────────────────────────────
+//
+// 它永远能产出一条 `raw` 候选，但**只在同段正经翻译器交白卷时**才露头。
+// 两个方向的输入缺一不可，只测一边会把"候选总是出现"这种错误实现当成通过。
+//
+// 挑输入有讲究：`qqq` 看着象乱码，其实 luna_pinyin 的单字母简拼把它切成了
+// 「七七」（q + q + q）—— 有正经候选。真正切不开的是 `vvv`：拼写表里没有
+// `v` 这个音节（`v` 在拼音里只作 ü 的输入替身，不单独成音节）。
+
+#[test]
+fn echo_translator_rescues_an_untranslatable_segment() {
+    let mut session = new_session(&build_dir(), "echo_demo");
+    type_ascii(&mut session, "vvv");
+
+    let candidates = candidate_list_of_last_segment(&mut session);
+    assert_eq!(
+        candidates.len(),
+        1,
+        "`vvv` 切不出音节，菜单里只该有兜底那一条，实际：{:?}",
+        candidates.iter().map(|c| (&c.kind, &c.text)).collect::<Vec<_>>()
+    );
+    let only = &candidates[0];
+    assert_eq!(only.kind, "raw");
+    assert_eq!(only.text, "vvv", "原样回显输入");
+    assert_eq!((only.start, only.end), (0, 3), "覆盖整段输入");
+}
+
+#[test]
+fn echo_candidate_yields_to_real_translations() {
+    let mut session = new_session(&build_dir(), "echo_demo");
+    type_ascii(&mut session, "nihao");
+
+    let candidates = candidate_list_of_last_segment(&mut session);
+    assert!(
+        candidates.iter().any(|c| c.text == "你好"),
+        "正常翻译应生效，实际：{:?}",
+        candidates.iter().map(|c| (&c.kind, &c.text)).collect::<Vec<_>>()
+    );
+    assert!(
+        candidates.iter().all(|c| c.kind != "raw"),
+        "有正经候选时兜底候选必须让位，实际：{:?}",
+        candidates.iter().map(|c| (&c.kind, &c.text)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn echo_fallback_can_be_committed_as_is() {
+    let mut session = new_session(&build_dir(), "echo_demo");
+    type_ascii(&mut session, "vvv");
+    session.choose(0);
+    assert_eq!(
+        session.take_commit().as_deref(),
+        Some("vvv"),
+        "兜底候选存在的意义就是让这段能原样上屏"
+    );
+}
