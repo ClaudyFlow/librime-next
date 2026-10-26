@@ -611,7 +611,9 @@ fn run_config_file_update(deployer: &mut Deployer, file_name: &str, version_key:
         log_warn(&format!("cannot create {}: {err}", parent.display()));
         return false;
     }
-    let defaults_path = deployer.shared_data_dir.join("default.yaml");
+    // `default` 资源（编译时 `__include`/`__patch` 的基准，schema 靠它拿
+    // `default/menu`、`default/navigator`、`default/selector`）。
+    let defaults_path = default_config_path(deployer);
     match config::compile(&source, &defaults_path, &[]) {
         Ok(compiled) => match write_compiled_schema(&compiled, &output) {
             Ok(()) => {
@@ -662,6 +664,26 @@ fn config_needs_update(staged_path: &Path, layout: &super::paths::Layout) -> boo
         }
     }
     false
+}
+
+/// `default` 资源的实际路径：**用户目录优先、共享目录回退**。
+///
+/// C++ 全程用 `Config::Require("config")->Create("default")`，它走的是
+/// `Service::CreateResourceResolver({"config","",".yaml"})` —— 根 = 用户目录、
+/// 回退根 = 共享目录（`service.cc:167-172`）。所以：
+///
+/// * 编译 schema 时的基准配置（`default/menu` 等）要按这个顺序找；
+/// * 方案清单的回退来源（`default.yaml` 的 `schema_list`）也是这一份。
+///
+/// 原来两处都硬写成 `shared_data_dir/default.yaml`，用户改过
+/// `%APPDATA%/Rime-Next/default.yaml` 时会被忽略。
+fn default_config_path(deployer: &Deployer) -> std::path::PathBuf {
+    let user_copy = deployer.user_data_dir.join("default.yaml");
+    if user_copy.is_file() {
+        user_copy
+    } else {
+        deployer.shared_data_dir.join("default.yaml")
+    }
 }
 
 /// `TrashDeprecatedUserCopy`（deployment_tasks.cc:338-372，简化版）：
@@ -893,10 +915,13 @@ fn run_workspace_update(deployer: &mut Deployer) -> bool {
     log_info("[Weasel-Next] SymlinkingPrebuiltDictionaries 未移植，跳过");
 
     // 3. 方案清单：`<user>/schema/schema.yaml`（点名制）优先，回退 default.yaml 的 schema_list
+    //
+    // 回退那份走 `default` 资源的解析规则（用户在目录优先、共享目录回退），
+    // 与 C++ `Config::Require("config")->Create("default")` 一致。
     let manifest = load_schema_manifest(&deployer.user_data_dir);
     let mut schema_ids = manifest.schemas.clone();
     let default_config = if schema_ids.is_empty() {
-        load_file(&deployer.shared_data_dir.join("default.yaml")).ok()
+        load_file(&default_config_path(deployer)).ok()
     } else {
         None
     };
@@ -970,9 +995,9 @@ fn run_workspace_update(deployer: &mut Deployer) -> bool {
     // 5. schema_list 写回 staging/default.yaml（清单唯一落点是 schema/schema.yaml，
     //    但 librime 的菜单读 build/default.yaml 的 schema_list，所以两处都要有）
     if !schema_ids.is_empty()
-        && let Some(mut value) = default_config.clone().or_else(|| {
-            load_file(&deployer.shared_data_dir.join("default.yaml")).ok()
-        })
+        && let Some(mut value) = default_config
+            .clone()
+            .or_else(|| load_file(&default_config_path(deployer)).ok())
     {
             let list: Vec<serde_json::Value> = schema_ids
                 .iter()
@@ -1259,9 +1284,54 @@ schemas = ["a", "b"]
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// `default` 资源**用户目录优先、共享目录回退**（C++ 的
+    /// `Config::Require("config")->Create("default")` 就是这么解析的）。
+    /// 原来两处都硬写 `shared_data_dir/default.yaml`，用户改过的那份会被忽略。
     #[test]
-    fn string_list_at_walks_nested_maps() {
-        use crate::config::convert_from_yaml;
+    fn user_default_yaml_wins_over_shared_copy() {
+        let root = std::env::temp_dir().join(format!("default-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let shared = root.join("shared");
+        let user = root.join("user");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::write(
+            shared.join("default.yaml"),
+            "config_version: 2\nmenu:\n  page_size: 5\n",
+        )
+        .unwrap();
+        let deployer = Deployer::with_data_dirs(&shared, &user);
+
+        // 只有共享目录那份 ⇒ 回退到它
+        assert_eq!(default_config_path(&deployer), shared.join("default.yaml"));
+
+        // 用户目录也有一份 ⇒ 用户那份说了算
+        std::fs::write(
+            user.join("default.yaml"),
+            "config_version: 2\nmenu:\n  page_size: 9\n",
+        )
+        .unwrap();
+        assert_eq!(default_config_path(&deployer), user.join("default.yaml"));
+
+        // 编译产物必须反映用户那份（page_size 9），否则就是又读回了共享目录
+        let mut deployer = Deployer::with_data_dirs(&shared, &user);
+        assert!(
+            DeploymentTask::ConfigFileUpdate {
+                file_name: "default.yaml".to_string(),
+                version_key: "config_version".to_string(),
+            }
+            .run(&mut deployer)
+        );
+        let staged = std::fs::read_to_string(user.join("build/default.yaml")).unwrap();
+        assert!(
+            staged.contains("9"),
+            "staging 应来自用户目录那份 default.yaml：{staged}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn string_list_at_walks_nested_maps() {        use crate::config::convert_from_yaml;
         let value: serde_json::Value = serde_json::json!({
             "schema": {
                 "dependencies": ["dep_a", "dep_b", ""],
