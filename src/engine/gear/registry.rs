@@ -48,6 +48,7 @@ use crate::engine::gear::reverse_lookup_filter::ReverseLookupFilter;
 use crate::engine::gear::reverse_lookup_translator::ReverseLookupTranslator;
 use crate::engine::gear::segmentor::Segmentor;
 use crate::engine::gear::selector::Selector;
+use crate::engine::gear::shape::ShapeProcessor;
 use crate::engine::gear::simplifier::Simplifier;
 use crate::engine::gear::speller::Speller;
 use crate::engine::gear::table_translator::TableTranslator;
@@ -360,9 +361,10 @@ pub fn create_processor(ticket: &Ticket) -> Option<Box<dyn Processor + Send + Sy
         "fluid_editor" | "fluency_editor" => Some(Box::new(Editor::fluid(ticket.config))),
         "key_binder" => Some(Box::new(KeyBinder::new(ticket.config))),
         "navigator" => Some(Box::new(Navigator::new(ticket.config))),
-        "punctuator" => Some(Box::new(Punctuator::with_config(ticket.config, false))),
+        "punctuator" => Some(Box::new(Punctuator::new(ticket.config))),
         "recognizer" => Some(Box::new(Recognizer::new(ticket.config, &ticket.name_space))),
         "selector" => Some(Box::new(Selector)),
+        "shape_processor" => Some(Box::new(ShapeProcessor)),
         "speller" => Some(Box::new(Speller::new(ticket.config))),
         _ => None,
     }
@@ -375,7 +377,7 @@ pub fn create_segmentor(ticket: &Ticket) -> Option<Box<dyn Segmentor + Send + Sy
         "ascii_segmentor" => Some(Box::new(AsciiSegmentor::new())),
         "matcher" => Some(Box::new(Matcher::new(ticket.config, &ticket.name_space))),
         "fallback_segmentor" => Some(Box::new(FallbackSegmentor::new())),
-        "punct_segmentor" => Some(Box::new(PunctSegmentor::with_config(ticket.config, false))),
+        "punct_segmentor" => Some(Box::new(PunctSegmentor::new(ticket.config))),
         "affix_segmentor" => Some(Box::new(AffixSegmentor::load(
             ticket.config,
             &ticket.name_space,
@@ -388,7 +390,7 @@ pub fn create_segmentor(ticket: &Ticket) -> Option<Box<dyn Segmentor + Send + Sy
 pub fn create_translator(ticket: &Ticket) -> Option<Box<dyn Translator + Send + Sync>> {
     let options = TranslatorOptions::from_config(ticket.config, &ticket.name_space);
     match ticket.klass.as_str() {
-        "punct_translator" => Some(Box::new(PunctTranslator::with_config(ticket.config, false))),
+        "punct_translator" => Some(Box::new(PunctTranslator::new(ticket.config))),
         "history_translator" => {
             // 命名空间改写（`translator` → `history`）发生在组件内部，
             // 所以这里把原始 `name_space` 原样递进去。

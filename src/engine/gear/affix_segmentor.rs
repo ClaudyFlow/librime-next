@@ -41,6 +41,7 @@
 //!    并且**去掉 `abc`** —— 否则剩余输入会被 abc_segmentor 抢走，翻译器就看不到它。
 //! 3. 劈完返回 `false`（**exclusive**）：本轮到此为止，后面的 segmentor 不再参与。
 
+use crate::engine::commit_history::CommitHistory;
 use crate::engine::gear::segmentor::{Segmentor, SegmentorView};
 use crate::engine::segmentation::{SegStatus, Segmentation, Segment};
 use serde_json::Value;
@@ -117,7 +118,12 @@ impl Default for AffixSegmentor {
 }
 
 impl Segmentor for AffixSegmentor {
-    fn proceed(&self, segs: &mut Segmentation, _view: SegmentorView) -> bool {
+    fn proceed(
+        &self,
+        segs: &mut Segmentation,
+        _view: SegmentorView,
+        _history: &CommitHistory,
+    ) -> bool {
         if segs.empty() {
             return true;
         }
@@ -195,9 +201,8 @@ impl Segmentor for AffixSegmentor {
         segs.add_segment(code_segment);
 
         // ── 有后缀就再劈一段 ──
-        let mut code_end = k;
         if !self.suffix.is_empty() && active_input.ends_with(&self.suffix) {
-            code_end = k - self.suffix.len();
+            let code_end = k - self.suffix.len();
             let back_start = segs.back().map_or(0, |s| s.start);
             if code_end == back_start {
                 // 码段是空的：整段扔掉，只留前后缀
@@ -271,7 +276,7 @@ mod tests {
     #[test]
     fn empty_segmentation_is_a_noop() {
         let mut segs = segs_of("`a");
-        assert!(zaoci().proceed(&mut segs, SegmentorView::default()));
+        assert!(zaoci().proceed(&mut segs, SegmentorView::default(), &CommitHistory::new()));
         assert!(segs.empty());
     }
 
@@ -280,7 +285,7 @@ mod tests {
         let mut segs = segs_of("`a");
         segs.push_back(Segment::new(0, 2));
         segs.segments[0].tags.push("abc".to_string());
-        assert!(zaoci().proceed(&mut segs, SegmentorView::default()));
+        assert!(zaoci().proceed(&mut segs, SegmentorView::default(), &CommitHistory::new()));
         assert_eq!(snapshot(&segs), vec![(0, 2, vec!["abc".to_string()])]);
     }
 
@@ -290,7 +295,7 @@ mod tests {
         segs.push_back(Segment::new(0, 1));
         segs.segments[0].tags.push("zaoci".to_string());
         assert!(
-            zaoci().proceed(&mut segs, SegmentorView::default()),
+            zaoci().proceed(&mut segs, SegmentorView::default(), &CommitHistory::new()),
             "只打前缀要让本轮继续"
         );
         let seg = &segs.segments[0];
@@ -305,7 +310,7 @@ mod tests {
         segs.push_back(Segment::new(0, 6));
         segs.segments[0].tags.push("zaoci".to_string());
         assert!(
-            !zaoci().proceed(&mut segs, SegmentorView::default()),
+            !zaoci().proceed(&mut segs, SegmentorView::default(), &CommitHistory::new()),
             "劈完要 exclusive"
         );
         let snap = snapshot(&segs);
@@ -327,7 +332,7 @@ mod tests {
         let mut segs = segs_of("`ab");
         segs.push_back(Segment::new(0, 3));
         segs.segments[0].tags.push("t".to_string());
-        s.proceed(&mut segs, SegmentorView::default());
+        s.proceed(&mut segs, SegmentorView::default(), &CommitHistory::new());
         assert!(segs.segments[1].has_tag("reverse_lookup"));
     }
 
@@ -340,7 +345,7 @@ mod tests {
         let mut segs = segs_of("`ab'");
         segs.push_back(Segment::new(0, 4));
         segs.segments[0].tags.push("t".to_string());
-        s.proceed(&mut segs, SegmentorView::default());
+        s.proceed(&mut segs, SegmentorView::default(), &CommitHistory::new());
         let snap = snapshot(&segs);
         assert_eq!(snap.len(), 3, "前缀 + 码 + 后缀，实际 {snap:?}");
         assert_eq!((snap[1].0, snap[1].1), (1, 3), "码段不含后缀");
@@ -359,7 +364,7 @@ mod tests {
         let mut segs = segs_of("`'");
         segs.push_back(Segment::new(0, 2));
         segs.segments[0].tags.push("t".to_string());
-        s.proceed(&mut segs, SegmentorView::default());
+        s.proceed(&mut segs, SegmentorView::default(), &CommitHistory::new());
         let snap = snapshot(&segs);
         assert_eq!(snap.len(), 2, "空码段要扔掉，实际 {snap:?}");
         assert!(snap[0].2.contains(&"t_prefix".to_string()));
@@ -378,7 +383,7 @@ mod tests {
         cur.tags.push("abc".to_string());
         segs.push_back(cur);
 
-        assert!(zaoci().proceed(&mut segs, SegmentorView::default()));
+        assert!(zaoci().proceed(&mut segs, SegmentorView::default(), &CommitHistory::new()));
         let back = segs.back().unwrap();
         assert!(back.has_tag("zaoci"), "要继承 tag");
         assert!(!back.has_tag("abc"), "abc 必须去掉，否则轮不到翻译器");
@@ -389,7 +394,7 @@ mod tests {
         let mut segs = segs_of("nihao");
         segs.push_back(Segment::new(0, 5));
         segs.segments[0].tags.push("zaoci".to_string());
-        assert!(zaoci().proceed(&mut segs, SegmentorView::default()));
+        assert!(zaoci().proceed(&mut segs, SegmentorView::default(), &CommitHistory::new()));
         assert_eq!(snapshot(&segs).len(), 1, "没前缀就不劈");
     }
 }

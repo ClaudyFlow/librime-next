@@ -309,18 +309,23 @@ impl Engine {
     fn calculate_segmentation(&mut self, caret_pos: usize) {
         // 同样的借用规避：把组件列表取到局部再遍历
         let segmentors = std::mem::take(&mut self.segmentors);
+        let ctx = &mut self.context;
         let view = SegmentorView {
-            ascii_mode: self.context.get_option("ascii_mode"),
+            ascii_mode: ctx.get_option("ascii_mode"),
+            full_shape: ctx.get_option("full_shape"),
         };
+        // `commit_history` 与 `composition.segmentation` 是兄弟字段，分开借不必拷贝
+        // （C++ 的 `PunctSegmentor::Proceed` 也是直接读 `context()->commit_history()`）。
+        let history = &ctx.commit_history;
         {
-            let segs = &mut self.context.composition.segmentation;
+            let segs = &mut ctx.composition.segmentation;
             while !segs.has_finished() {
                 let start_pos = segs.current_start();
                 for entry in &segmentors {
                     if !entry.is_enabled() {
                         continue;
                     }
-                    if !entry.component.proceed(segs, view) {
+                    if !entry.component.proceed(segs, view, history) {
                         break;
                     }
                 }
@@ -360,6 +365,11 @@ impl Engine {
     fn translate_segments(&mut self) {
         let mut translators = std::mem::take(&mut self.translators);
         let input = self.context.composition.segmentation.input.clone();
+        // translator 要读的运行期开关（`full_shape` 之类）在这里同步一次 ——
+        // 它们的 `query` 拿不到 `Context`（会和 `&mut segments` 借冲突）。
+        for entry in &mut translators {
+            entry.component.sync_context(&self.context);
+        }
         // 提交历史要按值拷一份：`segs` 借的是 `self.context` 的可变字段，
         // 不能再同时借 `self.context.commit_history`（最多 20 条，拷贝可忽略）。
         let history = self.context.commit_history.clone();

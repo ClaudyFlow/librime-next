@@ -5,6 +5,7 @@
 //! 差别只在怎么用它：processor 用来"放行按键"，这里用来"给段打标签"。
 
 use crate::engine::gear::recognizer::RecognizerPatterns;
+use crate::engine::commit_history::CommitHistory;
 use crate::engine::gear::segmentor::{Segmentor, SegmentorView};
 use crate::engine::segmentation::{Segment, Segmentation};
 
@@ -27,7 +28,12 @@ impl Matcher {
 }
 
 impl Segmentor for Matcher {
-    fn proceed(&self, segmentation: &mut Segmentation, _view: SegmentorView) -> bool {
+    fn proceed(
+        &self,
+        segmentation: &mut Segmentation,
+        _view: SegmentorView,
+        _history: &CommitHistory,
+    ) -> bool {
         if self.patterns.is_empty() {
             return true;
         }
@@ -63,7 +69,7 @@ mod tests {
             input: "abc@example.com".to_string(),
             segments: Vec::new(),
         };
-        assert!(m.proceed(&mut seg, SegmentorView::default()));
+        assert!(m.proceed(&mut seg, SegmentorView::default(), &CommitHistory::new()));
         assert_eq!(seg.segments.len(), 1);
         assert_eq!((seg.segments[0].start, seg.segments[0].end), (0, 15));
         assert!(seg.segments[0].tags.contains(&"email".to_string()));
@@ -76,7 +82,7 @@ mod tests {
             input: "abc".to_string(),
             segments: Vec::new(),
         };
-        assert!(m.proceed(&mut seg, SegmentorView::default()));
+        assert!(m.proceed(&mut seg, SegmentorView::default(), &CommitHistory::new()));
         assert!(seg.segments.is_empty());
     }
 }

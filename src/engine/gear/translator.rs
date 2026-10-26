@@ -33,6 +33,13 @@ const USER_DICT_QUALITY_BASE: f64 = 1.0e5;
 /// `` ` `` 之后要在输入区显示〔笔画〕）。Rust 侧直接把 `&mut Segment` 交出去，
 /// 比留个 `prompt` 旁路干净。
 pub trait Translator {
+    /// 每次翻译前同步一次运行期状态（C++ 里 translator 持 `Engine*`，随时能读 option）。
+    ///
+    /// lrn 的 `query` 只拿得到 `input` + `segment` + `history`，拿不到 `Context`，
+    /// 所以需要读 option 的实现（目前只有 `punct_translator` 要 `full_shape`）
+    /// 在这里刷新。默认实现什么都不做。
+    fn sync_context(&mut self, _ctx: &crate::engine::context::Context) {}
+
     /// 给定一段输入串，产出候选列表（位置**相对本段**，候选各带覆盖到的 `end`）。
     ///
     /// `history` 是本会话的提交历史（C++ 里通过 `engine_->context()` 拿到）。

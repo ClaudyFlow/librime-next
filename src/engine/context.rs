@@ -139,6 +139,15 @@ impl Context {
         self.composition.segmentation.input.clear();
     }
 
+    /// C++ `Context::AbortComposition()`：`Clear()` + 发 `abort` 通知。
+    ///
+    /// lrn 里没有 `update_notifier_` / `abort_notifier_` 这条链（通知一律由调用方
+    /// 显式补 `Engine::compose`），所以这里只做"清空"这一半。
+    /// 使用者是 `Punctuator` 处理数字串（`3.14`）时的"拼成整串重来"。
+    pub fn abort_composition(&mut self) {
+        self.clear();
+    }
+
     // ---- 段选择 ----
 
     /// `Select(index)`：选中末段第 index 个候选（置 `selected_index` + `Selected`）。

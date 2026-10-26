@@ -1,0 +1,53 @@
+# 数字分隔符（punctuator 的 digit_separators）的 e2e 验证方案。
+#
+# 和 `luna_pinyin_simp` 的关键区别：**不装 key_binder**。出厂方案里有
+# `{accept: period, send: Page_Down, when: has_menu}` —— 打完 `3.` 后组合里已经有
+# 候选（`has_menu` 成立），再按一次 `.` 会被 key_binder 转成 Page_Down，
+# 根本到不了 punctuator。所以"连按两次分隔符改回普通标点"
+# （`ReconvertDigitSeparatorAsPunct`）只能在没有这条绑定的方案上验证。
+#
+# 也不需要任何词典：`punct_translator` 一个就够让引擎装配成功。
+schema:
+  schema_id: digit_demo
+  name: "数字分隔符 (e2e 验证)"
+version: "1.0"
+engine:
+  processors:
+    - ascii_composer
+    - recognizer
+    - speller
+    - punctuator
+    - selector
+    - navigator
+    - express_editor
+  segmentors:
+    - ascii_segmentor
+    - matcher
+    - abc_segmentor
+    - punct_segmentor
+    - fallback_segmentor
+  translators:
+    - punct_translator
+  filters:
+    - uniquifier
+speller:
+  alphabet: "zyxwvutsrqponmlkjihgfedcba"
+  delimiter: " '"
+punctuator:
+  half_shape:
+    ",": { commit: "，" }
+    ".": { commit: "。" }
+    ":": { commit: "：" }
+  full_shape:
+    ",": { commit: "，" }
+    ".": { commit: "。" }
+    ":": { commit: "：" }
+menu:
+  page_size: 5
+switches:
+  - name: ascii_mode
+    states: [ 中文, 西文 ]
+  - name: full_shape
+    states: [ 半角, 全角 ]
+  - name: ascii_punct
+    states: [ 。，, ．， ]

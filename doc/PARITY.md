@@ -12,7 +12,7 @@
 
 | 层 | LRN | 补丁版 | 判定 |
 |---|---|---|---|
-| 输入组件 | 26 / 35 | 35 / 35 | 数量上仍缺 9 项，但**出厂 124 个方案引用的组件已 100% 覆盖**（引用加权 472/472）；剩下 9 项出厂 0 引用 |
+| 输入组件 | 28 / 35 | 35 / 35 | 数量上仍缺 7 项，但**出厂 124 个方案引用的组件已 100% 覆盖**（引用加权 472/472）；剩下 7 项出厂 0 引用 |
 | **整句组句（WordGraph + Poet）** | **有**，`src/engine/gear/poet.rs` + `Dictionary::lookup_from_graph` | 有，`ScriptSyllabifier::BuildSyllableGraph` + `Poet::MakeSentences` | **已对齐**（`b1b0125`）。`nihaoshijie` → 「你好世界」；`nihao` → 「你好」（精确词条不组句） |
 | 用户词典 UserDb 持久化 | **有**，`db.rs` + `level_db.rs`（rusty-leveldb）+ `user_db.rs` + `user_dictionary.rs`；`script_translator` 与 `table_translator` 两条学词链路都已打通，另补 `UnityTableEncoder` + `DictEntryIterator` | LevelDB 实装，`%APPDATA%/Rime-Next/userdb/` 下 4 个 `.userdb` 在用 | **已对齐**（拼音 + 形码双路） |
 | 语法模型 octagram grammar | **有**，`gram_db.rs` + `grammar.rs`（Darts trie + 紧凑 n-gram 编码 + 五元打分） | 有，4 个 `.gram` 共约 470 MB 在用 | **已对齐**（未提交时）。`zhongguoren` → 「中國人」排第一 |
@@ -35,7 +35,7 @@
 | `selector` | ✅ | 26 |
 | `speller` | ✅ | 32 |
 | `chord_composer` | ❌ | 0 |
-| `shape_processor` | ❌ | 0 |
+| `shape_processor` | ✅ | 0（全角模式下的 ASCII 直转上屏，`gear/shape.rs`） |
 | `streaming_chord_processor` | ❌ | 0 |
 
 ### segmentor（6）
@@ -78,7 +78,7 @@
 
 | 组件 | LRN | 出厂引用 |
 |---|---|---|
-| `shape_formatter` | ❌ | 0 |
+| `shape_formatter` | ✅ | 0（`punctuator` 的 `punct_number` 分支要用它转全角） |
 
 ## 三、已确认的等价项（不是差距，不要重复追）
 
@@ -153,6 +153,31 @@ e2e `table_translator_wubi86_learns_committed_word` 走完"打 `wq` → 选「�
    `table_translator` 与 `punct_translator` 原来传的是**绝对**位置，多段输入会被加两次
    （单段输入 `start == 0` 时看不出来，所以一直没暴露）。这次一并修正。
 
+**`punctuator` 的数字分隔符已补齐**（2026-10-26）。`digit_separators`（默认 `".:"`，
+即 `.` 和 `:`）让 `3.14` / `12:30` 原样上屏。三处协作 + 三个坑：
+
+1. **`Segmentor::proceed` 现在多收一份 `&CommitHistory`。** `PunctSegmentor` 要靠
+   "上一条提交是不是数字"决定打 `punct` 还是 `punct_number` 标签；C++ 是直接读
+   `engine_->context()`，而 lrn 的 segmentor 列表在 `calculate_segmentation` 里被
+   `mem::take` 出来遍历，拿不到 `&Engine`。`commit_history` 与
+   `composition.segmentation` 是兄弟字段，分开借不必拷贝。
+2. **`push_input` 之后必须自己 `compose()`。** C++ 靠 `update_notifier_` 同步触发
+   `Compose`；lrn 的 compose 在 `process_key` 末尾"输入变了才重算"。`ConvertDigitSeparator`
+   里不补这一下，`punct_number` 标签根本还没打上，`punctuation_is_translated` 恒假。
+   最狠的一处是"分隔符后面紧跟数字"：`abort_composition` + `push_input_str` 之后若不
+   compose，`commit()` 看到的是空组合，**什么都不上屏**。
+3. **连按恢复不能重新分段。** 出厂方案多半有
+   `{accept: period, send: Page_Down, when: has_menu}` —— 打完 `3.` 后 `has_menu` 成立，
+   第二次 `.` 被 key_binder 抢走，压根到不了 punctuator。所以这条路径要在
+   **没有该绑定**的方案上验证（`test/e2e/build/digit_demo.schema.yaml`）。
+   而即使到了 punctuator，`ReconvertDigitSeparatorAsPunct` 也**不重译**（重分段会把标签
+   又打回 `punct_number`）—— 上屏的是菜单里留着的那个字符（`3..` → `3.`）。
+
+顺带把 `full_shape` 的热切换接上了：`PunctConfig` 改成同时载入 `half_shape`/`full_shape`
+两张表（原来是构造时写死 `false`，全角开关对候选完全无效），`PunctTranslator` 通过新增的
+`Translator::sync_context(&Context)` 在每次翻译前刷新开关 —— `query` 拿不到 `Context`
+（会和 `&mut segments` 借冲突），这是唯一干净的入口。
+
 补丁版 patch 快照（Oct 25）里方案清单仍写 `schema/schema.toml`（靠 `toml_lite.cc` 解析），
 而 LRN 读 `<user>/schema/schema.yaml`。当前 `%APPDATA%/Rime-Next/schema/` 下**两个文件都在**。
 需要核实补丁版 dll 的实际读取路径，避免换引擎时方案清单来源不一致。
@@ -186,7 +211,9 @@ grep -E 'r\.Register' /c/code/librime/src/rime/gear/gears_module.cc
 4. ~~`reverse_lookup_translator` + `reverse_lookup_filter`~~ ✅ 18 个文件
 5. ~~`history_translator`~~ ✅ 12 个文件（连带落地 `commit_history` 底盘）
 6. ~~`affix_segmentor`~~ ✅ 6 个文件
-7. 其余 9 项（出厂 0 引用，按需再补）—— 引用加权已 100%，此后按需推进
+7. ~~`punctuator` 的数字分隔符~~ ✅ `3.14` / `12:30` 原样上屏（连带 `shape_formatter`
+   + `shape_processor`）；组件 **26/35 → 28/35**
+8. 其余 7 项（出厂 0 引用，按需再补）—— 引用加权已 100%，此后按需推进
 
 | 日期 | 变更 |
 |---|---|
@@ -202,3 +229,4 @@ grep -E 'r\.Register' /c/code/librime/src/rime/gear/gears_module.cc
 | 2026-10-26 | **学词闭环打通**：`Candidate.entry` 带词条 → `Context::collect_commit_elements` → `Engine::apply_commit` → `Translator::memorize` → `UserDictionary::UpdateEntry`。实测：`nihao` 选「你好」后 `<user>/userdb/luna_pinyin.userdb` 出现 `ni hao \t你好` / `c=1`；新会话再打 `nihao`，首候选 quality 99994（用户词典基数 1e5 + 对数权重），排在词表词条前面 |
 | 2026-10-26 | `history_translator` ✅ + `Context::commit_history` 底盘：组件 **24/35 → 25/35**，引用加权 **454/472 → 466/472（99%）**。顺带解锁 `table_translator` 的 `encode_commit_history`（从历史里拼短语再编码）。`Translator::query` 加 `&CommitHistory` 入参、`memorize` 同理。全量 **469 passed / 0 failed** |
 | 2026-10-26 | `affix_segmentor` ✅（用户造词）：组件 **25/35 → 26/35**，**按出厂引用加权 466/472 → 472/472（100%）** —— 出厂 124 个方案引用的组件全部落地。e2e 验证 `\`ni` → 劈成 `phony` 前缀段 + `zaoci` 码段、提交文本不含反引号。全量 **483 passed / 0 failed** |
+| 2026-10-26 | `punctuator` 数字分隔符 ✅：`3.14` / `12:30` 原样上屏、连按分隔符回退、`full_shape` 下转全角。连带移植 `shape_formatter` + `shape_processor`（`gear/shape.rs`），组件 **26/35 → 28/35**。接口变动：`Segmentor::proceed` 加 `&CommitHistory`、`SegmentorView` 加 `full_shape`、`Translator` 加 `sync_context`、`Context` 加 `abort_composition`。顺带修掉 `PunctConfig` 构造时把 `full_shape` 写死导致的"全角开关无效"。全量 **502 passed / 0 failed** |

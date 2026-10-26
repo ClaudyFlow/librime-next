@@ -310,6 +310,176 @@ fn punctuator_turns_comma_into_full_width() {
     );
 }
 
+// ── 数字分隔符（punctuator 的 digit_separators）─────────────────────────────
+//
+// 出厂 `punctuator` 没写 `digit_separators`，用的是 C++ 默认值 `.:`。
+// 效果：数字后面紧跟的 `.` / `:` 不会被翻成「。」「：」，而是原样留在输入串里。
+
+/// 数字键不该被引擎消费 —— 宿主看到 `false` 就自己把字符上屏，引擎只记提交历史。
+#[test]
+fn digit_keys_pass_through_to_the_host() {
+    let mut session = new_session(&build_dir(), "luna_pinyin_simp");
+    assert!(
+        !session.process_key(b'3' as u32, 0),
+        "`3` 不该被任何 processor 吃掉"
+    );
+    assert_eq!(
+        session.context().unwrap().commit_history.latest_text(),
+        "3",
+        "穿透的可打印键要记一条 thru 记录，punctuator 靠它判断「上一条是数字」"
+    );
+}
+
+/// `3.14`：`. `留在输入串里、跟后面的数字拼成一段一起上屏，最终打出来就是 `3.14`。
+#[test]
+fn digit_separator_keeps_decimal_point_in_numbers() {
+    let mut session = new_session(&build_dir(), "luna_pinyin_simp");
+
+    assert!(!session.process_key(b'3' as u32, 0), "`3` 应穿透");
+    assert!(
+        session.process_key(b'.' as u32, 0),
+        "小数点应被 punctuator 的数字分隔符逻辑消费"
+    );
+    assert_eq!(
+        session.context().unwrap().input,
+        ".",
+        "小数点应原样留在输入串里（不是被翻成「。」）"
+    );
+    // 段的标签是 `punct_number`，候选就是 `.` 本身
+    {
+        let ctx = session.context().unwrap();
+        let seg = ctx.composition.segmentation.segments.first().unwrap();
+        assert!(
+            seg.has_tag("punct_number"),
+            "应打 punct_number 标签，实际 {:?}",
+            seg.tags
+        );
+        assert_eq!(
+            seg.get_selected_candidate().map(|c| c.text.as_str()),
+            Some("."),
+            "数字里的分隔符候选应是字符本身"
+        );
+    }
+
+    assert!(
+        session.process_key(b'1' as u32, 0),
+        "紧跟分隔符的数字应触发「拼成整串上屏」"
+    );
+    assert_eq!(
+        session.take_commit().as_deref(),
+        Some(".1"),
+        "`.` 与 `1` 应一起上屏"
+    );
+    assert!(!session.process_key(b'4' as u32, 0), "`4` 应穿透");
+}
+
+/// `12:30`：冒号同理。
+#[test]
+fn digit_separator_keeps_colon_in_numbers() {
+    let mut session = new_session(&build_dir(), "luna_pinyin_simp");
+    assert!(!session.process_key(b'1' as u32, 0));
+    assert!(!session.process_key(b'2' as u32, 0));
+    assert!(session.process_key(b':' as u32, 0), "冒号应被消费");
+    assert_eq!(session.context().unwrap().input, ":");
+    assert!(session.process_key(b'3' as u32, 0));
+    assert_eq!(session.take_commit().as_deref(), Some(":3"));
+    assert!(!session.process_key(b'0' as u32, 0));
+}
+
+/// 连按两次同一个分隔符 → 改回普通标点并立刻上屏。
+///
+/// 用 `digit_demo` 而不是出厂方案：出厂方案里 `{accept: period, send: Page_Down,
+/// when: has_menu}` 会在"组合里已有候选"时把第二次 `.` 抢走（转 Page_Down），
+/// 根本到不了 punctuator —— 所以这条路径只能在没有该绑定的方案上验证。
+///
+/// 另外与 C++ 一致：`ReconvertDigitSeparatorAsPunct` 不重译，菜单里留的还是上一轮
+/// 的候选，所以上屏的是那个字符本身（`3..` → `3.`）。
+#[test]
+fn repeating_the_separator_falls_back_to_plain_punctuation() {
+    let mut session = new_session(&build_dir(), "digit_demo");
+    assert!(!session.process_key(b'3' as u32, 0));
+    assert!(session.process_key(b'.' as u32, 0));
+    {
+        let ctx = session.context().unwrap();
+        let seg = ctx.composition.segmentation.segments.first().unwrap();
+        assert!(seg.has_tag("punct_number"), "第一个 . 是数字分隔符");
+    }
+    assert!(session.process_key(b'.' as u32, 0), "第二次 . 也应被消费");
+    assert_eq!(
+        session.take_commit().as_deref(),
+        Some("."),
+        "连按后按普通标点路径上屏"
+    );
+    assert_eq!(
+        session.context().unwrap().input,
+        "",
+        "上屏后输入串应清空"
+    );
+}
+
+/// `digit_demo` 上的完整 `3.14`：与出厂方案同样的分段提交。
+#[test]
+fn digit_demo_types_a_decimal_number() {
+    let mut session = new_session(&build_dir(), "digit_demo");
+    assert!(!session.process_key(b'3' as u32, 0));
+    assert!(session.process_key(b'.' as u32, 0));
+    assert!(session.process_key(b'1' as u32, 0));
+    assert_eq!(session.take_commit().as_deref(), Some(".1"));
+    assert!(!session.process_key(b'4' as u32, 0));
+}
+
+/// 默认分隔符只有 `.:` —— 逗号不在其中，`1,000` 里的 `,` 会被翻成「，」。
+#[test]
+fn comma_is_not_a_digit_separator_by_default() {
+    let mut session = new_session(&build_dir(), "digit_demo");
+    assert!(!session.process_key(b'1' as u32, 0));
+    assert!(session.process_key(b',' as u32, 0));
+    assert_eq!(
+        session.take_commit().as_deref(),
+        Some("，"),
+        "`,` 不在默认 digit_separators 里，走普通标点路径"
+    );
+}
+
+/// full_shape 开着时，数字里的分隔符也要变全角（`ShapeFormatter` 参与）。
+#[test]
+fn digit_separator_respects_full_shape() {
+    let mut session = new_session(&build_dir(), "luna_pinyin_simp");
+    session.context_mut().unwrap().set_option("full_shape", true);
+    assert!(!session.process_key(b'3' as u32, 0));
+    assert!(session.process_key(b'.' as u32, 0));
+    assert_eq!(
+        session.context().unwrap().input,
+        ".",
+        "输入串仍是半角字符"
+    );
+    {
+        let ctx = session.context().unwrap();
+        let seg = ctx.composition.segmentation.segments.first().unwrap();
+        assert_eq!(
+            seg.get_selected_candidate().map(|c| c.text.as_str()),
+            Some("．"),
+            "候选应被 shape formatter 转成全角"
+        );
+    }
+    assert!(session.process_key(b'1' as u32, 0));
+    assert_eq!(session.take_commit().as_deref(), Some("．1"));
+}
+
+/// 分隔符后面紧跟空格：空格被吃进 `punct_number` 段（`3. 14` 里打空格不该变「。」）。
+#[test]
+fn space_after_digit_separator_is_swallowed() {
+    let mut session = new_session(&build_dir(), "luna_pinyin_simp");
+    assert!(!session.process_key(b'3' as u32, 0));
+    assert!(session.process_key(b'.' as u32, 0));
+    assert!(session.process_key(0x20, 0), "空格应被消费");
+    assert_eq!(
+        session.take_commit().as_deref(),
+        Some(". "),
+        "分隔符与空格一起上屏"
+    );
+}
+
 // ── 双拼方案（natural-code 自然码）端到端 ─────────────────────────────────
 //
 // 自然码键位：ao=k，所以「好」hao = h + k。

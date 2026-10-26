@@ -40,6 +40,7 @@ pub mod reverse_lookup_filter;
 pub mod reverse_lookup_translator;
 pub mod segmentor;
 pub mod selector;
+pub mod shape;
 pub mod simplifier;
 pub mod speller;
 pub mod table_translator;
