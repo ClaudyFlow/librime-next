@@ -42,10 +42,16 @@
 //! 但 C++ 只在**词级候选全空**时才组句（`if (enable_sentence_ && !translation)`），
 //! 所以单字/单词输入走的仍是原来的路，逐词输入行为不受影响。
 //!
-//! 还没移植的 C++ 部分：
+//! # 字符集过滤（`enable_charset_filter`）
 //!
-//! * `enable_charset_filter`（`CharsetFilter`：按字符集过滤候选）
-//! * `ContextualWeighted`（grammar 上下文加权；出厂方案没开 `contextual_suggestions`）
+//! `wubi86` / `cangjie5` / `cangjie5_express` 出厂都开了这个开关：候选里只要有字符
+//! 落在 CJK 扩展区 / 兼容汉字区就丢掉（判据见 [`super::charset_filter`]）。它**不是**
+//! 一个过滤组件，而是翻译器自己装的 —— 词级候选走"包一层文本过滤"，组句走"建图时
+//! 给迭代器挂 `filter_dict_entry`"（后者必须做，否则会用生僻字拼出一条整句再整条丢掉）。
+//! 用户打开 `extended_charset` 后整个失效。
+//!
+//! 还没移植的 C++ 部分：`ContextualWeighted`（grammar 上下文加权；出厂方案没开
+//! `contextual_suggestions`）。
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -53,6 +59,7 @@ use crate::dict::dict_entry_iterator::DictEntryIterator;
 use crate::dict::dictionary::Dictionary;
 use crate::dict::user_dictionary::{UserDictEntryIterator, UserDictionary};
 use crate::dict::vocabulary::{Code, DictEntry};
+use crate::engine::gear::charset_filter;
 use crate::engine::gear::poet::{Poet, Sentence, WordGraph};
 use crate::engine::candidate::Candidate;
 use crate::engine::commit_history::CommitHistory;
@@ -109,6 +116,12 @@ pub struct TableTranslator {
     /// `max_homographs`：组句用的词图里，每个 `[start, end)` 格子最多留几个同码词。
     /// 默认 **1**（`table_translator.h:47`）—— 也就是"每格取最优"。
     pub max_homographs: usize,
+    /// `enable_charset_filter`：过滤扩展区汉字（`𠛈` 这种一辈子不会打的字）。
+    /// 默认 **false**，但 `wubi86` / `cangjie5` / `cangjie5_express` 出厂都开了。
+    pub enable_charset_filter: bool,
+    /// `extended_charset` 开关的镜像（`Translator::sync_context` 每轮刷新）。
+    /// 用户打开"显示生僻字"后，上面的过滤器整个失效。
+    pub extended_charset: bool,
     /// `poet_`：组句器。C++ 用 `Poet::LeftAssociateCompare`（同权重时词少的赢）。
     pub poet: Poet,
 }
@@ -125,8 +138,15 @@ impl TableTranslator {
             enable_sentence: true,
             sentence_over_completion: false,
             max_homographs: 1,
+            enable_charset_filter: false,
+            extended_charset: false,
             poet: Poet::with_left_associative(None),
         }
+    }
+
+    /// `filter_by_charset`（`table_translator.cc:546-547`）：开关开着、且用户没要生僻字。
+    fn filter_by_charset(&self) -> bool {
+        self.enable_charset_filter && !self.extended_charset
     }
 
     /// 装语法模型（`Poet(language(), config, LeftAssociateCompare)` 的 `grammar_`）。
@@ -267,6 +287,13 @@ impl TableTranslator {
 }
 
 impl Translator for TableTranslator {
+    /// 刷 `extended_charset`（`enable_charset_filter` 的否决开关）。
+    /// C++ 是在 `Query` / `MakeSentence` 里现读 `engine_->context()`，LRN 的 `query`
+    /// 拿不到 `Context`，只能在这里同步。
+    fn sync_context(&mut self, ctx: &crate::engine::context::Context) {
+        self.extended_charset = ctx.get_option("extended_charset");
+    }
+
     fn query(
         &mut self,
         input: &str,
@@ -452,9 +479,18 @@ impl TableTranslator {
     ///   再给一份就重复了）。
     ///
     /// 顺序靠 `quality` 表达：整句基数是 [`SENTENCE_BASE`]，压过所有词级基数。
-    fn append_sentence(&mut self, input: &str, word_candidates: Vec<Candidate>) -> Vec<Candidate> {
+    fn append_sentence(&mut self, input: &str, mut word_candidates: Vec<Candidate>) -> Vec<Candidate> {
+        // C++ 的顺序是"先包 CharsetFilterTranslation、再判 exhausted"，
+        // 所以被字符集过滤光了的词级候选等同于"没有词级候选"，照样要试组句。
+        if self.filter_by_charset() {
+            word_candidates.retain(|candidate| charset_filter::filter_text(&candidate.text));
+        }
         if self.enable_sentence && word_candidates.is_empty() {
-            return self.make_sentence(input, true);
+            let mut candidates = self.make_sentence(input, true);
+            if self.filter_by_charset() {
+                candidates.retain(|candidate| charset_filter::filter_text(&candidate.text));
+            }
+            return candidates;
         }
         if self.sentence_over_completion
             && word_candidates
@@ -462,7 +498,10 @@ impl TableTranslator {
                 .is_some_and(|candidate| candidate.kind == "completion")
         {
             let mut merged = self.make_sentence(input, false);
-            merged.extend(word_candidates);
+            if self.filter_by_charset() {
+                merged.retain(|candidate| charset_filter::filter_text(&candidate.text));
+            }
+            merged.append(&mut word_candidates);
             return merged;
         }
         word_candidates
@@ -520,6 +559,9 @@ impl TableTranslator {
                     }
                     let mut uter = UserDictEntryIterator::new();
                     user_dict.lookup_words(&mut uter, key, false, 0, None);
+                    if self.filter_by_charset() {
+                        uter.add_filter(Box::new(charset_filter::filter_dict_entry));
+                    }
                     if uter.exhausted() {
                         continue;
                     }
@@ -553,6 +595,9 @@ impl TableTranslator {
                     };
                     let mut uter = UserDictEntryIterator::new();
                     encoder.lookup_phrases(user_dict, &mut uter, key, false, 0, None);
+                    if self.filter_by_charset() {
+                        uter.add_filter(Box::new(charset_filter::filter_dict_entry));
+                    }
                     if uter.exhausted() {
                         continue;
                     }
@@ -591,6 +636,9 @@ impl TableTranslator {
                 let mut iter = DictEntryIterator::new();
                 self.dict
                     .lookup_words(&mut iter, key, false, 0, Some(&blacklist));
+                if self.filter_by_charset() {
+                    iter.add_filter(Box::new(charset_filter::filter_dict_entry));
+                }
                 if iter.exhausted() {
                     continue;
                 }

@@ -35,6 +35,7 @@ use crate::engine::gear::ascii_segmentor::AsciiSegmentor;
 use crate::engine::gear::editor::Editor;
 use crate::engine::gear::fallback_segmentor::FallbackSegmentor;
 use crate::engine::gear::affix_segmentor::AffixSegmentor;
+use crate::engine::gear::charset_filter::CharsetFilter;
 use crate::engine::gear::filter::{Filter, SingleCharFilter, Uniquifier};
 use crate::engine::gear::history_translator::HistoryTranslator;
 use crate::engine::gear::key_binder::KeyBinder;
@@ -316,6 +317,12 @@ pub fn create_filter(ticket: &Ticket) -> Option<Box<dyn Filter + Send + Sync>> {
     match ticket.klass.as_str() {
         "uniquifier" => Some(Box::new(Uniquifier::new())),
         "single_char" | "single_char_filter" => Some(Box::new(SingleCharFilter::new())),
+        // `charset_filter` 与它的别名 `cjk_minifier` 是同一个组件
+        // （`gears_module.cc:85-88`：`if (!r.Find("charset_filter"))` 先让给改进版）。
+        "charset_filter" | "cjk_minifier" => Some(Box::new(CharsetFilter::load(
+            ticket.config,
+            &ticket.name_space,
+        ))),
         "reverse_lookup_filter" => Some(Box::new(ReverseLookupFilter::load(
             ticket.config,
             &ticket.name_space,
@@ -453,6 +460,15 @@ pub fn create_translator(ticket: &Ticket) -> Option<Box<dyn Translator + Send + 
                 .and_then(|v| v.as_i64())
             {
                 translator.max_homographs = v.max(1) as usize;
+            }
+            // `enable_charset_filter` 默认 **false**，但 wubi86 / cangjie5 /
+            // cangjie5_express 出厂都开了 —— 不开的话 `wqvbwq` 会冒出「𠛈」。
+            if let Some(v) = ticket
+                .config
+                .pointer(&pointer("enable_charset_filter"))
+                .and_then(|v| v.as_bool())
+            {
+                translator.enable_charset_filter = v;
             }
             // 语法模型：与 `script_translator` 同一套 `grammar/language` 解析。
             // 形码方案（wubi86 / cangjie5）出厂都没配 grammar，走动态规划。
@@ -734,6 +750,20 @@ mod tests {
         assert_eq!(ticket.klass, "lua_processor");
         assert_eq!(ticket.name_space, "foo", "@ 后的 alias 覆盖默认命名空间");
         assert!(create_processor(&ticket).is_none());
+    }
+
+    /// `charset_filter` 与它的别名 `cjk_minifier` 是同一个组件（`gears_module.cc:85-88`）。
+    #[test]
+    fn charset_filter_is_registered_under_both_names() {
+        let config = json!({"filter": {"tags": ["abc"]}});
+        for name in ["charset_filter", "cjk_minifier"] {
+            let ticket =
+                Ticket::from_prescription("filter", name, &config, Path::new(""), &[]);
+            assert!(
+                create_filter(&ticket).is_some(),
+                "{name} 应能构造（别名也要认）"
+            );
+        }
     }
 
     /// C++ `Ticket(engine, ns, prescription)`：命名空间**默认是组件类名**，

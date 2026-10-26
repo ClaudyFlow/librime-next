@@ -24,6 +24,10 @@ speller:
   delimiter: " ;'"
 translator:
   dictionary: wubi86
+  # 出厂 wubi86 的 translator 段（只保留 e2e 真会验证到的两项）：
+  # 过滤 CJK 扩展区汉字 / 多词连打时组整句。
+  enable_charset_filter: true
+  enable_sentence: true
 menu:
   page_size: 9
 switches:

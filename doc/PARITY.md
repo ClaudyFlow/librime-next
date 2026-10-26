@@ -12,7 +12,7 @@
 
 | 层 | LRN | 补丁版 | 判定 |
 |---|---|---|---|
-| 输入组件 | 28 / 35 | 35 / 35 | 数量上仍缺 7 项，但**出厂 124 个方案引用的组件已 100% 覆盖**（引用加权 472/472）；剩下 7 项出厂 0 引用 |
+| 输入组件 | 30 / 35 | 35 / 35 | 数量上仍缺 5 项，但**出厂 124 个方案引用的组件已 100% 覆盖**（引用加权 472/472）；剩下 5 项出厂 0 引用 |
 | **整句组句（WordGraph + Poet）** | **有**，`src/engine/gear/poet.rs` + `Dictionary::lookup_from_graph` | 有，`ScriptSyllabifier::BuildSyllableGraph` + `Poet::MakeSentences` | **已对齐**（`b1b0125`）。`nihaoshijie` → 「你好世界」；`nihao` → 「你好」（精确词条不组句） |
 | 用户词典 UserDb 持久化 | **有**，`db.rs` + `level_db.rs`（rusty-leveldb）+ `user_db.rs` + `user_dictionary.rs`；`script_translator` 与 `table_translator` 两条学词链路都已打通，另补 `UnityTableEncoder` + `DictEntryIterator` | LevelDB 实装，`%APPDATA%/Rime-Next/userdb/` 下 4 个 `.userdb` 在用 | **已对齐**（拼音 + 形码双路） |
 | 语法模型 octagram grammar | **有**，`gram_db.rs` + `grammar.rs`（Darts trie + 紧凑 n-gram 编码 + 五元打分） | 有，4 个 `.gram` 共约 470 MB 在用 | **已对齐**（未提交时）。`zhongguoren` → 「中國人」排第一 |
@@ -70,8 +70,8 @@
 | `uniquifier` | ✅ | 22 |
 | `simplifier` | ✅ | 20 |
 | `single_char_filter` | ✅ | 2 |
-| `charset_filter` | ❌ | 0（`enable_charset_filter` 是 option 名，不是组件） |
-| `cjk_minifier`（`CharsetFilter` 别名） | ❌ | 0 |
+| `charset_filter` | ✅ | 0（组件本身 0 引用，但 `wubi86` / `cangjie5` / `cangjie5_express` 的 `enable_charset_filter: true` 走的是内联那条路，**是真在用的**） |
+| `cjk_minifier`（`CharsetFilter` 别名） | ✅ | 0（`gears_module.cc:88` 的别名） |
 | `reverse_lookup_filter` | ✅ | 0 |
 
 ### formatter（1）
@@ -236,7 +236,10 @@ grep -E 'r\.Register' /c/code/librime/src/rime/gear/gears_module.cc
    + `shape_processor`）；组件 **26/35 → 28/35**
 8. ~~`table_translator::MakeSentence`（形码整句）~~ ✅ `enable_sentence` 在 wubi86 /
    cangjie5 / yujoy 系出厂方案里都是 true
-9. 其余 7 项（出厂 0 引用，按需再补）—— 引用加权已 100%，此后按需推进
+9. ~~`charset_filter` / `cjk_minifier`~~ ✅ 组件 0 引用，但 `table_translator` 的
+   `enable_charset_filter` 内联路径有 3 个出厂方案在用
+10. 其余 5 项（`chord_composer`、`streaming_chord_processor`、`echo_translator`、
+    `schema_list_translator`、`switch_translator`；出厂 0 引用，按需再补）
 
 | 日期 | 变更 |
 |---|---|
@@ -254,3 +257,4 @@ grep -E 'r\.Register' /c/code/librime/src/rime/gear/gears_module.cc
 | 2026-10-26 | `affix_segmentor` ✅（用户造词）：组件 **25/35 → 26/35**，**按出厂引用加权 466/472 → 472/472（100%）** —— 出厂 124 个方案引用的组件全部落地。e2e 验证 `\`ni` → 劈成 `phony` 前缀段 + `zaoci` 码段、提交文本不含反引号。全量 **483 passed / 0 failed** |
 | 2026-10-26 | `punctuator` 数字分隔符 ✅：`3.14` / `12:30` 原样上屏、连按分隔符回退、`full_shape` 下转全角。连带移植 `shape_formatter` + `shape_processor`（`gear/shape.rs`），组件 **26/35 → 28/35**。接口变动：`Segmentor::proceed` 加 `&CommitHistory`、`SegmentorView` 加 `full_shape`、`Translator` 加 `sync_context`、`Context` 加 `abort_composition`。顺带修掉 `PunctConfig` 构造时把 `full_shape` 写死导致的"全角开关无效"。全量 **502 passed / 0 failed** |
 | 2026-10-26 | `table_translator::MakeSentence` ✅（形码整句）：在码串上按 `consume_trailing_delimiters` 建 WordGraph（用户词 / 构造词 / 词表三路，全部**只认精确命中**），接 `Poet::with_left_associative` 求最短路，产出「整句」候选 + 手选首词候选（码长降序、同长用户词优先）。新增 `enable_sentence` / `sentence_over_completion` / `max_homographs` 三个配置项。e2e：`wq;vb` → 「你好」（注释 ☯、preedit 不插空格）、`wq;vb;wq` → 「你好你」、词级有候选时不出整句。全量 **511 passed / 0 failed** |
+| 2026-10-26 | `charset_filter` / `cjk_minifier` ✅（字符集过滤）：`gear/charset_filter.rs`，CJK 扩展 A–J + 兼容汉字/补充的区间表照抄（`U+3300..33FF`、`U+FE30..FE4F` 两行 C++ 是注释掉的，同样不启用）。两条入口：组件本体（0 引用）+ `table_translator` 的 `enable_charset_filter` 内联（**wubi86 / cangjie5 / cangjie5_express 三个出厂方案在用**，`extended_charset` 可关闭）。组件 **28/35 → 30/35**。e2e：`wqvbwq` 不再出「𠛈」（U+206C8 扩展 B），开 `extended_charset` 后回来。全量 **518 passed / 0 failed** |

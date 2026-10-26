@@ -4,6 +4,7 @@
 //! 对照 C++ librime：同样喂 "nihao"，应能在候选里拿到「你好」并提交。
 
 use librime_next::dict::dictionary::Dictionary;
+use librime_next::engine::gear::charset_filter::is_extended_cjk;
 use librime_next::engine::{SelectResult, Session};
 use std::path::PathBuf;
 
@@ -1473,6 +1474,49 @@ fn table_translator_sentence_commits_as_a_whole() {
         session.take_commit().as_deref(),
         Some("你好"),
         "整句应一次提交"
+    );
+}
+
+// ── 字符集过滤（`enable_charset_filter`）─────────────────────────────────
+//
+// 出厂 `wubi86` / `cangjie5` / `cangjie5_express` 都开了这个开关：候选文本里只要有
+// 一个字符落在 CJK 扩展区 / 兼容汉字区，整条候选就丢掉。不开的话 `wqvbwq` 会冒出
+// 「𠛈」（U+20718，扩展 B 区）—— 字库里有，但用户一辈子不会去打。
+//
+// 用户可以在菜单里打开 `extended_charset`（"显示生僻字"），开关一开过滤器整个失效。
+
+#[test]
+fn wubi86_charset_filter_drops_extended_cjk() {
+    let mut session = new_session(&build_dir(), "wubi86");
+    type_ascii(&mut session, "wqvbwq");
+    let texts = candidate_texts(&mut session);
+    assert!(
+        texts.iter().any(|t| t == "您好"),
+        "常用词候选该在，实际：{:?}",
+        &texts[..texts.len().min(8)]
+    );
+    assert!(
+        !texts
+            .iter()
+            .any(|t| t.chars().any(is_extended_cjk)),
+        "扩展区汉字应被过滤掉，实际：{:?}",
+        &texts[..texts.len().min(8)]
+    );
+}
+
+#[test]
+fn extended_charset_option_disables_the_filter() {
+    let mut session = new_session(&build_dir(), "wubi86");
+    session
+        .context_mut()
+        .expect("composing")
+        .set_option("extended_charset", true);
+    type_ascii(&mut session, "wqvbwq");
+    let texts = candidate_texts(&mut session);
+    assert!(
+        texts.iter().any(|t| t.chars().any(is_extended_cjk)),
+        "开了 extended_charset 就该看见扩展区汉字（𠛈），实际：{:?}",
+        &texts[..texts.len().min(8)]
     );
 }
 
