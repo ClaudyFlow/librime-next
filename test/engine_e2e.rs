@@ -1409,3 +1409,85 @@ fn affix_prefix_alone_retags_without_splitting() {
         snap[0].2
     );
 }
+
+// ── 形码整句（`table_translator::MakeSentence`）───────────────────────────
+//
+// C++ 只在**词级候选全空**时才组句（`table_translator.cc:296`）。而
+// `enable_completion` 默认 true —— 只要整串码是某个词条码的前缀，就会有补全候选，
+// 轮不到组句。所以验证组句必须让整串码查不到任何词：用 `speller/delimiter`
+// 里的 `;` 把两段独立的码隔开。
+//
+//   `wq` = 你、`vb` = 好（五笔）；`wq;vb` 整串不是任何词条的码，
+//   但词图上有 0→3(你) 与 3→5(好) 两条边，最短路就是「你好」。
+
+#[test]
+fn table_translator_makes_sentence_across_delimiters() {
+    let mut session = new_session(&build_dir(), "wubi86");
+    type_ascii(&mut session, "wq;vb");
+
+    let candidates = candidate_list_of_last_segment(&mut session);
+    let first = candidates.first().expect("应至少有一条候选");
+    assert_eq!(
+        first.kind, "sentence",
+        "整句候选的 kind 应为 sentence，实际：{:?}",
+        candidates
+            .iter()
+            .map(|c| (&c.kind, &c.text))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(first.text, "你好", "整句应为「你好」");
+    assert_eq!(
+        first.comment,
+        " \u{262f} ",
+        "整句候选的注释是 C++ 的 kUnitySymbol"
+    );
+    assert_eq!(
+        first.preedit, "wq;vb",
+        "边界前一个字符是分隔符时不插空格"
+    );
+    assert_eq!((first.start, first.end), (0, 5), "整句覆盖整段输入");
+}
+
+#[test]
+fn table_translator_sentence_can_span_three_codes() {
+    let mut session = new_session(&build_dir(), "wubi86");
+    type_ascii(&mut session, "wq;vb;wq");
+    let texts = candidate_texts(&mut session);
+    assert!(
+        texts.iter().any(|t| t == "你好你"),
+        "三段码应组出「你好你」，实际：{:?}",
+        &texts[..texts.len().min(8)]
+    );
+}
+
+#[test]
+fn table_translator_sentence_commits_as_a_whole() {
+    let mut session = new_session(&build_dir(), "wubi86");
+    type_ascii(&mut session, "wq;vb");
+    let idx = candidate_texts(&mut session)
+        .iter()
+        .position(|t| t == "你好")
+        .expect("候选里应有整句「你好」");
+    session.choose(idx);
+    assert_eq!(
+        session.take_commit().as_deref(),
+        Some("你好"),
+        "整句应一次提交"
+    );
+}
+
+#[test]
+fn table_translator_word_match_suppresses_sentence() {
+    // 词级候选非空时绝不组句：单字 `wq` 有精确命中「你」。
+    let mut session = new_session(&build_dir(), "wubi86");
+    type_ascii(&mut session, "wq");
+    let candidates = candidate_list_of_last_segment(&mut session);
+    assert!(
+        candidates.iter().all(|c| c.kind != "sentence"),
+        "有词级候选时不该出整句：{:?}",
+        candidates
+            .iter()
+            .map(|c| (&c.kind, &c.text))
+            .collect::<Vec<_>>()
+    );
+}

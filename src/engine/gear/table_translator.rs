@@ -31,18 +31,29 @@
 //!    `weight` 能到 `+1.8`（`exp ≈ 6`）、生僻字到 `-54`，值域跨 30 个数量级。
 //!    直接 `exp` 再加类别基数会被高权重吃掉，所以改用**同序**的 `weight`（对数尺度）。
 //!
+//! # 整句（`MakeSentence`，`table_translator.cc:543-693`）
+//!
+//! 形码的整句不是"音节切分组合"，而是**在码串上做最短路**：把输入里每个位置当成
+//! 图的顶点，凡是"从 `start_pos` 到 `end_pos` 这截码能查到词"就连一条边，然后交给
+//! [`Poet`] 选一条总分最高的路径。三条边的来源与词级候选相同（用户词 / 构造词 / 词表），
+//! 区别只在**不做补全**（`predictive = false`）—— 组句要的是精确落脚点。
+//!
+//! `enable_sentence` 在出厂方案里是 **true**（`wubi86`、`cangjie5`、`yujoy` 系），
+//! 但 C++ 只在**词级候选全空**时才组句（`if (enable_sentence_ && !translation)`），
+//! 所以单字/单词输入走的仍是原来的路，逐词输入行为不受影响。
+//!
 //! 还没移植的 C++ 部分：
 //!
-//! * `MakeSentence`（`table_translator.cc:383-478`）—— 形码整句输入（多词连打）。
-//!   `enable_sentence` 默认 true，但缺了它只是"多词连打不出整句候选"，逐词输入不受影响。
-//! * `enable_charset_filter` / `ContextualWeighted`（grammar 加权）。
+//! * `enable_charset_filter`（`CharsetFilter`：按字符集过滤候选）
+//! * `ContextualWeighted`（grammar 上下文加权；出厂方案没开 `contextual_suggestions`）
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::dict::dict_entry_iterator::DictEntryIterator;
 use crate::dict::dictionary::Dictionary;
 use crate::dict::user_dictionary::{UserDictEntryIterator, UserDictionary};
-use crate::dict::vocabulary::DictEntry;
+use crate::dict::vocabulary::{Code, DictEntry};
+use crate::engine::gear::poet::{Poet, Sentence, WordGraph};
 use crate::engine::candidate::Candidate;
 use crate::engine::commit_history::CommitHistory;
 use crate::engine::gear::translator::Translator;
@@ -66,6 +77,17 @@ const USER_COMPLETION_BASE: f64 = 2.0e6;
 /// 类别基数：**表词条的补全**。
 const TABLE_COMPLETION_BASE: f64 = 1.0e6;
 
+/// 整句候选的基数。要压过上面所有词级基数（`USER_EXACT_BASE`），
+/// 因为 C++ 里 `SentenceTranslation` 把整句天然排在候选列表最前。
+const SENTENCE_BASE: f64 = 5.0e6;
+
+/// 整句之后"手选首词"候选的**递减步长**。
+///
+/// C++ 的顺序是结构性的（先整句、再首词码长从长到短、同长用户词优先），
+/// LRN 的菜单按 `quality` 排序，所以把顺序直接编码成严格递减的分数：
+/// 每多一条就减 `1e-3`，1e6 条以内都不会掉出 [`SENTENCE_BASE`] 量级。
+const PHRASE_STEP: f64 = 1.0e-3;
+
 /// 形码翻译器（`class TableTranslator`，`table_translator.h:25-53`）。
 pub struct TableTranslator {
     pub dict: Dictionary,
@@ -79,6 +101,16 @@ pub struct TableTranslator {
     pub encode_commit_history: bool,
     /// `max_phrase_length`：`encode_commit_history` 拼到多长就停。默认 5。
     pub max_phrase_length: i32,
+    /// `enable_sentence`：词级候选全空时是否组整句。默认 **true**（`table_translator.h:41`）。
+    pub enable_sentence: bool,
+    /// `sentence_over_completion`：词级候选**只**有补全时，是否把整句拼到前面。
+    /// 默认 **false**。
+    pub sentence_over_completion: bool,
+    /// `max_homographs`：组句用的词图里，每个 `[start, end)` 格子最多留几个同码词。
+    /// 默认 **1**（`table_translator.h:47`）—— 也就是"每格取最优"。
+    pub max_homographs: usize,
+    /// `poet_`：组句器。C++ 用 `Poet::LeftAssociateCompare`（同权重时词少的赢）。
+    pub poet: Poet,
 }
 
 impl TableTranslator {
@@ -90,7 +122,17 @@ impl TableTranslator {
             encoder: None,
             encode_commit_history: true,
             max_phrase_length: 5,
+            enable_sentence: true,
+            sentence_over_completion: false,
+            max_homographs: 1,
+            poet: Poet::with_left_associative(None),
         }
+    }
+
+    /// 装语法模型（`Poet(language(), config, LeftAssociateCompare)` 的 `grammar_`）。
+    pub fn with_poet(mut self, poet: Poet) -> Self {
+        self.poet = poet;
+        self
     }
 
     /// 挂上用户词典（`Translator::user_dict_`）。
@@ -270,7 +312,7 @@ impl Translator for TableTranslator {
         // ③ 交错合流
         let mut out: Vec<Candidate> = Vec::new();
         if !user_ready && iter.exhausted() {
-            return out;
+            return self.append_sentence(input, out);
         }
         loop {
             let take_user = Self::prefer_user_phrase(&mut iter, &uter);
@@ -305,7 +347,7 @@ impl Translator for TableTranslator {
                 }
             }
         }
-        out
+        self.append_sentence(input, out)
     }
 
     /// `TableTranslator::Memorize`（`table_translator.cc:311-356`）。
@@ -400,6 +442,391 @@ impl TableTranslator {
             }
         }
     }
+
+    /// 词级候选算完之后的两条整句分支（`table_translator.cc:296-300`）。
+    ///
+    /// * `enable_sentence && 词级全空` → 整句独占（`include_prefix_phrases = true`，
+    ///   因为这时用户没有别的路可走，必须给他"手选首词"的余地）；
+    /// * `sentence_over_completion && 首条是补全` → 整句拼在补全候选**前面**
+    ///   （`include_prefix_phrases = false`：补全候选本身就是手选首词的余地，
+    ///   再给一份就重复了）。
+    ///
+    /// 顺序靠 `quality` 表达：整句基数是 [`SENTENCE_BASE`]，压过所有词级基数。
+    fn append_sentence(&mut self, input: &str, word_candidates: Vec<Candidate>) -> Vec<Candidate> {
+        if self.enable_sentence && word_candidates.is_empty() {
+            return self.make_sentence(input, true);
+        }
+        if self.sentence_over_completion
+            && word_candidates
+                .first()
+                .is_some_and(|candidate| candidate.kind == "completion")
+        {
+            let mut merged = self.make_sentence(input, false);
+            merged.extend(word_candidates);
+            return merged;
+        }
+        word_candidates
+    }
+
+    /// `MakeSentence`（`table_translator.cc:543-693`）：在码串上建词图，交给 [`Poet`] 求最短路。
+    ///
+    /// 返回顺序照抄 C++：**整句一条**，随后是"手选首词"候选 —— 首段码长**从长到短**，
+    /// 同长度时用户词优先（`SentenceTranslation::PreferUserPhrase`）。
+    ///
+    /// # 三处照抄的细节
+    ///
+    /// 1. **只有精确命中能连边**。三个循环全部 `predictive = false`：组句要的是落脚点，
+    ///    拿补全词去拼会让"半截码"也被当成一个词，整句立刻散架。
+    /// 2. **`vertices` 才决定要不要从这个位置展开**。从 0 出发，只有真的查到词的那一截
+    ///    末尾才插进 `vertices`，所以图是从左到右"水波扩散"建起来的，不是全枚举。
+    /// 3. **首词候选要不要跳过头一条**，取决于 `max_homographs`：`> 1` 时建图用副本、
+    ///    候选从第 1 条起；`== 1`（出厂默认）时建图先吃掉 1 条、候选从第 2 条起。
+    ///    理由是第 1 条已经被整句选进去了，候选列表负责给"换一个首词"的余地。
+    fn make_sentence(&mut self, input: &str, include_prefix_phrases: bool) -> Vec<Candidate> {
+        let n = input.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let delimiters = self.options.delimiters.clone();
+        let blacklist = self.options.blacklist.clone();
+        let max_homographs = self.max_homographs.max(1);
+        let copy_for_phrases = max_homographs > 1;
+
+        let mut graph = WordGraph::new();
+        let mut vertices: HashSet<usize> = HashSet::from([0]);
+        // 首段码长 → 同码词条（C++ 的 `DictEntryCollector` / `UserDictEntryCollector`）。
+        let mut table_phrases: BTreeMap<usize, Vec<DictEntry>> = BTreeMap::new();
+        let mut user_phrases: BTreeMap<usize, Vec<DictEntry>> = BTreeMap::new();
+
+        for start_pos in 0..n {
+            if !vertices.contains(&start_pos) {
+                continue;
+            }
+            let Some(active_input) = input.get(start_pos..) else {
+                continue;
+            };
+            let need_phrases = include_prefix_phrases && start_pos == 0;
+
+            // ① 用户词（精确）
+            if let Some(user_dict) = self.user_dict.as_ref().filter(|dict| dict.loaded()) {
+                for len in 1..=active_input.len() {
+                    let Some(key) = active_input.get(..len) else {
+                        continue;
+                    };
+                    let consumed = consume_trailing_delimiters(len, active_input, &delimiters);
+                    let end_pos = start_pos + consumed;
+                    if cell_len(&graph, start_pos, end_pos) >= max_homographs {
+                        continue;
+                    }
+                    let mut uter = UserDictEntryIterator::new();
+                    user_dict.lookup_words(&mut uter, key, false, 0, None);
+                    if uter.exhausted() {
+                        continue;
+                    }
+                    let entries = drain_user_entries(&mut uter);
+                    vertices.insert(end_pos);
+                    let (cells, phrases) =
+                        split_entries(entries, max_homographs, need_phrases, copy_for_phrases);
+                    if !cells.is_empty() {
+                        graph.entry(start_pos).or_default().insert(end_pos, cells);
+                    }
+                    if !phrases.is_empty() {
+                        user_phrases.insert(consumed, phrases);
+                    }
+                }
+            }
+
+            // ② 构造词（编码器算出来的码），只在格子还空着时补
+            if let Some(encoder) = self.encoder.as_ref().filter(|encoder| encoder.loaded()) {
+                let user_dict = self.user_dict.as_ref();
+                for len in 1..=active_input.len() {
+                    let Some(key) = active_input.get(..len) else {
+                        continue;
+                    };
+                    let consumed = consume_trailing_delimiters(len, active_input, &delimiters);
+                    let end_pos = start_pos + consumed;
+                    if cell_len(&graph, start_pos, end_pos) > 0 {
+                        continue;
+                    }
+                    let Some(user_dict) = user_dict else {
+                        break;
+                    };
+                    let mut uter = UserDictEntryIterator::new();
+                    encoder.lookup_phrases(user_dict, &mut uter, key, false, 0, None);
+                    if uter.exhausted() {
+                        continue;
+                    }
+                    let entries = drain_user_entries(&mut uter);
+                    vertices.insert(end_pos);
+                    let (cells, phrases) =
+                        split_entries(entries, max_homographs, need_phrases, copy_for_phrases);
+                    if !cells.is_empty() {
+                        graph.entry(start_pos).or_default().insert(end_pos, cells);
+                    }
+                    if !phrases.is_empty() {
+                        user_phrases.insert(consumed, phrases);
+                    }
+                }
+            }
+
+            // ③ 词表（prism 前缀命中，**倒序**处理：长的先连，格子先到先占）
+            for m in self
+                .dict
+                .prism
+                .common_prefix_search(active_input)
+                .iter()
+                .rev()
+            {
+                if m.length == 0 {
+                    continue;
+                }
+                let Some(key) = active_input.get(..m.length) else {
+                    continue;
+                };
+                let consumed = consume_trailing_delimiters(m.length, active_input, &delimiters);
+                let end_pos = start_pos + consumed;
+                if cell_len(&graph, start_pos, end_pos) >= max_homographs {
+                    continue;
+                }
+                let mut iter = DictEntryIterator::new();
+                self.dict
+                    .lookup_words(&mut iter, key, false, 0, Some(&blacklist));
+                if iter.exhausted() {
+                    continue;
+                }
+                let entries = drain_table_entries(&mut iter);
+                vertices.insert(end_pos);
+                let (cells, phrases) =
+                    split_entries(entries, max_homographs, need_phrases, copy_for_phrases);
+                if !cells.is_empty() {
+                    graph.entry(start_pos).or_default().insert(end_pos, cells);
+                }
+                if !phrases.is_empty() {
+                    table_phrases.insert(consumed, phrases);
+                }
+            }
+        }
+
+        let mut out: Vec<Candidate> = Vec::new();
+
+        // ④ 整句
+        //
+        // `preceding_text` 传空串：C++ 的 `GetPrecedingText` 在
+        // `contextual_suggestions_ == false` 时直接返回空串，而出厂 124 个方案
+        // 没有一个开这个开关。
+        if let Some(sentence) = self.poet.make_sentence(&graph, n, "") {
+            let mut preedit = sentence_preedit(input, &sentence, &delimiters);
+            self.options.format_preedit(&mut preedit);
+            let mut candidate = Candidate::new(
+                "sentence",
+                0,
+                sentence.end_pos,
+                sentence.text.clone(),
+                SENTENCE_BASE + sentence.weight,
+            )
+            .with_comment(K_UNITY_SYMBOL)
+            .with_preedit(preedit);
+            // C++ 的 `Sentence` 自带一个累加出来的词条；有它，提交整句才能进用户词典。
+            if let Some(entry) = sentence_entry(&graph, &sentence) {
+                candidate = candidate.with_entry(entry);
+            }
+            out.push(candidate);
+        }
+
+        // ⑤ 手选首词：两条流按码长降序归并，同长度用户词优先
+        let user_stream = flatten_desc(&user_phrases);
+        let table_stream = flatten_desc(&table_phrases);
+        let (mut user_index, mut table_index) = (0usize, 0usize);
+        let mut rank = 0usize;
+        while user_index < user_stream.len() || table_index < table_stream.len() {
+            let user_len = user_stream.get(user_index).map_or(0, |item| item.0);
+            let table_len = table_stream.get(table_index).map_or(0, |item| item.0);
+            let prefer_user = user_len > 0 && user_len >= table_len;
+            let (code_length, entry, is_user) = if prefer_user {
+                let item = user_stream[user_index].clone();
+                user_index += 1;
+                (item.0, item.1, true)
+            } else {
+                let item = table_stream[table_index].clone();
+                table_index += 1;
+                (item.0, item.1, false)
+            };
+            rank += 1;
+            let quality = SENTENCE_BASE - rank as f64 * PHRASE_STEP;
+            let candidate = self.phrase_candidate(&entry, is_user, code_length, input, quality);
+            out.push(candidate);
+        }
+        out
+    }
+
+    /// `SentenceTranslation::Peek` 的 `Phrase` 分支：候选覆盖首段 `[0, code_length)`。
+    ///
+    /// 注释**不过** `comment_formatter` —— C++ 这一路是 `Phrase` 构造器直接
+    /// `set_comment(entry->comment)`，与词级候选（`TableTranslation::Peek` 会过格式化）
+    /// 不同。照抄。
+    fn phrase_candidate(
+        &mut self,
+        entry: &DictEntry,
+        is_user: bool,
+        code_length: usize,
+        input: &str,
+        quality: f64,
+    ) -> Candidate {
+        let mut preedit = input.get(..code_length).unwrap_or(input).to_string();
+        self.options.format_preedit(&mut preedit);
+        Candidate::new(
+            if is_user { "user_table" } else { "table" },
+            0,
+            code_length,
+            entry.text.clone(),
+            quality,
+        )
+        .with_comment(entry.comment.clone())
+        .with_preedit(preedit)
+        .with_entry(entry.clone())
+    }
+}
+
+/// `consume_trailing_delimiters`（`table_translator.cc:521-527`）：
+/// 码后面紧跟的分隔符（`;` 之类）一起吃进这一段。
+fn consume_trailing_delimiters(pos: usize, input: &str, delimiters: &str) -> usize {
+    let mut pos = pos;
+    while let Some(ch) = input.get(pos..).and_then(|rest| rest.chars().next()) {
+        if !delimiters.contains(ch) {
+            break;
+        }
+        pos += ch.len_utf8();
+    }
+    pos
+}
+
+/// 图里 `graph[start][end]` 已经收了几条。
+fn cell_len(graph: &WordGraph, start: usize, end: usize) -> usize {
+    graph
+        .get(&start)
+        .and_then(|edges| edges.get(&end))
+        .map_or(0, Vec::len)
+}
+
+/// 把一个迭代器里剩下的词条全倒出来（急切化的代价，条数很少）。
+fn drain_user_entries(iter: &mut UserDictEntryIterator) -> Vec<DictEntry> {
+    let mut entries = Vec::new();
+    if iter.exhausted() {
+        return entries;
+    }
+    if let Some(entry) = iter.peek() {
+        entries.push(entry.clone());
+    }
+    while iter.next() {
+        if let Some(entry) = iter.peek() {
+            entries.push(entry.clone());
+        }
+    }
+    entries
+}
+
+/// 同 [`drain_user_entries`]，词表侧。
+fn drain_table_entries(iter: &mut DictEntryIterator) -> Vec<DictEntry> {
+    let mut entries = Vec::new();
+    if iter.exhausted() {
+        return entries;
+    }
+    if let Some(entry) = iter.peek() {
+        entries.push(entry.clone());
+    }
+    while iter.next() {
+        if let Some(entry) = iter.peek() {
+            entries.push(entry.clone());
+        }
+    }
+    entries
+}
+
+/// 按 `collect_entries` 的消费顺序切成"进图的"和"留给手选首词的"。
+///
+/// C++ 里 `max_homographs_ > 1` 时用副本建图，所以手选候选从第 1 条开始；
+/// 否则建图已经把前 `max_homographs_` 条吃掉了，手选候选从剩下的开始。
+fn split_entries(
+    entries: Vec<DictEntry>,
+    max_homographs: usize,
+    need_phrases: bool,
+    copy_for_phrases: bool,
+) -> (Vec<DictEntry>, Vec<DictEntry>) {
+    let take = max_homographs.min(entries.len());
+    let cells = entries[..take].to_vec();
+    if !need_phrases {
+        return (cells, Vec::new());
+    }
+    let phrases = if copy_for_phrases {
+        entries
+    } else {
+        entries[take..].to_vec()
+    };
+    (cells, phrases)
+}
+
+/// 码长降序展开成扁平列表（C++ 对 collector 反复 `rbegin()` 的效果）。
+fn flatten_desc(collected: &BTreeMap<usize, Vec<DictEntry>>) -> Vec<(usize, DictEntry)> {
+    let mut out = Vec::new();
+    for (code_length, entries) in collected.iter().rev() {
+        for entry in entries {
+            out.push((*code_length, entry.clone()));
+        }
+    }
+    out
+}
+
+/// `SentenceTranslation::PrepareSentence` 的 preedit：词的边界插空格，
+/// 但前一个字符本身就是分隔符时不插（否则会出现 `ni ; hao`）。
+fn sentence_preedit(input: &str, sentence: &Sentence, delimiters: &str) -> String {
+    let mut preedit = input.to_string();
+    let mut pos = 0usize;
+    let mut previous_end = 0usize;
+    for (end, _, _) in &sentence.segments {
+        if pos > 0
+            && !preedit
+                .as_bytes()
+                .get(pos - 1)
+                .is_some_and(|byte| delimiters.contains(*byte as char))
+        {
+            preedit.insert(pos, ' ');
+            pos += 1;
+        }
+        pos += end - previous_end;
+        previous_end = *end;
+    }
+    preedit
+}
+
+/// C++ `Sentence::Extend` 累加出来的那个词条：文本拼起来、码接起来、权重是整句分。
+///
+/// 提交整句时会走 `Memorize`，靠它把整句写进用户词典（否则整句只能看不能学）。
+/// 用"段的文本"在词图对应格子里反查词条 —— `Sentence` 只带 `(end_pos, text, weight)`，
+/// 没带词条本体，同格同文本的多条（不同码）取第一条。
+fn sentence_entry(graph: &WordGraph, sentence: &Sentence) -> Option<DictEntry> {
+    if sentence.segments.is_empty() {
+        return None;
+    }
+    let mut code = Code::new();
+    let mut previous_end = 0usize;
+    for (end, text, _) in &sentence.segments {
+        let entry = graph
+            .get(&previous_end)?
+            .get(end)?
+            .iter()
+            .find(|entry| &entry.text == text)?
+            .clone();
+        for syllable in entry.code.iter() {
+            code.push(*syllable);
+        }
+        previous_end = *end;
+    }
+    Some(DictEntry {
+        text: sentence.text.clone(),
+        code,
+        weight: sentence.weight,
+        ..Default::default()
+    })
 }
 
 #[cfg(test)]
@@ -436,5 +863,72 @@ mod tests {
         assert!(!TableTranslator::is_constructed(&plain));
         let constructed = entry("甲乙", 0.0, 0, "\u{7f}enc\u{1f}ab ");
         assert!(TableTranslator::is_constructed(&constructed));
+    }
+
+    /// 码后面紧跟的分隔符一起吃进这一段（`consume_trailing_delimiters`）。
+    #[test]
+    fn trailing_delimiters_are_consumed() {
+        let delimiters = " ;'";
+        assert_eq!(consume_trailing_delimiters(2, "wqvb", delimiters), 2, "没有分隔符");
+        assert_eq!(consume_trailing_delimiters(2, "wq;vb", delimiters), 3, "吃一个 ;");
+        assert_eq!(consume_trailing_delimiters(2, "wq;; vb", delimiters), 5, "连着吃");
+        assert_eq!(consume_trailing_delimiters(3, "wq;", delimiters), 3, "越过末尾就停");
+    }
+
+    /// `max_homographs == 1` 时建图吃掉第 1 条，手选首词从第 2 条起
+    /// （C++ 里 `max_homographs_ > 1` 才用副本，照抄这个分支差异）。
+    #[test]
+    fn first_entry_goes_to_graph_when_one_homograph() {
+        let entries = vec![
+            entry("甲", 3.0, 0, ""),
+            entry("乙", 2.0, 0, ""),
+            entry("丙", 1.0, 0, ""),
+        ];
+        let (cells, phrases) = split_entries(entries, 1, true, false);
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].text, "甲", "图里每格只留最优");
+        let texts: Vec<&str> = phrases.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(texts, ["乙", "丙"], "手选候选从第 2 条起");
+    }
+
+    /// `max_homographs > 1` 时建图用副本，手选候选从第 1 条起。
+    #[test]
+    fn phrases_start_from_first_entry_when_many_homographs() {
+        let entries = vec![entry("甲", 3.0, 0, ""), entry("乙", 2.0, 0, "")];
+        let (cells, phrases) = split_entries(entries, 2, true, true);
+        assert_eq!(cells.len(), 2, "两格都进图");
+        assert_eq!(phrases.len(), 2, "手选候选不从第 2 条起");
+        assert_eq!(phrases[0].text, "甲");
+    }
+
+    /// 不要手选候选时，剩下的词条直接丢掉。
+    #[test]
+    fn phrases_are_dropped_when_not_needed() {
+        let entries = vec![entry("甲", 3.0, 0, ""), entry("乙", 2.0, 0, "")];
+        let (cells, phrases) = split_entries(entries, 1, false, false);
+        assert_eq!(cells.len(), 1);
+        assert!(phrases.is_empty());
+    }
+
+    /// 整句 preedit 在词边界插空格，但边界前是分隔符时不插
+    /// （`SentenceTranslation::PrepareSentence`）。
+    #[test]
+    fn sentence_preedit_inserts_spaces_at_word_boundaries() {
+        let sentence = Sentence {
+            text: "你好".to_string(),
+            end_pos: 4,
+            weight: 0.0,
+            segments: vec![(2, "你".to_string(), 0.0), (4, "好".to_string(), 0.0)],
+        };
+        assert_eq!(sentence_preedit("wqvb", &sentence, " ;'"), "wq vb");
+
+        // 第二段前面是 `;`（分隔符）⇒ 不再插空格
+        let sentence = Sentence {
+            text: "你好".to_string(),
+            end_pos: 5,
+            weight: 0.0,
+            segments: vec![(3, "你".to_string(), 0.0), (5, "好".to_string(), 0.0)],
+        };
+        assert_eq!(sentence_preedit("wq;vb", &sentence, " ;'"), "wq;vb");
     }
 }

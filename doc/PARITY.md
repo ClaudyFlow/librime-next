@@ -182,6 +182,27 @@ e2e `table_translator_wubi86_learns_committed_word` 走完"打 `wq` → 选「�
 而 LRN 读 `<user>/schema/schema.yaml`。当前 `%APPDATA%/Rime-Next/schema/` 下**两个文件都在**。
 需要核实补丁版 dll 的实际读取路径，避免换引擎时方案清单来源不一致。
 
+### 形码整句（`table_translator::MakeSentence`）的三个反直觉点
+
+**1. 出厂方案里几乎观察不到这句代码在跑。** `enable_sentence: true` 有（wubi86 /
+cangjie5 / yujoy 系），但 C++ 只在**词级候选全空**时才组句
+（`if (enable_sentence_ && !translation)`），而 `enable_completion` 默认 true ——
+只要整串码是某个词条码的**前缀**就有补全候选，轮不到组句。要验证必须让整串码查不到
+任何词，最省事的办法是用 `speller/delimiter` 把两段独立码隔开（`wq;vb`）。
+
+**2. 建图只认精确命中。** 三路查询（用户词 / 构造词 / 词表）全部 `predictive = false`。
+用补全词去连边会让"半截码"也成为一个词，整句立刻散架。
+
+**3. 首词候选要不要跳过头一条，取决于 `max_homographs`。** C++ 的条件是
+`start_pos == 0 && max_homographs_ - homographs.size() > 1` 时用**副本**建图 ——
+`max_homographs == 1`（出厂默认）走 else 分支，先把迭代器吃掉 1 条再存进 collector，
+所以"手选首词"候选是从**第 2 条**开始的（第 1 条已经被整句选走了）；`> 1` 时反过来从
+第 1 条开始。这个分支差异照抄了。
+
+LRN 侧的一处换算：`Sentence` 只带 `(end_pos, text, weight)`，不带词条本体，而 C++ 的
+`Sentence::Extend` 会累加出一个 `DictEntry`（提交整句时靠它进用户词典）。这里用
+"段的文本"在词图对应格子里反查词条来还原 —— 同格同文本的多条（不同码）取第一条。
+
 ## 六、重跑数据的命令
 
 ```bash
@@ -213,7 +234,9 @@ grep -E 'r\.Register' /c/code/librime/src/rime/gear/gears_module.cc
 6. ~~`affix_segmentor`~~ ✅ 6 个文件
 7. ~~`punctuator` 的数字分隔符~~ ✅ `3.14` / `12:30` 原样上屏（连带 `shape_formatter`
    + `shape_processor`）；组件 **26/35 → 28/35**
-8. 其余 7 项（出厂 0 引用，按需再补）—— 引用加权已 100%，此后按需推进
+8. ~~`table_translator::MakeSentence`（形码整句）~~ ✅ `enable_sentence` 在 wubi86 /
+   cangjie5 / yujoy 系出厂方案里都是 true
+9. 其余 7 项（出厂 0 引用，按需再补）—— 引用加权已 100%，此后按需推进
 
 | 日期 | 变更 |
 |---|---|
@@ -230,3 +253,4 @@ grep -E 'r\.Register' /c/code/librime/src/rime/gear/gears_module.cc
 | 2026-10-26 | `history_translator` ✅ + `Context::commit_history` 底盘：组件 **24/35 → 25/35**，引用加权 **454/472 → 466/472（99%）**。顺带解锁 `table_translator` 的 `encode_commit_history`（从历史里拼短语再编码）。`Translator::query` 加 `&CommitHistory` 入参、`memorize` 同理。全量 **469 passed / 0 failed** |
 | 2026-10-26 | `affix_segmentor` ✅（用户造词）：组件 **25/35 → 26/35**，**按出厂引用加权 466/472 → 472/472（100%）** —— 出厂 124 个方案引用的组件全部落地。e2e 验证 `\`ni` → 劈成 `phony` 前缀段 + `zaoci` 码段、提交文本不含反引号。全量 **483 passed / 0 failed** |
 | 2026-10-26 | `punctuator` 数字分隔符 ✅：`3.14` / `12:30` 原样上屏、连按分隔符回退、`full_shape` 下转全角。连带移植 `shape_formatter` + `shape_processor`（`gear/shape.rs`），组件 **26/35 → 28/35**。接口变动：`Segmentor::proceed` 加 `&CommitHistory`、`SegmentorView` 加 `full_shape`、`Translator` 加 `sync_context`、`Context` 加 `abort_composition`。顺带修掉 `PunctConfig` 构造时把 `full_shape` 写死导致的"全角开关无效"。全量 **502 passed / 0 failed** |
+| 2026-10-26 | `table_translator::MakeSentence` ✅（形码整句）：在码串上按 `consume_trailing_delimiters` 建 WordGraph（用户词 / 构造词 / 词表三路，全部**只认精确命中**），接 `Poet::with_left_associative` 求最短路，产出「整句」候选 + 手选首词候选（码长降序、同长用户词优先）。新增 `enable_sentence` / `sentence_over_completion` / `max_homographs` 三个配置项。e2e：`wq;vb` → 「你好」（注释 ☯、preedit 不插空格）、`wq;vb;wq` → 「你好你」、词级有候选时不出整句。全量 **511 passed / 0 failed** |

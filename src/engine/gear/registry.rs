@@ -430,6 +430,38 @@ pub fn create_translator(ticket: &Ticket) -> Option<Box<dyn Translator + Send + 
             {
                 translator.max_phrase_length = v as i32;
             }
+            // 组句三开关（`table_translator.cc:218-224`）。
+            // `enable_sentence` 默认 **true**、`sentence_over_completion` 默认 **false**、
+            // `max_homographs` 默认 **1**（每格只留最优词）。
+            if let Some(v) = ticket
+                .config
+                .pointer(&pointer("enable_sentence"))
+                .and_then(|v| v.as_bool())
+            {
+                translator.enable_sentence = v;
+            }
+            if let Some(v) = ticket
+                .config
+                .pointer(&pointer("sentence_over_completion"))
+                .and_then(|v| v.as_bool())
+            {
+                translator.sentence_over_completion = v;
+            }
+            if let Some(v) = ticket
+                .config
+                .pointer(&pointer("max_homographs"))
+                .and_then(|v| v.as_i64())
+            {
+                translator.max_homographs = v.max(1) as usize;
+            }
+            // 语法模型：与 `script_translator` 同一套 `grammar/language` 解析。
+            // 形码方案（wubi86 / cangjie5）出厂都没配 grammar，走动态规划。
+            let roots: Vec<&Path> = ticket.data_roots.iter().map(PathBuf::as_path).collect();
+            if let Some(octagram) = crate::engine::gear::grammar::create(ticket.config, &roots) {
+                translator = translator.with_poet(Poet::with_left_associative(Some(Box::new(
+                    octagram,
+                ))));
+            }
             // 用户词典（学词 / 调频）：C++ 里是 `Translator` 基类的 `user_dict_`
             if let Some(user_dict) = create_user_dictionary(ticket, &dict_name) {
                 translator = translator.with_user_dict(user_dict);
