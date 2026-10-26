@@ -45,14 +45,29 @@ pub struct Dictionary {
     pub reverse: Option<ReverseDb>,
 }
 
+/// 真实 build 用**系列文件夹**布局（见 `crate::lever::paths::series_subdir` 的恒等式）：
+/// `.bin` 落在 `build/<系列(id)>/<id><ext>.bin`（如 `build/luna_pinyin/luna_pinyin.table.bin`）。
+/// 测试 fixture 用**扁平** `build/<id><ext>.bin`。两者都试 —— 系列优先、扁平回退，
+/// 保证两种布局都能加载（这正是真机部署下 translator 之前全部加载失败的根因）。
+///
+/// `ext` 含前导点，例如 `".table"` → `<id>.table.bin`（不带点会拼成 `<id>table.bin`）。
+pub(crate) fn bin_resource_path(build_dir: &Path, id: &str, ext: &str) -> PathBuf {
+    let file = format!("{id}{ext}.bin");
+    let series = build_dir.join(id.replace('.', "/")).join(&file);
+    if series.is_file() {
+        return series;
+    }
+    build_dir.join(&file)
+}
+
 impl Dictionary {
-    /// 在 rime 的扁平 `build/` 下打开词典：
+    /// 在 rime 的 `build/` 下打开词典：
     /// `<dict_name>.table.bin` / `<dict_name>.reverse.bin` + `<prism_name>.prism.bin`
     /// （拼音方案的 table 与 prism 往往不同名，如 `luna_pinyin` vs `luna_pinyin_simp`）。
     pub fn open(build_dir: &Path, dict_name: &str, prism_name: &str) -> Option<Dictionary> {
-        let table = Table::open(build_dir.join(format!("{dict_name}.table.bin"))).ok()?;
-        let prism = Prism::open(build_dir.join(format!("{prism_name}.prism.bin"))).ok()?;
-        let reverse = ReverseDb::open(build_dir.join(format!("{dict_name}.reverse.bin"))).ok();
+        let table = Table::open(bin_resource_path(build_dir, dict_name, ".table")).ok()?;
+        let prism = Prism::open(bin_resource_path(build_dir, prism_name, ".prism")).ok()?;
+        let reverse = ReverseDb::open(bin_resource_path(build_dir, dict_name, ".reverse")).ok();
         Some(Dictionary {
             name: dict_name.to_string(),
             prism,

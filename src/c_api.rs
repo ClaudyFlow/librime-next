@@ -46,7 +46,11 @@ impl Global {
         } else if !self.prebuilt_data_dir.is_empty() {
             PathBuf::from(&self.prebuilt_data_dir)
         } else {
-            PathBuf::from(&self.shared_data_dir).join("build")
+            // 真实 build 恒在**用户目录**下（`<user>/build`，见 rime_layout 契约）；
+            // 宿主只传 `shared_data_dir`/`user_data_dir`、`staging_dir` 留空，
+            // 因此这里必须回退到用户目录的 build，而不是 `shared_data_dir/build`
+            // （程序目录的 `build` 不存在、也没有任何 .bin）。
+            PathBuf::from(&self.user_data_dir).join("build")
         }
     }
 
@@ -1400,4 +1404,76 @@ static RIME_API: OnceLock<RimeApi> = OnceLock::new();
 #[unsafe(no_mangle)]
 pub extern "C" fn rime_get_api() -> *const RimeApi {
     RIME_API.get_or_init(build_api) as *const RimeApi
+}
+
+// ----------------------------------------------------------------- 宿主路径冒烟测试
+//
+// 这条测试刻意走和宿主（`Engine/src/librime/mod.rs` 的 `Librime::load`）**完全一致**的
+// 调用序列：`rime_initialize`（只传 shared/user，staging_dir = null）→ `rime_create_session`
+// → 逐个 `rime_process_key` → `rime_get_context` 读候选。
+//
+// 之前的 `repro_real_luna_pinyin` 直接 `Session::create_with_roots` 绕过了 C-API 全局态，
+// 因此没暴露 `build_dir()` 在 staging_dir 为空时回退到 `shared_data_dir/build`（程序目录，
+// 那里没有 .bin）的 bug。这条测试能直接复现宿主线上行为。
+
+#[cfg(test)]
+mod host_smoke {
+    use super::*;
+    use std::ffi::{CStr, CString};
+
+    #[test]
+    fn host_path_typing_nihao_yields_candidates() {
+        let appdata = std::env::var("APPDATA").unwrap_or_default();
+        let shared = CString::new("C:/Program Files/Weasel-Next/Rime-Next").unwrap();
+        let user = CString::new(format!("{appdata}/Rime-Next")).unwrap();
+        let app = CString::new("rime.weasel-next").unwrap();
+
+        let mut traits = RimeTraits {
+            data_size: std::mem::size_of::<RimeTraits>() as c_int,
+            shared_data_dir: shared.as_ptr(),
+            user_data_dir: user.as_ptr(),
+            distribution_name: std::ptr::null(),
+            distribution_code_name: std::ptr::null(),
+            distribution_version: std::ptr::null(),
+            app_name: app.as_ptr(),
+            modules: std::ptr::null(),
+            min_log_level: 0,
+            log_dir: std::ptr::null(),
+            prebuilt_data_dir: std::ptr::null(),
+            staging_dir: std::ptr::null(),
+        };
+
+        unsafe {
+            rime_initialize(&mut traits);
+            let id = rime_create_session();
+            assert!(id != 0, "宿主路径下应创建出会话");
+            for ch in "nihao".chars() {
+                let consumed = rime_process_key(id, ch as c_int, 0);
+                assert!(consumed != 0, "按键 {ch} 应被消费");
+            }
+            let mut ctx: RimeContext = std::mem::zeroed();
+            let ok = rime_get_context(id, &mut ctx);
+            assert!(ok != 0, "应能取得上下文");
+            let n = ctx.menu.num_candidates as usize;
+            let mut texts = Vec::new();
+            if n > 0 && !ctx.menu.candidates.is_null() {
+                let arr = std::slice::from_raw_parts(ctx.menu.candidates, n);
+                for c in arr {
+                    if !c.text.is_null() {
+                        texts.push(CStr::from_ptr(c.text).to_string_lossy().into_owned());
+                    }
+                }
+            }
+            rime_free_context(&mut ctx);
+            eprintln!("HOST-PATH candidates (n={n}): {texts:?}");
+            assert!(
+                !texts.is_empty(),
+                "宿主路径下应产出候选；若为空，多半是 build_dir 解析到了程序目录（那里没有 .bin）"
+            );
+            assert!(
+                texts.iter().any(|t| t.contains("你好")),
+                "nihao 应能在候选里拿到「你好」，实得 {texts:?}"
+            );
+        }
+    }
 }

@@ -61,7 +61,11 @@ impl ReverseLookupFilter {
             .and_then(|name| {
                 // 只 `open` 不 `load` 的话两个 trie 都是空的，`lookup` 恒返回 `None`
                 // （C++ 对应 `ReverseLookupDictionary::Load()` 里的 `db_->Load()`）。
-                ReverseDb::open(build_dir.join(format!("{name}.reverse.bin")))
+                ReverseDb::open(crate::dict::dictionary::bin_resource_path(
+                    build_dir,
+                    name,
+                    ".reverse",
+                ))
                     .ok()
                     .and_then(|mut db| db.load().then_some(db))
             });

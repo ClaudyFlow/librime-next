@@ -39,6 +39,48 @@ fn type_ascii(session: &mut Session, s: &str) {
     }
 }
 
+/// 复现真实用户配置下新 DLL 的崩溃：指向 %APPDATA%/Rime-Next/build。
+///
+/// 部署时新引擎在加载 `luna_pinyin` 资源阶段崩了，单测 fixture 不覆盖真实配置，
+/// 这里直接用真实 build 目录跑一遍拿 panic 回溯。
+///
+/// **关键**：必须按真机宿主的 `data_roots` 顺序传根 —— 用户目录优先、共享目录其次，
+/// 否则 `grammar`（`model/*.gram`）和 `simplifier`（`opencc/`）找不到资源，
+/// 会误判成"引擎没修好"。
+#[test]
+fn repro_real_luna_pinyin() {
+    let appdata = std::env::var("APPDATA").unwrap_or_default();
+    let real_build = PathBuf::from(format!("{appdata}/Rime-Next/build"));
+    let user_dir = PathBuf::from(format!("{appdata}/Rime-Next"));
+    let shared_dir = PathBuf::from("C:/Program Files/Weasel-Next/Rime-Next");
+    if !real_build.exists() {
+        eprintln!("skip: 真实 build 目录不存在");
+        return;
+    }
+    println!("REAL build dir: {}", real_build.display());
+    println!("REAL roots: {:?}", [&user_dir, &shared_dir]);
+    let mut session = Session::create_with_roots(
+        &real_build,
+        "luna_pinyin_simp",
+        &[user_dir, shared_dir],
+    );
+    assert!(
+        session.engine.is_some(),
+        "luna_pinyin_simp 引擎应能从真实配置加载"
+    );
+    type_ascii(&mut session, "nihao");
+    let texts = candidate_texts(&mut session);
+    println!(
+        "REAL luna_pinyin_simp candidates: {:?}",
+        &texts[..texts.len().min(10)]
+    );
+    assert!(!texts.is_empty(), "真实配置下应产出候选（之前因系列文件夹路径 bug 全空）");
+    assert!(
+        texts.iter().any(|t| t.contains("你好")),
+        "nihao 应能在候选里拿到「你好」，实得 {texts:?}"
+    );
+}
+
 #[test]
 fn engine_loads_luna_pinyin_simp() {
     let session = new_session(&build_dir(), "luna_pinyin_simp");

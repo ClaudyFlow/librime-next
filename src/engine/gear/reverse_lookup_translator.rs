@@ -116,9 +116,13 @@ impl ReverseLookupTranslator {
         // `open` 只把文件映进来，`load` 才解析两个 trie —— 少这一步 `lookup` 恒返回
         // `None`，表现为"候选出得来、注释永远是空的"（C++ 侧对应
         // `ReverseLookupDictionary::Load()` 里的 `db_->Load()`）。
-        let rev_dict = ReverseDb::open(build_dir.join(format!("{rev_name}.reverse.bin")))
-            .ok()
-            .and_then(|mut db| db.load().then_some(db));
+        let rev_dict = ReverseDb::open(crate::dict::dictionary::bin_resource_path(
+            build_dir,
+            rev_name,
+            ".reverse",
+        ))
+        .ok()
+        .and_then(|mut db| db.load().then_some(db));
 
         Some(Self {
             tag,

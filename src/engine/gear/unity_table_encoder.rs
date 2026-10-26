@@ -78,7 +78,8 @@ impl UnityTableEncoder {
     /// 任何一步失败都返回 `None` —— 调用方照 C++ 的做法把 `encoder_` 留空，
     /// 翻译器照常工作，只是学不了新词。
     pub fn load(build_dir: &Path, dict_name: &str) -> Option<Self> {
-        let reverse_path = build_dir.join(format!("{dict_name}.reverse.bin"));
+        let reverse_path =
+            crate::dict::dictionary::bin_resource_path(build_dir, dict_name, ".reverse");
         let mut rev_dict = ReverseDb::open(&reverse_path).ok()?;
         if !rev_dict.load() {
             eprintln!(
