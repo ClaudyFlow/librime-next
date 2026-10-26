@@ -22,9 +22,14 @@
 //!
 //! 返回读到的词条数（与 C++ 的 `num_entries` 同义）。
 //!
-//! 写侧（`TsvWriter`）没有移植：词典编译链路只读不写。
+//! # 写侧
+//!
+//! [`TsvWriter`] 对应 `tsv.cc:67-91`。原本没移植（词典编译链只读不写），
+//! 但用户词典备份要走 `<name>.userdb.txt`（`TsvWriter` + `DbSource`），
+//! 所以补上了。它吃 [`TsvSource`]（`Source` 侧的最小接口，
+//! 由 `dict::db::DbSource` 实现），避免 tsv 反向依赖 db。
 
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::algo::strings::{self, SplitBehavior};
@@ -41,6 +46,83 @@ pub trait TsvSink {
     }
     /// `Sink::Put`：一条词条。返回 false = 拒收（调用方记 invalid entry）。
     fn put(&mut self, key: &str, value: &str) -> bool;
+}
+
+/// C++ 的 `Source`：TSV 行的来源（先元数据、再数据）。
+///
+/// `dict::db::DbSource` 是它唯一的实现。放在这里而不是 `db.rs`，
+/// 是为了让 [`TsvWriter`] 不必知道 `Db` 的存在。
+pub trait TsvSource {
+    /// `Source::MetaGet`。
+    fn meta_get(&mut self) -> Option<(String, String)>;
+    /// `Source::Get`。
+    fn get(&mut self) -> Option<(String, String)>;
+}
+
+/// `TsvFormatter`：把 `(key, value)` 拆成一行；`None` = 这条写不出去。
+pub type TsvFormatter = Box<dyn Fn(&str, &str) -> Option<Tsv>>;
+
+/// `TsvWriter`：把一个 [`TsvSource`] 摊成 TSV 文件（`tsv.cc:67-91`）。
+///
+/// 输出格式：
+///
+/// ```text
+/// # <file_description>          ← 有描述才写
+/// #@<key>\t<value>              ← 元数据，每行一条
+/// <col0>\t<col1>\t...           ← 数据
+/// ```
+pub struct TsvWriter {
+    file_path: PathBuf,
+    formatter: TsvFormatter,
+    /// `TsvWriter::file_description`：首行注释，空则不写。
+    pub file_description: String,
+}
+
+impl TsvWriter {
+    pub fn new(file_path: impl Into<PathBuf>, formatter: TsvFormatter) -> Self {
+        Self {
+            file_path: file_path.into(),
+            formatter,
+            file_description: String::new(),
+        }
+    }
+
+    pub fn file_path(&self) -> &Path {
+        &self.file_path
+    }
+
+    /// `TsvWriter::operator()(Source*)`：返回写出的**数据**行数
+    /// （元数据行不计入，与 C++ 一致）。
+    pub fn write(&self, source: &mut dyn TsvSource) -> io::Result<usize> {
+        let mut out = String::new();
+        if !self.file_description.is_empty() {
+            out.push_str("# ");
+            out.push_str(&self.file_description);
+            out.push('\n');
+        }
+        while let Some((key, value)) = source.meta_get() {
+            out.push_str("#@");
+            out.push_str(&key);
+            out.push('\t');
+            out.push_str(&value);
+            out.push('\n');
+        }
+        let mut num_entries = 0usize;
+        while let Some((key, value)) = source.get() {
+            let Some(row) = (self.formatter)(&key, &value) else {
+                continue;
+            };
+            if row.is_empty() {
+                continue;
+            }
+            out.push_str(&row.join("\t"));
+            out.push('\n');
+            num_entries += 1;
+        }
+        let mut file = std::fs::File::create(&self.file_path)?;
+        file.write_all(out.as_bytes())?;
+        Ok(num_entries)
+    }
 }
 
 /// `TsvReader`：读一个 TSV 文件喂给 `TsvSink`。

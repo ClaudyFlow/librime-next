@@ -69,6 +69,15 @@ impl EdgeProperties {
             ambiguous_source_positions: BTreeSet::new(),
         }
     }
+
+    /// `syllabifier.h:26` 的 `end_pos`（这条边在输入串里的结束位置）。
+    ///
+    /// `SpellingProperties::end_pos` 是 `pub(super)`（只对 `algo` 可见），
+    /// 而 `dict::user_dictionary` 的 `DfsLookup` 需要它来推进位置，所以在这里
+    /// 开一个只读口子 —— 比把字段放宽成 `pub(crate)` 更收敛。
+    pub fn end_pos(&self) -> usize {
+        self.base.end_pos
+    }
 }
 
 impl std::ops::Deref for EdgeProperties {

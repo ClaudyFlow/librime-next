@@ -14,7 +14,7 @@
 |---|---|---|---|
 | 输入组件 | 22 / 35 | 35 / 35 | 落后，缺 13 项；出厂方案实际只引用其中 3 项 |
 | **整句组句（WordGraph + Poet）** | **有**，`src/engine/gear/poet.rs` + `Dictionary::lookup_from_graph` | 有，`ScriptSyllabifier::BuildSyllableGraph` + `Poet::MakeSentences` | **已对齐**（`b1b0125`）。`nihaoshijie` → 「你好世界」；`nihao` → 「你好」（精确词条不组句） |
-| 用户词典 UserDb 持久化 | 占位桩（`src/dict/user_db.rs` 仅一行注释） | LevelDB 实装，`%APPDATA%/Rime-Next/userdb/` 下 4 个 `.userdb` 在用 | **落后**，影响全部方案的学词与调频 |
+| 用户词典 UserDb 持久化 | **有**，`db.rs` + `level_db.rs`（rusty-leveldb）+ `user_db.rs` + `user_dictionary.rs` | LevelDB 实装，`%APPDATA%/Rime-Next/userdb/` 下 4 个 `.userdb` 在用 | **已对齐**。实测读动 C++ 版写出的 `luna_pinyin.userdb`：1257 条记录，值形如 `c=21 d=3.50902 t=3402` |
 | 语法模型 octagram grammar | **有**，`gram_db.rs` + `grammar.rs`（Darts trie + 紧凑 n-gram 编码 + 五元打分） | 有，4 个 `.gram` 共约 470 MB 在用 | **已对齐**（未提交时）。`zhongguoren` → 「中國人」排第一 |
 | TOML 解析 | 0 行（方案清单读 `schema.yaml`） | 手写 `toml_lite.cc` +259 行 | **领先**，补丁版这 259 行可归零 |
 
@@ -138,8 +138,9 @@ grep -E 'r\.Register' /c/code/librime/src/rime/gear/gears_module.cc
 按表的工作顺序（依赖优先，其次影响面）：
 
 1. ~~整句组句 `WordGraph` + `Poet`~~ ✅ `b1b0125`
-2. ~~octagram grammar~~ ✅ 4 个方案直接依赖，470 MB 模型在用
-3. UserDb 持久化 —— 全部方案的学词/调频　**← 下一个要做**
+2. ~~octagram grammar~~ ✅ `86aad8c`
+3. ~~UserDb 持久化~~ ✅ 字典层已通（`db` / `level_db` / `user_db` / `user_dictionary`）；
+   **下一步是把它接进 translator 的学词链路**　**← 当前在做**
 4. `reverse_lookup_translator` + `reverse_lookup_filter` —— 18 个文件
 5. `history_translator` —— 12 个文件
 6. `affix_segmentor` —— 6 个文件
@@ -151,3 +152,4 @@ grep -E 'r\.Register' /c/code/librime/src/rime/gear/gears_module.cc
 | 2026-10-26 | 补「整句组句」一层：核查 `ScriptTranslator` 为纯词级，`Poet`/`WordGraph` 未移植，grammar 因此无落点。定为第 1 优先级 |
 | 2026-10-26 | 整句组句落地（`b1b0125`）：`poet.rs` 560 行 + `lookup_from_graph` + `match_extra_code`。实测 `nihaoshijie`→「你好世界」、`nihao`→「你好」、`choose(0)` commit 全文 |
 | 2026-10-26 | grammar 落地：`gram_db.rs`（Darts + MappedFile）、`grammar.rs`（encode + Octagram 五元打分）、`data_roots` 架构。实测 `zhongguoren`→「中國人」；单测证明 `中国` 6.83 > `中果` -1.55 |
+| 2026-10-26 | **UserDb 字典层落地**：`db.rs`（Db/DbAccessor/Transactional/Source/Sink）、`level_db.rs`（rusty-leveldb + 游标关进 Mutex）、`user_db.rs`（值格式 + `%g` 对齐 + 快照 + merger/importer）、`user_dictionary.rs`（DFS 查询 + 学词 + 事务）。实测：真实 `luna_pinyin.userdb` 读出 1257 条；真实 prism/table 上 `nihao` 捞出用户词「你好」，预测分支捞出「你好吗」 |

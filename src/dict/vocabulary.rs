@@ -29,12 +29,28 @@
 //!   C++ 一致（`"1,2,3"`）。
 //! * **没移植**：`DictEntryFilterBinder`（C++ 的 `function` 组合子，等 `dictionary`
 //!   层一起做）。`Vocabulary::LocateEntries` 的递归助手是私有函数，不占公共面。
+//!
+//! 2026-10-26 补上 [`DictEntryFilter`] / [`DictEntryFilterBinder`]：
+//! `user_dictionary` 的 `UserDictEntryIterator` 需要它（`vocabulary.h:85-111`）。
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::slice::Iter;
+
+/// `using DictEntryFilter = function<bool(const an<DictEntry>&)>`（`vocabulary.h:85`）。
+pub type DictEntryFilter = Box<dyn Fn(&DictEntry) -> bool>;
+
+/// `class DictEntryFilterBinder`（`vocabulary.h:87-111`）的可组合形态。
+///
+/// C++ 的 binder 让一个迭代器持有一串 filter，`AddFilter` 追加。Rust 侧同样用
+/// `Option<Box<dyn Fn>>` 表示"有没有 filter"，追加时用闭包套一层即可：
+///
+/// ```ignore
+/// binder = Some(Box::new(move |e| old(e) && new(e)));
+/// ```
+pub type DictEntryFilterBinder = Option<DictEntryFilter>;
 
 /// `using SyllableId = int32_t;`（`vocabulary.h:19`）。
 ///

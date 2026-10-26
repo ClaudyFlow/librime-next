@@ -17,11 +17,11 @@
 //! | `dict_compiler.h`(66) + `dict_compiler.cc`(424) | 490 | [`dict_compiler`] | 已移植 |
 //! | `reverse_lookup_dictionary.h`(89) + `reverse_lookup_dictionary.cc`(261) | 350 | [`reverse_lookup_dictionary`] | 已移植 |
 //! | `preset_vocabulary.h`(27) + `preset_vocabulary.cc`(116) | 143 | [`preset_vocabulary`] | 已移植 |
-//! | `text_db.h`(80) + `text_db.cc`(233) | 313 | [`text_db`] | 已移植 |
-//! | `user_db.h`(142) + `user_db.cc`(270) | 412 | [`user_db`] | 已移植 |
-//! | `level_db.h`(78) + `level_db.cc`(348) | 426 | [`level_db`] | 已移植（rusty-leveldb） |
-//! | `user_dictionary.h`(121) + `user_dictionary.cc`(622) | 743 | [`user_dictionary`] | 已移植 |
-//! | `db.h`(119) + `db.cc`(60) + `db_utils`(124) + `tsv`(162) | 465 | [`db`] / [`tsv`] | 已移植 |
+//! | `text_db.h`(80) + `text_db.cc`(233) | 313 | [`text_db`] | ❌ **仍是占位**（快照走 TSV，暂不需要 TextDb 后端） |
+//! | `db.h`(119) + `db.cc`(60) + `db_utils`(124) + `tsv`(162) | 465 | [`db`] / [`tsv`] | 已移植（2026-10-26：`Source`/`Sink` + `TsvWriter` 补齐） |
+//! | `user_db.h`(142) + `user_db.cc`(270) | 412 | [`user_db`] | 已移植（2026-10-26，`.userdb.txt` 快照 + merger/importer） |
+//! | `level_db.h`(78) + `level_db.cc`(348) | 426 | [`level_db`] | 已移植（`rusty-leveldb`；**实测读得动 C++ 版写出的 .userdb**） |
+//! | `user_dictionary.h`(121) + `user_dictionary.cc`(622) | 743 | [`user_dictionary`] | 已移植（2026-10-26，DFS 查询 + 学词 + 事务） |
 //!
 //! ## 三种 `.bin` 的格式（逆向结论都写在各自模块的文档里）
 //!
