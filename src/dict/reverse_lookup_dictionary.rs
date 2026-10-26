@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 
 use crate::dict::dict_settings::DictSettings;
 use crate::dict::mapped_file::MappedFile;
-use crate::dict::string_table::{StringTable, K_INVALID_STRING_ID};
+use crate::dict::string_table::{K_INVALID_STRING_ID, StringTable};
 use crate::dict::string_table_builder::StringTableBuilder;
 use crate::dict::vocabulary::{ReverseLookupTable, Syllabary, Vocabulary};
 
@@ -134,13 +134,21 @@ impl ReverseDb {
         let entry_count = rev_table.len() + stems.len();
         for (text, syllables) in &rev_table {
             key_builder.add(text.clone(), 0.0, None);
-            value_builder.add(syllables.iter().cloned().collect::<Vec<_>>().join(" "), 0.0, None);
+            value_builder.add(
+                syllables.iter().cloned().collect::<Vec<_>>().join(" "),
+                0.0,
+                None,
+            );
         }
         for (text, stem_set) in stems {
             let mut key = text.clone();
             key.push_str(K_STEM_KEY_SUFFIX);
             key_builder.add(key, 0.0, None);
-            value_builder.add(stem_set.iter().cloned().collect::<Vec<_>>().join(" "), 0.0, None);
+            value_builder.add(
+                stem_set.iter().cloned().collect::<Vec<_>>().join(" "),
+                0.0,
+                None,
+            );
         }
         key_builder
             .build()
@@ -171,7 +179,10 @@ impl ReverseDb {
             dict_file_checksum,
         );
         if !dict_settings.is_empty() {
-            file.copy_string(&dict_settings, metadata_pos + metadata_layout::DICT_SETTINGS_POS);
+            file.copy_string(
+                &dict_settings,
+                metadata_pos + metadata_layout::DICT_SETTINGS_POS,
+            );
         }
         // ⑥ index：`List<StringId>` 的头（size + OffsetPtr）在 metadata **内部**的
         // INDEX_POS（C++ `metadata_->index` 是结构体字段），数据数组另分配。
@@ -181,7 +192,10 @@ impl ReverseDb {
             let position = data + key_ids[i] as usize * 4;
             file.put_u32(position, value_ids[i]);
         }
-        file.put_u32(metadata_pos + metadata_layout::INDEX_POS, entry_count as u32);
+        file.put_u32(
+            metadata_pos + metadata_layout::INDEX_POS,
+            entry_count as u32,
+        );
         file.set_offset(metadata_pos + metadata_layout::INDEX_POS + 4, data);
         // ⑦ 键值 trie 镜像（C++:171-188）
         let key_image = file.allocate(key_builder.binary_size(), 1);
@@ -239,10 +253,10 @@ impl ReverseDb {
         let Some(metadata_pos) = self.file.pos(0) else {
             return false;
         };
-        let Some(format) = self
-            .file
-            .fixed_str_at(metadata_pos + metadata_layout::FORMAT_POS, metadata_layout::FORMAT_MAX_LENGTH)
-        else {
+        let Some(format) = self.file.fixed_str_at(
+            metadata_pos + metadata_layout::FORMAT_POS,
+            metadata_layout::FORMAT_MAX_LENGTH,
+        ) else {
             return false;
         };
         let Some(rest) = format.strip_prefix(K_REVERSE_FORMAT_PREFIX) else {
@@ -311,10 +325,7 @@ impl ReverseDb {
         let key_trie = self.key_trie.as_ref()?;
         let value_trie = self.value_trie.as_ref()?;
         // C++：`!metadata_->index.size` → false
-        let index_size = self
-            .file
-            .u32_at(metadata_layout::INDEX_POS)
-            .unwrap_or(0);
+        let index_size = self.file.u32_at(metadata_layout::INDEX_POS).unwrap_or(0);
         if index_size == 0 {
             return None;
         }
@@ -337,6 +348,24 @@ impl ReverseDb {
         key.push_str(K_STEM_KEY_SUFFIX);
         self.lookup(&key)
     }
+
+    /// `ReverseDb::dict_settings()`（`reverse_lookup_dictionary.h:60`）：
+    /// 建库时**内嵌**的词典 YAML（`dict_settings` 是 `OffsetPtr<char>`，空 = NULL）。
+    ///
+    /// 为什么内嵌：反查表是给"规则编码器"用的，而规则写在词典头部的
+    /// `encoder:` 节点里。运行期的 `UnityTableEncoder` 只拿得到 `.reverse.bin`，
+    /// 所以编译期就把那段 YAML 抄进去了（`reverse_lookup_dictionary.cc:126-131`）。
+    pub fn dict_settings(&self) -> Option<&str> {
+        self.file
+            .string_at(metadata_layout::DICT_SETTINGS_POS)
+            .filter(|text| !text.is_empty())
+    }
+
+    /// `ReverseLookupDictionary::GetDictSettings()`：把内嵌 YAML 解析成
+    /// [`DictSettings`]。没内嵌（词典没用规则编码器）时 `None`。
+    pub fn load_dict_settings(&self) -> Option<DictSettings> {
+        DictSettings::load_dict_header(self.dict_settings()?).map(|(settings, _)| settings)
+    }
 }
 
 #[cfg(test)]
@@ -354,9 +383,15 @@ mod tests {
         let ni = syllabary.id_of("ni").unwrap();
         let hao = syllabary.id_of("hao").unwrap();
         let page_ni = vocabulary.pages_mut().entry(ni).or_default();
-        page_ni.entries.0.push(ShortDictEntry::new("你", Code::from_slice(&[ni]), 1.0));
+        page_ni
+            .entries
+            .0
+            .push(ShortDictEntry::new("你", Code::from_slice(&[ni]), 1.0));
         let page_hao = vocabulary.pages_mut().entry(hao).or_default();
-        page_hao.entries.0.push(ShortDictEntry::new("好", Code::from_slice(&[hao]), 1.0));
+        page_hao
+            .entries
+            .0
+            .push(ShortDictEntry::new("好", Code::from_slice(&[hao]), 1.0));
         vocabulary
     }
 
@@ -370,7 +405,10 @@ mod tests {
         let vocabulary = sample_vocabulary(&syllabary);
         // 一个词根：你好 → 你好
         let mut stems: ReverseLookupTable = BTreeMap::new();
-        stems.insert("你好".to_string(), ["你好".to_string()].into_iter().collect());
+        stems.insert(
+            "你好".to_string(),
+            ["你好".to_string()].into_iter().collect(),
+        );
 
         let checksum = 0xDEADBEEF;
         let db = ReverseDb::compile(&path, None, &syllabary, &vocabulary, &stems, checksum)
@@ -400,11 +438,15 @@ mod tests {
         let stems = BTreeMap::new();
         let db = ReverseDb::build(&path, None, &syllabary, &vocabulary, &stems, 7).expect("build");
         // format 写在 0，checksum 在 32
-        assert!(db
-            .file
-            .fixed_str_at(metadata_layout::FORMAT_POS, metadata_layout::FORMAT_MAX_LENGTH)
-            .unwrap()
-            .starts_with("Rime::Reverse/3.1"));
+        assert!(
+            db.file
+                .fixed_str_at(
+                    metadata_layout::FORMAT_POS,
+                    metadata_layout::FORMAT_MAX_LENGTH
+                )
+                .unwrap()
+                .starts_with("Rime::Reverse/3.1")
+        );
         assert_eq!(db.dict_file_checksum(), 7);
         // index：size = 0（没有反查项也没有词根）
         assert_eq!(

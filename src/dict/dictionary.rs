@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::algo::syllabifier::SyllableGraph;
+use crate::dict::dict_entry_iterator::{DictEntryIterator, add_chunks_for_keys};
 use crate::dict::prism::Prism;
 use crate::dict::reverse_lookup_dictionary::ReverseDb;
 use crate::dict::table::Table;
@@ -189,13 +190,16 @@ impl Dictionary {
                         }
                     };
                     if let Some(target_end) = target_end {
-                        collector.entry(target_end).or_default().push(VocabularyEntry {
-                            text,
-                            weight: entry.weight as f64 - K_WEIGHT_OFFSET + credibility,
-                            code: index_code.clone(),
-                            quality_len,
-                            ..Default::default()
-                        });
+                        collector
+                            .entry(target_end)
+                            .or_default()
+                            .push(VocabularyEntry {
+                                text,
+                                weight: entry.weight as f64 - K_WEIGHT_OFFSET + credibility,
+                                code: index_code.clone(),
+                                quality_len,
+                                ..Default::default()
+                            });
                     }
                     accessor.next();
                 }
@@ -207,6 +211,78 @@ impl Dictionary {
         }
         collector.retain(|_, bucket| !bucket.is_empty());
         collector
+    }
+
+    /// `Dictionary::LookupWords(result, str_code, predictive, limit, blacklist)`
+    /// （`dictionary.cc:299-348`）：按**码串**取词条（不走音节图）。
+    ///
+    /// 这是形码方案的主查询路径 —— 用户的按键码就是 prism 的键，不存在"一种输入多种切分"，
+    /// 所以要的是"整码命中 + 前缀补全"，不是音节图上的路径枚举。
+    ///
+    /// # 三路来源
+    ///
+    /// | `predictive` | 键怎么来 | 页怎么来 |
+    /// |---|---|---|
+    /// | `false` | `prism.get_value(str_code)`（整码，一个键） | `table.query_words(音节 id)` |
+    /// | `true` | `prism.expand_search(str_code, limit)`（BFS，前缀族） | 同上 |
+    ///
+    /// 每个键经 `query_spelling` 展开成若干 (音节 id, 拼写类型)，**只留
+    /// `kNormalSpelling`**（`dictionary.cc:324`：`if (type > kNormalSpelling) continue;`
+    /// —— 模糊音/简拼/补全在这一层就被丢掉），每个音节取一页同码词。
+    ///
+    /// # `remaining_code`（`dictionary.cc:326-331`）
+    ///
+    /// 只有补全时"键比用户打的码还长"才发生：`expand_search` 会往下 BFS，
+    /// 打出 `nih` 时键 `nihao` 也算命中，此时提示 `~ao`。判据是
+    /// `match.length > code_length` 且 `音节.len() > code_length`。
+    ///
+    /// # 返回值
+    ///
+    /// C++ 返回**命中键的个数**（不是词条数），`LazyTableTranslation` 用它判断
+    /// "是不是还有更多页"。词条本身装在 `result` 里。
+    pub fn lookup_words(
+        &self,
+        result: &mut DictEntryIterator,
+        str_code: &str,
+        predictive: bool,
+        limit: usize,
+        blacklist: Option<&HashSet<String>>,
+    ) -> usize {
+        let keys = if predictive {
+            self.prism.expand_search(str_code, limit)
+        } else {
+            // C++：`Prism::Match match{0, 0}` —— **length 留 0**，不是键长。
+            // 留下 0 才能让下面 `match.length > code_length` 恒假（整码不该有 ~ 提示）。
+            match self.prism.get_value(str_code) {
+                Some(value) => vec![crate::dict::prism::Match { value, length: 0 }],
+                None => Vec::new(),
+            }
+        };
+        add_chunks_for_keys(result, &self.table, &self.prism, &keys, str_code.len());
+        if let Some(blacklist) = blacklist.filter(|blacklist| !blacklist.is_empty()) {
+            // C++ 的 filter 闭包捕的是 `const hash_set*`（指针活到迭代器析构）；
+            // Rust 侧 Box<dyn Fn> 要求 'static，只能把集合搬进去。黑名单通常只有几条，
+            // 而且一个迭代器只挂一次，代价可以忽略。
+            let blacklist = blacklist.clone();
+            result.add_filter(Box::new(move |entry: &VocabularyEntry| {
+                !blacklist.contains(&entry.text)
+            }));
+        }
+        keys.len()
+    }
+
+    /// `Dictionary::Decode(const Code&, vector<string>* result)`（`dictionary.cc:351-363`）：
+    /// 音节 id 序列 → 音节串序列。任一个 id 查不到就整条失败（`result` 仍被清空）。
+    pub fn decode(&self, code: &Code) -> Option<Vec<String>> {
+        let mut result = Vec::with_capacity(code.len());
+        for &syllable_id in code.iter() {
+            let syllable = self.table.get_syllable_by_id(syllable_id);
+            if syllable.is_empty() {
+                return None;
+            }
+            result.push(syllable);
+        }
+        Some(result)
     }
 }
 
@@ -274,4 +350,3 @@ impl CodeMatch {
         end_pos: 0,
     };
 }
-

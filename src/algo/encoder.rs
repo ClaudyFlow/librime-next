@@ -153,8 +153,22 @@ fn find_first_of_from(haystack: &[u8], needles: &[u8], from: usize) -> Option<us
 }
 
 /// `encoder.h:66-99`：按公式取码。
+///
+/// # 为什么这里没有 `collector` 字段
+///
+/// C++ 的 `TableEncoder` 存一个 `PhraseCollector* collector_`，构造时
+/// `new TableEncoder(this)` 指向自己那边（`entry_collector` / `unity_table_encoder`
+/// 都是这种自引用写法）。Rust 侧把这个字段拆走了，原因有两条：
+///
+/// 1. **自引用写不出来**：`UnityTableEncoder` 既是编码器又是收集方，字段互指会打架；
+/// 2. **`Box<dyn PhraseCollector>` 不是 `Send`/`Sync`**（`entry_collector` 那边用
+///    `Rc<RefCell<..>>`），而引擎要求组件 `Send + Sync`。留着这个字段，
+///    `TableEncoder` 一进 `TableTranslator` 就编不过。
+///
+/// 于是收集方变成**每次调用的参数**（[`Self::encode_phrase_with`]）；
+/// 编译期那条需要"绑定一个收集方"的路径用 [`BoundTableEncoder`] 包装。
+/// `TableEncoder` 本身只剩纯数据，因此天然 `Send + Sync`。
 pub struct TableEncoder {
-    collector: Option<Box<dyn PhraseCollector>>,
     loaded: bool,
     encoding_rules: Vec<TableEncodingRule>,
     /// C++ 是 `vector<boost::regex>`
@@ -172,9 +186,8 @@ impl Default for TableEncoder {
 
 impl TableEncoder {
     /// `encoder.cc:27-28`
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
-            collector: None,
             loaded: false,
             encoding_rules: Vec::new(),
             exclude_patterns: Vec::new(),
@@ -183,19 +196,8 @@ impl TableEncoder {
         }
     }
 
-    /// `encoder.cc:27-28`：`new TableEncoder(this)`（带 collector 的版本；
-    /// 无参版留给单测）。
-    pub fn with_collector(collector: Box<dyn PhraseCollector>) -> Self {
-        let mut encoder = Self::new();
-        encoder.collector = Some(collector);
-        encoder
-    }
-
-    fn set_collector(&mut self, collector: Box<dyn PhraseCollector>) {
-        self.collector = Some(collector);
-    }
-
-    fn loaded(&self) -> bool {
+    /// `TableEncoder::loaded()`：`encoder/rules` 里至少有一条规则解析成功。
+    pub fn loaded(&self) -> bool {
         self.loaded
     }
 
@@ -212,7 +214,7 @@ impl TableEncoder {
     }
 
     /// `encoder.cc:45-106`：读 `encoder/*` 设置。返回 `loaded_`。
-    fn load_settings(&mut self, config: &Value) -> bool {
+    pub fn load_settings(&mut self, config: &Value) -> bool {
         self.loaded = false;
         self.max_phrase_length = 0;
         self.encoding_rules.clear();
@@ -225,10 +227,15 @@ impl TableEncoder {
         }
 
         // `encoder.cc:55-93`
-        if let Some(rules) = config.get("encoder").and_then(|e| e.get("rules")).and_then(|r| r.as_array())
+        if let Some(rules) = config
+            .get("encoder")
+            .and_then(|e| e.get("rules"))
+            .and_then(|r| r.as_array())
         {
             for item in rules {
-                let Some(rule) = item.as_object() else { continue };
+                let Some(rule) = item.as_object() else {
+                    continue;
+                };
                 if !rule.contains_key("formula") {
                     continue;
                 }
@@ -474,8 +481,14 @@ impl TableEncoder {
     }
 
     /// `encoder.cc:247-290`：逐字 DFS，把 `code` 的所有组合都试一遍。
+    ///
+    /// `collector` 是**显式入参**而不是 `self.collector`：C++ 用 `collector_(this)`
+    /// 让 `UnityTableEncoder` 既是编码器又是收集方（自引用）。Rust 不能这么写，
+    /// 于是把"收集方"提到每次调用的参数上 —— 见
+    /// [`Self::encode_phrase_with`]。
     fn dfs_encode(
-        &mut self,
+        &self,
+        collector: &mut dyn PhraseCollector,
         phrase: &str,
         value: &str,
         start_pos: usize,
@@ -486,9 +499,7 @@ impl TableEncoder {
             *limit -= 1;
             let mut encoded = String::new();
             if self.encode(code, &mut encoded) {
-                if let Some(collector) = self.collector.as_mut() {
-                    collector.create_entry(phrase, &encoded, value);
-                }
+                collector.create_entry(phrase, &encoded, value);
                 return true;
             }
             return false;
@@ -501,17 +512,15 @@ impl TableEncoder {
         let word = &phrase[start_pos..word_end];
         let mut ret = false;
         let mut translations: Vec<String> = Vec::new();
-        if let Some(collector) = self.collector.as_mut() {
-            if !collector.translate_word(word, &mut translations) {
-                translations.clear();
-            }
+        if !collector.translate_word(word, &mut translations) {
+            translations.clear();
         }
         for x in translations {
             if self.is_code_excluded(&x) {
                 continue;
             }
             code.push(x);
-            let ok = self.dfs_encode(phrase, value, word_end, code, limit);
+            let ok = self.dfs_encode(collector, phrase, value, word_end, code, limit);
             ret = ret || ok;
             code.pop();
             if *limit <= 0 {
@@ -520,22 +529,65 @@ impl TableEncoder {
         }
         ret
     }
-}
 
-impl Encoder for TableEncoder {
-    fn load_settings(&mut self, config: &Value) -> bool {
-        TableEncoder::load_settings(self, config)
-    }
-
-    /// `encoder.cc:236-245`
-    fn encode_phrase(&mut self, phrase: &str, value: &str) -> bool {
+    /// `EncodePhrase` 的"自带收集方"版本（`encoder.cc:236-245` 的语义 + 显式 collector）。
+    ///
+    /// `self` 只需要 `&`：编码规则、tail anchor、exclude patterns 都是只读的。
+    /// 这让 [`crate::engine::gear::unity_table_encoder::UnityTableEncoder`] 能把
+    /// 自己的两个字段（反查表 + 用户词典）同时借进来当收集方。
+    pub fn encode_phrase_with(
+        &self,
+        collector: &mut dyn PhraseCollector,
+        phrase: &str,
+        value: &str,
+    ) -> bool {
         let phrase_length = phrase.chars().count() as i32;
         if phrase_length > self.max_phrase_length {
             return false;
         }
         let mut code = RawCode::new();
         let mut limit = K_ENCODER_DFS_LIMIT;
-        self.dfs_encode(phrase, value, 0, &mut code, &mut limit)
+        self.dfs_encode(collector, phrase, value, 0, &mut code, &mut limit)
+    }
+}
+
+/// `TableEncoder` + 一个绑定好的收集方 = C++ 的 `new TableEncoder(this)`。
+///
+/// 只有词典编译期（[`crate::dict::entry_collector`]）需要这种"绑死收集方"的形态；
+/// 引擎侧的 [`crate::engine::gear::unity_table_encoder::UnityTableEncoder`]
+/// 走 [`TableEncoder::encode_phrase_with`]，每次调用现拼收集方。
+///
+/// 这个类型**不是** `Send`/`Sync`（收集方往往是 `Rc<RefCell<..>>`），
+/// 但也只在单线程的编译流程里用 —— 拆开就是为了让 `TableEncoder` 本身能进引擎。
+pub struct BoundTableEncoder {
+    encoder: TableEncoder,
+    collector: Box<dyn PhraseCollector>,
+}
+
+impl BoundTableEncoder {
+    /// `new TableEncoder(this)`（`encoder.cc:27-28`）。
+    pub fn new(collector: Box<dyn PhraseCollector>) -> Self {
+        Self {
+            encoder: TableEncoder::new(),
+            collector,
+        }
+    }
+
+    /// 内层编码器的只读视图（规则数量之类）。
+    pub fn encoder(&self) -> &TableEncoder {
+        &self.encoder
+    }
+}
+
+impl Encoder for BoundTableEncoder {
+    fn load_settings(&mut self, config: &Value) -> bool {
+        self.encoder.load_settings(config)
+    }
+
+    /// `encoder.cc:236-245`
+    fn encode_phrase(&mut self, phrase: &str, value: &str) -> bool {
+        self.encoder
+            .encode_phrase_with(self.collector.as_mut(), phrase, value)
     }
 }
 
@@ -667,15 +719,39 @@ mod tests {
         assert_eq!(4, rules[2].min_word_length);
         assert_eq!(9, rules[2].max_word_length);
         assert_eq!(4, rules[0].coords.len());
-        assert_eq!((0, 0), (rules[0].coords[0].char_index, rules[0].coords[0].code_index));
-        assert_eq!((0, -1), (rules[0].coords[1].char_index, rules[0].coords[1].code_index));
-        assert_eq!((1, 0), (rules[0].coords[2].char_index, rules[0].coords[2].code_index));
-        assert_eq!((1, -1), (rules[0].coords[3].char_index, rules[0].coords[3].code_index));
+        assert_eq!(
+            (0, 0),
+            (rules[0].coords[0].char_index, rules[0].coords[0].code_index)
+        );
+        assert_eq!(
+            (0, -1),
+            (rules[0].coords[1].char_index, rules[0].coords[1].code_index)
+        );
+        assert_eq!(
+            (1, 0),
+            (rules[0].coords[2].char_index, rules[0].coords[2].code_index)
+        );
+        assert_eq!(
+            (1, -1),
+            (rules[0].coords[3].char_index, rules[0].coords[3].code_index)
+        );
         assert_eq!(4, rules[2].coords.len());
-        assert_eq!((0, 0), (rules[2].coords[0].char_index, rules[2].coords[0].code_index));
-        assert_eq!((1, 0), (rules[2].coords[1].char_index, rules[2].coords[1].code_index));
-        assert_eq!((2, 0), (rules[2].coords[2].char_index, rules[2].coords[2].code_index));
-        assert_eq!((-1, -1), (rules[2].coords[3].char_index, rules[2].coords[3].code_index));
+        assert_eq!(
+            (0, 0),
+            (rules[2].coords[0].char_index, rules[2].coords[0].code_index)
+        );
+        assert_eq!(
+            (1, 0),
+            (rules[2].coords[1].char_index, rules[2].coords[1].code_index)
+        );
+        assert_eq!(
+            (2, 0),
+            (rules[2].coords[2].char_index, rules[2].coords[2].code_index)
+        );
+        assert_eq!(
+            (-1, -1),
+            (rules[2].coords[3].char_index, rules[2].coords[3].code_index)
+        );
     }
 
     #[test]
@@ -805,15 +881,33 @@ mod tests {
         assert_eq!(
             rule.coords,
             vec![
-                CodeCoords { char_index: 0, code_index: 0 },
-                CodeCoords { char_index: -6, code_index: -6 },
-                CodeCoords { char_index: -1, code_index: -1 },
+                CodeCoords {
+                    char_index: 0,
+                    code_index: 0
+                },
+                CodeCoords {
+                    char_index: -6,
+                    code_index: -6
+                },
+                CodeCoords {
+                    char_index: -1,
+                    code_index: -1
+                },
             ]
         );
         // 奇数长度 / 非字母 → false
-        assert!(!TableEncoder::parse_formula("AaA", &mut TableEncodingRule::default()));
-        assert!(!TableEncoder::parse_formula("A1", &mut TableEncodingRule::default()));
-        assert!(!TableEncoder::parse_formula("1a", &mut TableEncodingRule::default()));
+        assert!(!TableEncoder::parse_formula(
+            "AaA",
+            &mut TableEncodingRule::default()
+        ));
+        assert!(!TableEncoder::parse_formula(
+            "A1",
+            &mut TableEncodingRule::default()
+        ));
+        assert!(!TableEncoder::parse_formula(
+            "1a",
+            &mut TableEncodingRule::default()
+        ));
     }
 
     #[test]
@@ -826,8 +920,8 @@ mod tests {
         let c0 = RawCode::from_string("abc def");
         let mut result = String::new();
         assert!(!encoder.encode(&c0, &mut result));
-        // EncodePhrase 对任何非空词也直接 false
-        assert!(!TableEncoder::encode_phrase(&mut encoder, "ab", "value"));
+        // EncodePhrase 对任何非空词也直接 false（max_phrase_length 是 0）
+        assert!(!encoder.encode_phrase_with(&mut Recorder::default(), "ab", "value"));
     }
 
     #[test]
@@ -859,13 +953,13 @@ mod tests {
             words: Rc::new(words),
         };
         let entries = recorder.entries.clone();
-        let mut encoder = TableEncoder::with_collector(Box::new(recorder));
+        let mut encoder = BoundTableEncoder::new(Box::new(recorder));
         // AaAzBaBz：每个字取"首码 + 尾码"
         let config = rules_config(serde_json::json!([
             { "length_equal": 2, "formula": "AaAzBaBz" }
         ]));
         assert!(encoder.load_settings(&config));
-        assert!(TableEncoder::encode_phrase(&mut encoder, "中国", "value"));
+        assert!(Encoder::encode_phrase(&mut encoder, "中国", "value"));
         let got = entries.borrow().clone();
         assert_eq!(got.len(), 4, "中2码 × 国2码 = 4 种组合: {got:?}");
         assert_eq!(got[0].0, "中国");
@@ -888,7 +982,7 @@ mod tests {
             words: Rc::new(words),
         };
         let entries = recorder.entries.clone();
-        let mut encoder = TableEncoder::with_collector(Box::new(recorder));
+        let mut encoder = BoundTableEncoder::new(Box::new(recorder));
         let config = serde_json::json!({
             "encoder": {
                 "rules": [{ "length_equal": 2, "formula": "AaBa" }],
@@ -896,7 +990,7 @@ mod tests {
             }
         });
         assert!(encoder.load_settings(&config));
-        assert!(TableEncoder::encode_phrase(&mut encoder, "中国", "value"));
+        assert!(Encoder::encode_phrase(&mut encoder, "中国", "value"));
         let got = entries.borrow().clone();
         assert!(got.iter().all(|(_, code, _)| code != "xg"), "{got:?}");
         assert!(got.iter().any(|(_, code, _)| code == "zg"));

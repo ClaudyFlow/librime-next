@@ -92,7 +92,8 @@ impl CollectorData {
         }
         if scaled {
             // C++：stod 失败 → percentage = 100.0
-            let percentage = parse_double_prefix(&weight_str[..weight_str.len() - 1]).unwrap_or(100.0);
+            let percentage =
+                parse_double_prefix(&weight_str[..weight_str.len() - 1]).unwrap_or(100.0);
             weight *= percentage / 100.0;
         } else if !weight_str.is_empty() {
             // C++：stod 失败 → 0.0
@@ -116,7 +117,9 @@ impl CollectorData {
         if is_word {
             let weights = self.words.entry(word.to_string()).or_default();
             if weights.iter().any(|(code, _)| code == code_str) {
-                log_warn(&format!("duplicate word definition '{word}': [{code_str}]."));
+                log_warn(&format!(
+                    "duplicate word definition '{word}': [{code_str}]."
+                ));
                 return;
             }
             weights.push((code_str.to_string(), weight));
@@ -219,7 +222,7 @@ impl EntryCollector {
         }
         let handle: Box<dyn PhraseCollector> = Box::new(CollectorHandle(self.data.clone()));
         let mut encoder: Box<dyn Encoder> = if settings.use_rule_based_encoder() {
-            Box::new(crate::algo::encoder::TableEncoder::with_collector(handle))
+            Box::new(crate::algo::encoder::BoundTableEncoder::new(handle))
         } else {
             Box::new(crate::algo::encoder::ScriptEncoder::new(handle))
         };
@@ -330,7 +333,9 @@ impl EntryCollector {
             }
             self.data.borrow_mut().collection.insert(word.clone());
             if !code_str.is_empty() {
-                self.data.borrow_mut().create_entry(&word, &code_str, &weight_str);
+                self.data
+                    .borrow_mut()
+                    .create_entry(&word, &code_str, &weight_str);
             } else {
                 self.data
                     .borrow_mut()
@@ -363,7 +368,9 @@ impl EntryCollector {
         };
         loop {
             let next = { self.data.borrow_mut().encode_queue.pop_front() };
-            let Some((phrase, weight_str)) = next else { break };
+            let Some((phrase, weight_str)) = next else {
+                break;
+            };
             if !encoder.encode_phrase(&phrase, &weight_str) {
                 log_error(&format!("Encode failure: '{phrase}'."));
             }
@@ -371,7 +378,12 @@ impl EntryCollector {
         // 预置词库补录：收集过的词不再进
         let has_preset = self.data.borrow().preset_vocabulary.is_some();
         if has_preset {
-            self.data.borrow_mut().preset_vocabulary.as_mut().unwrap().reset();
+            self.data
+                .borrow_mut()
+                .preset_vocabulary
+                .as_mut()
+                .unwrap()
+                .reset();
             loop {
                 let next = {
                     self.data
@@ -381,7 +393,9 @@ impl EntryCollector {
                         .unwrap()
                         .get_next_entry()
                 };
-                let Some((phrase, weight_str)) = next else { break };
+                let Some((phrase, weight_str)) = next else {
+                    break;
+                };
                 let already_collected = self.data.borrow().collection.contains(&phrase);
                 if already_collected {
                     continue;
@@ -472,10 +486,7 @@ sort: original
         assert_eq!(texts, vec!["你", "好", "你好"]);
         // 造出来的码是 "ni hao"（单音节拼接）
         let composed = entries.last().unwrap();
-        assert_eq!(
-            strings::join(composed.raw_code.iter(), " "),
-            "ni hao"
-        );
+        assert_eq!(strings::join(composed.raw_code.iter(), " "), "ni hao");
         assert_eq!(composed.weight, 0.0, "无权重列 → 0");
         std::fs::remove_file(&path).ok();
     }
@@ -541,7 +552,9 @@ columns:
         collector.collect(std::slice::from_ref(&path));
         let stems = collector.take_stems();
         assert_eq!(
-            stems.get("你好").map(|codes| codes.iter().cloned().collect::<Vec<_>>()),
+            stems
+                .get("你好")
+                .map(|codes| codes.iter().cloned().collect::<Vec<_>>()),
             Some(vec!["你好".to_string()]),
         );
         std::fs::remove_file(&path).ok();

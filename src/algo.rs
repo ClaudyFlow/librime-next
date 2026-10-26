@@ -53,20 +53,20 @@ pub mod utilities;
 
 pub use algebra::{Projection, Script};
 pub use calculus::{
-    Abbreviation, Calculation, Calculus, Correction, Derivation, Erasion, Factory, Fuzzing, Reorder,
-    Transformation, Transliteration, K_ABBREVIATION_PENALTY, K_CORRECTION_PENALTY,
-    K_FUZZY_SPELLING_PENALTY,
+    Abbreviation, Calculation, Calculus, Correction, Derivation, Erasion, Factory, Fuzzing,
+    K_ABBREVIATION_PENALTY, K_CORRECTION_PENALTY, K_FUZZY_SPELLING_PENALTY, Reorder,
+    Transformation, Transliteration,
 };
 pub use dynamics::{formula_d, formula_p};
 pub use encoder::{
-    CodeCoords, Encoder, PhraseCollector, RawCode, ScriptEncoder, TableEncoder, TableEncodingRule,
-    K_ENCODER_DFS_LIMIT, K_MAX_PHRASE_LENGTH,
+    BoundTableEncoder, CodeCoords, Encoder, K_ENCODER_DFS_LIMIT, K_MAX_PHRASE_LENGTH,
+    PhraseCollector, RawCode, ScriptEncoder, TableEncoder, TableEncodingRule,
 };
 pub use spelling::{Spelling, SpellingProperties, SpellingType};
-pub use strings::{join, split, split_default, SplitBehavior};
+pub use strings::{SplitBehavior, join, split, split_default};
 pub use syllabifier::{
-    Corrector, EdgeMap, EdgeProperties, EndVertexMap, InMemoryPrism, Prism, PrismMatch,
-    SpellingIndices, SpellingMap, SyllableGraph, SyllableId, Syllabifier, VertexMap,
-    K_COMPLETION_PENALTY, K_CORRECTION_CREDIBILITY,
+    Corrector, EdgeMap, EdgeProperties, EndVertexMap, InMemoryPrism, K_COMPLETION_PENALTY,
+    K_CORRECTION_CREDIBILITY, Prism, PrismMatch, SpellingIndices, SpellingMap, Syllabifier,
+    SyllableGraph, SyllableId, VertexMap,
 };
-pub use utilities::{compare_version_string, file_modified_time, to_time_t, ChecksumComputer};
+pub use utilities::{ChecksumComputer, compare_version_string, file_modified_time, to_time_t};

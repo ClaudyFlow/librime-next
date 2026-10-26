@@ -14,7 +14,7 @@
 |---|---|---|---|
 | 输入组件 | 22 / 35 | 35 / 35 | 落后，缺 13 项；出厂方案实际只引用其中 3 项 |
 | **整句组句（WordGraph + Poet）** | **有**，`src/engine/gear/poet.rs` + `Dictionary::lookup_from_graph` | 有，`ScriptSyllabifier::BuildSyllableGraph` + `Poet::MakeSentences` | **已对齐**（`b1b0125`）。`nihaoshijie` → 「你好世界」；`nihao` → 「你好」（精确词条不组句） |
-| 用户词典 UserDb 持久化 | **有**，`db.rs` + `level_db.rs`（rusty-leveldb）+ `user_db.rs` + `user_dictionary.rs`，并已接进 `script_translator` 的学词链路 | LevelDB 实装，`%APPDATA%/Rime-Next/userdb/` 下 4 个 `.userdb` 在用 | **已对齐**（`script_translator`）；`table_translator` 的用户词典/编码器仍缺，见第五节 |
+| 用户词典 UserDb 持久化 | **有**，`db.rs` + `level_db.rs`（rusty-leveldb）+ `user_db.rs` + `user_dictionary.rs`；`script_translator` 与 `table_translator` 两条学词链路都已打通，另补 `UnityTableEncoder` + `DictEntryIterator` | LevelDB 实装，`%APPDATA%/Rime-Next/userdb/` 下 4 个 `.userdb` 在用 | **已对齐**（拼音 + 形码双路） |
 | 语法模型 octagram grammar | **有**，`gram_db.rs` + `grammar.rs`（Darts trie + 紧凑 n-gram 编码 + 五元打分） | 有，4 个 `.gram` 共约 470 MB 在用 | **已对齐**（未提交时）。`zhongguoren` → 「中國人」排第一 |
 | TOML 解析 | 0 行（方案清单读 `schema.yaml`） | 手写 `toml_lite.cc` +259 行 | **领先**，补丁版这 259 行可归零 |
 
@@ -111,13 +111,24 @@ LRN 缺 lua 与补丁版**行为等价**，不列缺口。
 
 ## 五、待确认事项
 
-**`table_translator` 的用户词典还差一块**（2026-10-26）。`script_translator` 已经打通
-"查询用户词 → 选中 → 提交 → 写库 → 下次优先"的闭环（e2e `user_dict_learns_committed_phrase`），
-但 `table_translator`（形码，出厂 19 个文件在用）这边还缺：
+**`table_translator` 的学词闭环已补齐**（2026-10-26）。原先记的三处缺口全部落地：
+`UnityTableEncoder`（`src/engine/gear/unity_table_encoder.rs`）、`TableTranslator::memorize`
+的 `is_constructed(e)` 分支、表侧 `Dictionary::lookup_words` + `DictEntryIterator`。
+e2e `table_translator_wubi86_learns_committed_word` 走完"打 `wq` → 选「你」→ 提交 →
+`<user>/userdb/wubi86.userdb` 出现 `wq \t你` / `c=1` → 新会话以 `user_table` 身份排首"。
 
-* `UnityTableEncoder`（`table_encoder.cc`）—— 给"构造成码"的短语编码；
-* `TableTranslator::Memorize` 里 `is_constructed(e)` 的分支（要 `RemovePrefix` 掉构造前缀）；
-* `LookupWords` 那条 `code` 前缀路径（table 的候选码是字形码而非音节串）。
+移植这条路径时踩到的三个坑，已写进代码注释，重做时别再犯：
+
+1. **质量分是 `exp(weight)`，不是线性加权。** `table_translator.cc:311` 写的是
+   `std::exp(e->weight) + initial_quality`。形码词表权重来自 `table_db` 的 1e8 倍率，
+   `exp` 之后量级回落到个位数到百位；照抄拼音那套"音节数×1000+weight"会让所有形码候选
+   挤在同一档、排序失效。
+2. **chunk 排序 ≠ 权重排序。** `DictEntryIterator::AddChunk` 后做 `partial_sort`，
+   比较序是"精确匹配优先 → `remaining_code` 短的优先 → 权重降序"（`dictionary.cc:182-198`）。
+   只按权重排会让补全词压掉精确词。
+3. **`TableEncoder` 在 C++ 里是自引用设计。** 它 `set_collector(this)` 即"自己是自己的收集器"，
+   靠继承实现。Rust 做不出自引用，改成收集器走入参（`dfs_encode(collector, ...)`），
+   编码器只负责公式/排除项/尾锚，收集器由调用方给（`BoundTableEncoder::new(collector)`）。
 
 补丁版 patch 快照（Oct 25）里方案清单仍写 `schema/schema.toml`（靠 `toml_lite.cc` 解析），
 而 LRN 读 `<user>/schema/schema.yaml`。当前 `%APPDATA%/Rime-Next/schema/` 下**两个文件都在**。
@@ -147,9 +158,9 @@ grep -E 'r\.Register' /c/code/librime/src/rime/gear/gears_module.cc
 
 1. ~~整句组句 `WordGraph` + `Poet`~~ ✅ `b1b0125`
 2. ~~octagram grammar~~ ✅ `86aad8c`
-3. ~~UserDb 持久化~~ ✅ 字典层 + `script_translator` 学词闭环；
-   `table_translator` 侧还缺 Encoder（见第五节）　**← 继续做**
-4. `reverse_lookup_translator` + `reverse_lookup_filter` —— 18 个文件
+3. ~~UserDb 持久化~~ ✅ 字典层 + `script_translator` 学词闭环 + `table_translator`
+   学词闭环（`UnityTableEncoder` + `DictEntryIterator` + `lookup_words`）
+4. `reverse_lookup_translator` + `reverse_lookup_filter` —— 18 个文件　**← 继续做**
 5. `history_translator` —— 12 个文件
 6. `affix_segmentor` —— 6 个文件
 7. 其余 8 项（出厂 0 引用，按需再补）
@@ -157,6 +168,9 @@ grep -E 'r\.Register' /c/code/librime/src/rime/gear/gears_module.cc
 | 日期 | 变更 |
 |---|---|
 | 2026-10-26 | 建表。基准：组件 22/35、整句缺、UserDb 缺、grammar 缺、TOML 领先。simplifier + opencc 已端到端验证（`66ab7ab`） |
+| 2026-10-26 | 整句组句 ✅（`b1b0125`）；grammar ✅（`86aad8c`）；UserDb 字典层 ✅（`019da51`） |
+| 2026-10-26 | `script_translator` 学词闭环 ✅（`5387a9d`） |
+| 2026-10-26 | `table_translator` 学词闭环 ✅：`unity_table_encoder.rs`(230行) + `dict_entry_iterator.rs`(492行) + `Dictionary::lookup_words` + `TableTranslator::query` 三路合流。质量公式改为 `exp(weight)`。全量 **434 passed / 0 failed** |
 | 2026-10-26 | 补「整句组句」一层：核查 `ScriptTranslator` 为纯词级，`Poet`/`WordGraph` 未移植，grammar 因此无落点。定为第 1 优先级 |
 | 2026-10-26 | 整句组句落地（`b1b0125`）：`poet.rs` 560 行 + `lookup_from_graph` + `match_extra_code`。实测 `nihaoshijie`→「你好世界」、`nihao`→「你好」、`choose(0)` commit 全文 |
 | 2026-10-26 | grammar 落地：`gram_db.rs`（Darts + MappedFile）、`grammar.rs`（encode + Octagram 五元打分）、`data_roots` 架构。实测 `zhongguoren`→「中國人」；单测证明 `中国` 6.83 > `中果` -1.55 |

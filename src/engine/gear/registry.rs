@@ -34,17 +34,17 @@ use crate::engine::gear::ascii_composer::AsciiComposer;
 use crate::engine::gear::ascii_segmentor::AsciiSegmentor;
 use crate::engine::gear::editor::Editor;
 use crate::engine::gear::fallback_segmentor::FallbackSegmentor;
-use crate::engine::gear::key_binder::KeyBinder;
 use crate::engine::gear::filter::{Filter, SingleCharFilter, Uniquifier};
+use crate::engine::gear::key_binder::KeyBinder;
 use crate::engine::gear::matcher::Matcher;
 use crate::engine::gear::navigator::Navigator;
 use crate::engine::gear::poet::Poet;
-use crate::engine::gear::punctuator::{PunctSegmentor, PunctTranslator, Punctuator};
 use crate::engine::gear::processor::Processor;
+use crate::engine::gear::punctuator::{PunctSegmentor, PunctTranslator, Punctuator};
 use crate::engine::gear::recognizer::Recognizer;
 use crate::engine::gear::segmentor::Segmentor;
-use crate::engine::gear::simplifier::Simplifier;
 use crate::engine::gear::selector::Selector;
+use crate::engine::gear::simplifier::Simplifier;
 use crate::engine::gear::speller::Speller;
 use crate::engine::gear::table_translator::TableTranslator;
 use crate::engine::gear::translator::{ScriptTranslator, Translator};
@@ -114,7 +114,10 @@ impl<'a> Ticket<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Condition {
     /// `- some_option` / `- !some_option` / `{ option: x, value: true }`
-    Option { name: String, expected: bool },
+    Option {
+        name: String,
+        expected: bool,
+    },
     AllOf(Vec<Condition>),
     AnyOf(Vec<Condition>),
     NoneOf(Vec<Condition>),
@@ -187,10 +190,7 @@ impl Condition {
     }
 }
 
-fn has_exact_keys(
-    map: &serde_json::Map<String, Value>,
-    expected: &[&str],
-) -> bool {
+fn has_exact_keys(map: &serde_json::Map<String, Value>, expected: &[&str]) -> bool {
     map.len() == expected.len() && expected.iter().all(|k| map.contains_key(*k))
 }
 
@@ -288,13 +288,8 @@ where
             );
             continue;
         };
-        let ticket = Ticket::from_prescription(
-            component_type,
-            &prescription,
-            config,
-            build_dir,
-            data_roots,
-        );
+        let ticket =
+            Ticket::from_prescription(component_type, &prescription, config, build_dir, data_roots);
         let Some(component) = make(&ticket) else {
             eprintln!("[registry] error creating {component_type}: '{prescription}'");
             continue;
@@ -334,7 +329,8 @@ pub fn create_filter(ticket: &Ticket) -> Option<Box<dyn Filter + Send + Sync>> {
             // opencc 数据在 `<root>/opencc`。`build_dir` 在生产里是 `<用户目录>/build`，
             // 而 opencc 落在**共享目录** —— 所以必须按 roots 逐个试，不能只看 `build_dir.parent()`。
             for root in ticket.data_roots {
-                if let Some(simplifier) = Simplifier::new(&root.join("opencc"), config_name, option_name.clone())
+                if let Some(simplifier) =
+                    Simplifier::new(&root.join("opencc"), config_name, option_name.clone())
                 {
                     return Some(Box::new(simplifier));
                 }
@@ -387,7 +383,29 @@ pub fn create_translator(ticket: &Ticket) -> Option<Box<dyn Translator + Send + 
                 &dict_name,
                 &prism_name,
             )?;
-            Some(Box::new(TableTranslator::new(dict, options)))
+            let mut translator = TableTranslator::new(dict, options);
+            // 用户词典（学词 / 调频）：C++ 里是 `Translator` 基类的 `user_dict_`
+            if let Some(user_dict) = create_user_dictionary(ticket, &dict_name) {
+                translator = translator.with_user_dict(user_dict);
+            }
+            // 规则编码器：`enable_encoder_ && user_dict_`（`table_translator.cc:231`），
+            // 且默认 **false** —— 只有仓颉/郑码这类"按公式取码"的方案才开。
+            let enable_encoder = ticket
+                .config
+                .pointer(&format!("/{}/enable_encoder", ticket.name_space))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if enable_encoder && translator.user_dict.is_some() {
+                if let Some(encoder) =
+                    crate::engine::gear::unity_table_encoder::UnityTableEncoder::load(
+                        ticket.build_dir,
+                        &dict_name,
+                    )
+                {
+                    translator = translator.with_encoder(encoder);
+                }
+            }
+            Some(Box::new(translator))
         }
         "script_translator" | "r10n_translator" => {
             let (dict_name, prism_name) = translator_dict_name(ticket)?;
@@ -645,7 +663,13 @@ mod tests {
     #[test]
     fn name_space_defaults_to_component_type() {
         let config = json!({});
-        let t = Ticket::from_prescription("translator", "table_translator", &config, Path::new(""), &[]);
+        let t = Ticket::from_prescription(
+            "translator",
+            "table_translator",
+            &config,
+            Path::new(""),
+            &[],
+        );
         assert_eq!(t.klass, "table_translator");
         assert_eq!(t.name_space, "translator");
 
@@ -658,7 +682,13 @@ mod tests {
     #[test]
     fn table_translator_reads_the_translator_node() {
         let config = json!({"translator": {"dictionary": "stroke", "prism": "stroke"}});
-        let t = Ticket::from_prescription("translator", "table_translator", &config, Path::new(""), &[]);
+        let t = Ticket::from_prescription(
+            "translator",
+            "table_translator",
+            &config,
+            Path::new(""),
+            &[],
+        );
         assert_eq!(
             translator_dict_name(&t),
             Some(("stroke".to_string(), "stroke".to_string()))

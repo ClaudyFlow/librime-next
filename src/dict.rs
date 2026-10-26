@@ -67,6 +67,7 @@
 pub mod darts;
 pub mod db;
 pub mod dict_compiler;
+pub mod dict_entry_iterator;
 pub mod dict_settings;
 pub mod dictionary;
 pub mod entry_collector;
