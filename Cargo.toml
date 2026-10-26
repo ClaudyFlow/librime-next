@@ -34,6 +34,10 @@ path = "src/main.rs"
 # ---------------------------------------------------------------------------
 
 [[test]]
+name = "all_schemas_e2e"
+path = "test/all_schemas_e2e.rs"
+
+[[test]]
 name = "algebra_real_rules"
 path = "test/algebra_real_rules.rs"
 
@@ -68,6 +72,14 @@ path = "example/deploy_diff.rs"
 [[example]]
 name = "deploy_luna"
 path = "example/deploy_luna.rs"
+
+[[example]]
+name = "probe_yuling2"
+path = "example/probe_yuling2.rs"
+
+[[example]]
+name = "probe_yuling"
+path = "example/probe_yuling.rs"
 
 [[example]]
 name = "deploy_real"
