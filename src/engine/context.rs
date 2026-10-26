@@ -37,6 +37,12 @@ pub struct Context {
     pub page_size: usize,
     pub options: HashMap<String, bool>,
     pub properties: HashMap<String, String>,
+    /// 本次提交里选中的词条（C++ `CommitEntry::elements`）。
+    ///
+    /// `commit()` / 整段 `select()` 会把它填上，[`crate::engine::runtime::Engine::apply_commit`]
+    /// 取走并分发给各 translator 学词。放在 `Context` 里而不是直接回调 Engine，
+    /// 是因为 processor（editor）只拿得到 `&mut Context`。
+    pub pending_commit_elements: Vec<crate::dict::vocabulary::DictEntry>,
 }
 
 impl Context {
@@ -148,6 +154,8 @@ impl Context {
             // 整段覆盖：拼接已确认前缀，提交
             let mut text = std::mem::take(&mut self.committed_prefix);
             text.push_str(&cand.text);
+            // 提交前收词条（`clear()` 会把 segmentation 清掉）
+            self.collect_commit_elements();
             self.clear();
             self.commit_text = Some(text.clone());
             Some(SelectResult::Committed(text))
@@ -325,9 +333,36 @@ impl Context {
             return false;
         }
         let text = self.get_commit_text();
+        self.collect_commit_elements();
         self.clear();
         self.commit_text = Some(text);
         true
+    }
+
+    /// 把各段**已选中**候选挂着的词条收进 `pending_commit_elements`。
+    ///
+    /// 对应 C++ `Context::commit()` 里 `CommitEntry` 的构建：`elements` 是
+    /// `segment.GetSelectedCandidate()->entry` 的集合，之后由
+    /// `Engine::ApplyCommit` 播给每个 translator 的 `Memorize`。
+    pub fn collect_commit_elements(&mut self) {
+        let mut elements = Vec::new();
+        for segment in &self.composition.segmentation.segments {
+            if let Some(candidate) = segment
+                .menu
+                .as_ref()
+                .and_then(|menu| menu.candidate_at(segment.selected_index))
+            {
+                if let Some(entry) = &candidate.entry {
+                    elements.push(entry.clone());
+                }
+            }
+        }
+        self.pending_commit_elements = elements;
+    }
+
+    /// 取走待学词的词条（`Engine::apply_commit` 用）。
+    pub fn take_commit_elements(&mut self) -> Vec<crate::dict::vocabulary::DictEntry> {
+        std::mem::take(&mut self.pending_commit_elements)
     }
 
     /// C++ `engine_->sink()(text)`：不经组合**直接**把一段文本送进提交管道。

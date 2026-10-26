@@ -403,9 +403,78 @@ pub fn create_translator(ticket: &Ticket) -> Option<Box<dyn Translator + Send + 
             if let Some(octagram) = crate::engine::gear::grammar::create(ticket.config, &roots) {
                 translator = translator.with_poet(Poet::new(Some(Box::new(octagram))));
             }
+            // 用户词典（学词 / 调频）：`Translator::user_dict_`
+            if let Some(user_dict) = create_user_dictionary(ticket, &dict_name) {
+                translator = translator.with_user_dict(user_dict);
+            }
             Some(Box::new(translator))
         }
         _ => None,
+    }
+}
+
+/// C++ `UserDictionaryComponent::Create(ticket)`（`user_dictionary.cc:595-620`）。
+///
+/// 取名字的顺序照抄：
+///
+/// 1. `enable_user_dict` 默认 **true**，显式 `false` 就不建；
+/// 2. 名字先看 `user_dict`，没有再取 `dictionary` 并**去掉 `.extra` 后缀**
+///    （`{dictionary: luna_pinyin.extra}` 隐含 `{user_dict: luna_pinyin}`，
+///    C++ 用 `Language::get_language_component` 干这事）；
+/// 3. `db_class` 默认 `userdb`；只实现了 userdb 后端，别的类名直接不建。
+///
+/// 目录是 `<用户文件夹>/userdb/<名字>.userdb`（`lever::paths::Layout::user_db_dir`）。
+fn create_user_dictionary(
+    ticket: &Ticket,
+    dict_name: &str,
+) -> Option<crate::dict::user_dictionary::UserDictionary> {
+    let pointer = |key: &str| format!("/{}/{key}", ticket.name_space);
+    let enable = ticket
+        .config
+        .pointer(&pointer("enable_user_dict"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if !enable {
+        return None;
+    }
+    let db_class = ticket
+        .config
+        .pointer(&pointer("db_class"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("userdb");
+    if db_class != "userdb" {
+        eprintln!("[registry] unsupported user db class '{db_class}', skipping user dict.");
+        return None;
+    }
+    let name = ticket
+        .config
+        .pointer(&pointer("user_dict"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| language_component(dict_name));
+    // `data_roots[0]` = 用户文件夹（见 `c_api::Global::data_roots`）
+    let user_dir = ticket.data_roots.first()?;
+    let db_dir = user_dir.join(crate::lever::paths::USERDB_DIR);
+    if let Err(e) = std::fs::create_dir_all(&db_dir) {
+        eprintln!("[registry] cannot create userdb dir {db_dir:?}: {e}");
+        return None;
+    }
+    let db = std::sync::Arc::new(crate::dict::level_db::LevelDb::new_user_db(&db_dir, &name));
+    let mut user_dict = crate::dict::user_dictionary::UserDictionary::new(&name, db);
+    if !user_dict.load() {
+        eprintln!("[registry] failed to load user dict '{name}', continuing without it.");
+        return None;
+    }
+    Some(user_dict)
+}
+
+/// `Language::get_language_component(name)`：砍掉第一个 `.` 及其后缀。
+///
+/// `luna_pinyin.extra` → `luna_pinyin`；`luna_pinyin` → `luna_pinyin`。
+fn language_component(name: &str) -> String {
+    match name.split_once('.') {
+        Some((head, _)) => head.to_string(),
+        None => name.to_string(),
     }
 }
 

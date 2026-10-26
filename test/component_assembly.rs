@@ -13,10 +13,24 @@ fn build_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test/e2e/build")
 }
 
+/// 装配引擎时给一个**临时用户目录**：`script_translator` 会在这里建
+/// `<user>/userdb/`，不能落到仓库的 `test/e2e/` 里。
+fn make_engine(schema: &str) -> Option<Engine> {
+    let user_dir = std::env::temp_dir().join(format!(
+        "lrn_assembly_user_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::create_dir_all(&user_dir);
+    Engine::create_with_roots(&build_dir(), schema, &[user_dir, build_dir()])
+}
+
 #[test]
 fn real_schema_assembles_processors_from_config() {
-    let engine = Engine::create(&build_dir(), "luna_pinyin_simp")
-        .expect("luna_pinyin_simp 引擎应能加载");
+    let engine = make_engine("luna_pinyin_simp").expect("luna_pinyin_simp 引擎应能加载");
     let names = engine.processor_names();
     println!("processors = {names:?}");
     println!("translators = {:?}", engine.translator_names());
@@ -74,8 +88,7 @@ fn real_schema_assembles_processors_from_config() {
 
 #[test]
 fn translator_is_created_from_engine_translators_list() {
-    let engine = Engine::create(&build_dir(), "luna_pinyin_simp")
-        .expect("luna_pinyin_simp 引擎应能加载");
+    let engine = make_engine("luna_pinyin_simp").expect("luna_pinyin_simp 引擎应能加载");
     let names = engine.translator_names();
     println!("translators = {names:?}");
     assert!(
@@ -87,8 +100,7 @@ fn translator_is_created_from_engine_translators_list() {
 #[test]
 fn multi_segment_input_produces_raw_then_abc() {
     // 分段框架的意义：输入不再是"一大段"，而是按规则切成若干段分别翻译。
-    let mut engine = Engine::create(&build_dir(), "luna_pinyin_simp")
-        .expect("luna_pinyin_simp 引擎应能加载");
+    let mut engine = make_engine("luna_pinyin_simp").expect("luna_pinyin_simp 引擎应能加载");
     // 空格不在 `speller/alphabet` 里 → fallback_segmentor 切成 raw 段；
     // 后面的字母由 abc_segmentor 切成 abc 段。
     engine.context.input = " zho".to_string();
@@ -117,8 +129,7 @@ fn multi_segment_input_produces_raw_then_abc() {
 
 #[test]
 fn filters_are_assembled_from_config() {
-    let engine = Engine::create(&build_dir(), "luna_pinyin_simp")
-        .expect("luna_pinyin_simp 引擎应能加载");
+    let engine = make_engine("luna_pinyin_simp").expect("luna_pinyin_simp 引擎应能加载");
     let names = engine.filter_names();
     println!("filters = {names:?}");
     // 真实方案至少声明了 uniquifier；它必须真的挂到链上（不再只是个名字）
@@ -130,8 +141,7 @@ fn filters_are_assembled_from_config() {
 
 #[test]
 fn uniquifier_removes_duplicate_candidates_real_dict() {
-    let mut engine = Engine::create(&build_dir(), "luna_pinyin_simp")
-        .expect("luna_pinyin_simp 引擎应能加载");
+    let mut engine = make_engine("luna_pinyin_simp").expect("luna_pinyin_simp 引擎应能加载");
     engine.context.input = "nihao".to_string();
     engine.context.caret_pos = 5;
     engine.compose();

@@ -1,5 +1,7 @@
 //! `src/rime/candidate.{h,cc}`：候选词条 + 候选页。
 
+use crate::dict::vocabulary::DictEntry;
+
 /// 一条候选（对照 C++ `Candidate` / `SimpleCandidate`）。
 #[derive(Clone, Debug, PartialEq)]
 pub struct Candidate {
@@ -16,6 +18,14 @@ pub struct Candidate {
     pub comment: String,
     /// 在 preedit 区替换输入串显示的文本，可选。
     pub preedit: String,
+    /// 产出这条候选的词典词条（`DictEntry`）。
+    ///
+    /// C++ 的 `CommitEntry::elements` 是 `vector<const DictEntry*>`，
+    /// 由 `Segment::GetSelectedCandidate()` 一路带出来，最终交给
+    /// `Translator::Memorize` 学词。Rust 侧直接把词条挂在候选上 ——
+    /// 没有它就无法在提交时知道"用户选的到底是哪条词条"。
+    /// 组句候选 / 标点候选这类没有词条的，保持 `None`。
+    pub entry: Option<DictEntry>,
 }
 
 impl Candidate {
@@ -28,6 +38,7 @@ impl Candidate {
             text: text.into(),
             comment: String::new(),
             preedit: String::new(),
+            entry: None,
         }
     }
 
@@ -38,6 +49,12 @@ impl Candidate {
 
     pub fn with_preedit(mut self, preedit: impl Into<String>) -> Self {
         self.preedit = preedit.into();
+        self
+    }
+
+    /// 挂上产出这条候选的词典词条（学词要用）。
+    pub fn with_entry(mut self, entry: DictEntry) -> Self {
+        self.entry = Some(entry);
         self
     }
 }

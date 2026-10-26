@@ -51,6 +51,9 @@ impl Session {
             return false;
         };
         let ok = engine.context.commit_composition();
+        // `commit_composition` 走的是 `Context::select`，绕过了 `process_key`，
+        // 所以学词得在这儿补一次。
+        engine.apply_commit();
         if let Some(t) = engine.context.commit_text.take() {
             self.commit_text = Some(t);
         }
@@ -79,6 +82,8 @@ impl Session {
             return None;
         };
         let result = engine.context.select(idx);
+        // `select` 可能直接提交（整段覆盖 / 逐段确认完毕），学词要跟上
+        engine.apply_commit();
         if matches!(result, Some(SelectResult::Continued)) {
             engine.context.highlight(0);
             engine.compose();

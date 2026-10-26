@@ -184,7 +184,30 @@ impl Engine {
         if self.context.input != input_before {
             self.compose();
         }
+        // 提交可能发生在任何一个 processor 里（editor 的 space / enter / 数字键），
+        // 处理器只拿得到 `&mut Context`，所以学词在这里补。
+        self.apply_commit();
         result
+    }
+
+    /// C++ `Engine::ApplyCommit(commit_entry)`：把刚提交的内容交给各翻译器学词。
+    ///
+    /// 词条由 [`crate::engine::context::Context::collect_commit_elements`] 在提交瞬间
+    /// 收好（那时 `segmentation` 还在），这里只负责分发。没有用户词典的翻译器
+    /// 走 trait 的默认实现，什么都不做。
+    pub fn apply_commit(&mut self) {
+        let elements = self.context.take_commit_elements();
+        if elements.is_empty() {
+            return;
+        }
+        // 同样的借用规避：`memorize` 要 `&mut self`，先把列表取到局部
+        let mut translators = std::mem::take(&mut self.translators);
+        for entry in &mut translators {
+            if entry.is_enabled() {
+                entry.component.memorize(&elements);
+            }
+        }
+        self.translators = translators;
     }
 
     /// C++ `ConcreteEngine::ProcessSyntheticKey`：由组件（如 key_binder 的 `send:`）

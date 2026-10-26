@@ -2,6 +2,8 @@
 
 use crate::algo::syllabifier::{SyllableGraph, Syllabifier};
 use crate::dict::dictionary::Dictionary;
+use crate::dict::user_dictionary::UserDictionary;
+use crate::dict::vocabulary::DictEntry;
 use crate::engine::candidate::Candidate;
 use crate::engine::gear::poet::{Poet, Sentence, WordGraph};
 use crate::engine::gear::translator_options::TranslatorOptions;
@@ -12,6 +14,14 @@ use crate::engine::gear::translator_options::TranslatorOptions;
 /// 降序排，所以把"整句优先"编码进分数里。见 [`ScriptTranslator::sentence_candidates`]。
 const SENTENCE_QUALITY_BASE: f64 = 1.0e6;
 
+/// 用户词典候选的 `quality` 基数：排在**整句之后、词表之前**。
+///
+/// C++ 的 `ScriptTranslation::Evaluate` 给用户词典词条一个 `credibility` 加成
+/// （`kUserDict` 分支），靠 `Translation` 内部的排序把它顶到词表词条前面。
+/// LRN 的菜单是单一 `quality` 排序，所以用一个高于词级（`音节数 * 1000 + weight`，
+/// 实测量级 1e3~1e4）但低于整句（1e6）的基数来表达"学过的最优先"。
+const USER_DICT_QUALITY_BASE: f64 = 1.0e5;
+
 /// 翻译器（对照 C++ `Translator::Query(input, segment)`）。
 ///
 /// `seg_tags` 是本段命中的标签集：翻译器用它决定是否认领这段
@@ -19,6 +29,14 @@ const SENTENCE_QUALITY_BASE: f64 = 1.0e6;
 pub trait Translator {
     /// 给定一段输入串，产出候选列表（位置**相对本段**，候选各带覆盖到的 `end`）。
     fn query(&mut self, input: &str, start: usize, seg_tags: &[String]) -> Vec<Candidate>;
+
+    /// `Translator::Memorize(commit_entry)`：一次提交里选中的词条交回来学。
+    ///
+    /// C++ 在 `Context::commit()` 里把 `CommitEntry::elements` 播给每个 translator；
+    /// 只有带用户词典的实现会真的写库，默认实现什么都不做。
+    fn memorize(&mut self, _elements: &[DictEntry]) -> bool {
+        false
+    }
 }
 
 /// 拼音翻译器：把输入按音节图切分，逐切分查 `.table.bin` 得词条。
@@ -32,6 +50,9 @@ pub struct ScriptTranslator {
     /// 组句器（`poet.cc`）。没有 grammar 时内部走动态规划，等价 C++ 的
     /// `Poet::MakeSentenceWithStrategy<DynamicProgramming>`。
     pub poet: Poet,
+    /// 用户词典（`Translator::user_dict_`）。`None` = 方案没开 `enable_user_dict`
+    /// 或者拿不到词典名。
+    pub user_dict: Option<UserDictionary>,
 }
 
 impl ScriptTranslator {
@@ -44,7 +65,14 @@ impl ScriptTranslator {
             dict,
             options,
             poet: Poet::new(None),
+            user_dict: None,
         }
+    }
+
+    /// 挂上用户词典（`Translator::user_dict_`）。
+    pub fn with_user_dict(mut self, user_dict: UserDictionary) -> Self {
+        self.user_dict = Some(user_dict);
+        self
     }
 
     /// 换上带语法模型的组句器（`Poet` 里 `grammar` 非空即走束搜索）。
@@ -224,6 +252,49 @@ impl ScriptTranslator {
         let word_graph = self.prepare_word_graph(&graph, consumed);
         self.poet.make_sentences(&word_graph, consumed, "", 5, 0.1)
     }
+
+    /// 用户词典候选（`script_translator.cc` 里 `user_dict_->Lookup(...)` 那段）。
+    ///
+    /// C++ 把用户词典词条塞进同一个 `ScriptTranslation`，靠 `credibility` 加成
+    /// 顶到词表词条前面；LRN 用 [`USER_DICT_QUALITY_BASE`] 表达同一件事。
+    ///
+    /// `predict_word_from_depth` 传 0（`script_translator` 出厂方案不开预测），
+    /// 与 C++ 的 `user_dict_->Lookup(syllable_graph, start, 0, 0)` 一致。
+    fn user_dict_candidates(&mut self, input: &str) -> Vec<Candidate> {
+        if self.user_dict.is_none() {
+            return Vec::new();
+        }
+        // 先把音节图算出来：`build_graph` 借 `&self`，不能和 `user_dict` 的可变借用共存
+        let Some((graph, _consumed)) = self.build_graph(input) else {
+            return Vec::new();
+        };
+        let Some(user_dict) = self.user_dict.as_mut() else {
+            return Vec::new();
+        };
+        if !user_dict.loaded() {
+            return Vec::new();
+        }
+        let Some(collector) = user_dict.lookup(&self.dict, &graph, 0, 0, 0, 0.0) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (end, iterator) in collector {
+            for entry in iterator.into_entries().0 {
+                if self.options.blacklist.contains(&entry.text) {
+                    continue;
+                }
+                let quality = USER_DICT_QUALITY_BASE + entry.weight;
+                let mut candidate =
+                    Candidate::new("script", 0, end, entry.text.clone(), quality).with_entry(entry);
+                let preedit = self.build_preedit(input, end);
+                if !preedit.is_empty() {
+                    candidate = candidate.with_preedit(preedit);
+                }
+                out.push(candidate);
+            }
+        }
+        out
+    }
 }
 
 impl Translator for ScriptTranslator {
@@ -237,34 +308,65 @@ impl Translator for ScriptTranslator {
             return Vec::new();
         }
         let mut out: Vec<Candidate> = self.sentence_candidates(input);
-        out.extend(
-            self.dict
-                .translate(input)
-                .into_iter()
-                .filter(|e| !self.options.blacklist.contains(&e.text))
-                .map(|e| {
-                    let mut c = Candidate::new(
-                        "script",
-                        0,
-                        e.end,
-                        e.text,
-                        e.quality + self.options.initial_quality,
-                    );
-                    if !e.comment.is_empty() {
-                        c = c.with_comment(e.comment);
-                    }
-                    // 构造 preedit 串并套 preedit_formatter。
-                    let preedit = self.build_preedit(input, e.end);
-                    if !preedit.is_empty() {
-                        c = c.with_preedit(preedit);
-                    }
-                    c
-                }),
-        );
+        let mut words: Vec<Candidate> = self
+            .dict
+            .translate(input)
+            .into_iter()
+            .filter(|e| !self.options.blacklist.contains(&e.text))
+            .map(|e| {
+                let quality = e.quality + self.options.initial_quality;
+                // 词条挂到候选上：用户选中后要靠它学词（`Translator::Memorize`）
+                let mut vocabulary_entry = crate::dict::vocabulary::DictEntry::default();
+                vocabulary_entry.text = e.text.clone();
+                vocabulary_entry.code = e.code.clone();
+                vocabulary_entry.weight = e.weight;
+                let mut c = Candidate::new("script", 0, e.end, e.text, quality)
+                    .with_entry(vocabulary_entry);
+                if !e.comment.is_empty() {
+                    c = c.with_comment(e.comment);
+                }
+                // 构造 preedit 串并套 preedit_formatter。
+                let preedit = self.build_preedit(input, e.end);
+                if !preedit.is_empty() {
+                    c = c.with_preedit(preedit);
+                }
+                c
+            })
+            .collect();
+
+        // 用户词典：学过的词优先。同文本去重时**保留用户词条**，
+        // 这样再选一次还会累加到同一条 userdb 记录上。
+        let user = self.user_dict_candidates(input);
+        if !user.is_empty() {
+            let user_texts: std::collections::HashSet<&str> =
+                user.iter().map(|c| c.text.as_str()).collect();
+            words.retain(|c| !user_texts.contains(c.text.as_str()));
+            out.extend(user);
+        }
+        out.append(&mut words);
+
         for c in &mut out {
             self.options.format_comment(&mut c.comment);
             self.options.format_preedit(&mut c.preedit);
         }
         out
+    }
+
+    /// `TableTranslator::Memorize` / `ScriptTranslator::Memorize`：
+    /// 把这次提交里选中的词条逐条 `UpdateEntry(entry, 1)`。
+    fn memorize(&mut self, elements: &[DictEntry]) -> bool {
+        let Some(user_dict) = self.user_dict.as_mut() else {
+            return false;
+        };
+        if !user_dict.loaded() || user_dict.readonly() {
+            return false;
+        }
+        let mut written = false;
+        for entry in elements {
+            if user_dict.update_entry(&self.dict, entry, 1) {
+                written = true;
+            }
+        }
+        written
     }
 }

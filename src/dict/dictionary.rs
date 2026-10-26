@@ -29,6 +29,11 @@ pub struct DictEntry {
     /// 覆盖到的输入字节位置（选择此候选将消费到此处）。
     pub end: usize,
     pub comment: String,
+    /// 该词条对应的音节码（`Code` = `Vec<SyllableId>`）。
+    ///
+    /// 学词要用：`UserDictionary::UpdateEntry` 在 `custom_code` 为空时靠它
+    /// 反查出 `"ni hao "` 这样的码串，拼成 userdb 的键。
+    pub code: Code,
 }
 
 /// 词典（对照 C++ `Dictionary`）：持有 Prism（拼写→音节）+ Table（音节码→词条）。
@@ -102,6 +107,7 @@ impl Dictionary {
                                 quality: syllables * 1000.0 + weight,
                                 end: start,
                                 comment: String::new(),
+                                code: code.clone(),
                             });
                         }
                     }

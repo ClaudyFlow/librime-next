@@ -11,6 +11,29 @@ fn build_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test/e2e/build")
 }
 
+
+/// 用户文件夹的临时根：学词会写 `<user>/userdb/`。
+///
+/// **绝不能让它落到 `test/e2e/` 里** —— 上一轮学到的词会改变下一轮的候选顺序，
+/// 测试就不确定了。每次建 Session 给一个全新的临时目录，测试之间互不影响。
+fn fresh_user_dir(tag: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "lrn_e2e_user_{}_{n}_{tag}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// 建一个会话：数据根 = [本次专属临时用户目录, 构建目录]。
+fn new_session(build: &std::path::Path, schema: &str) -> Session {
+    let user_dir = fresh_user_dir(schema);
+    Session::create_with_roots(build, schema, &[user_dir, build.to_path_buf()])
+}
+
 /// 把一个 ASCII 串逐个字符作为按键喂给会话。
 fn type_ascii(session: &mut Session, s: &str) {
     for ch in s.chars() {
@@ -21,7 +44,7 @@ fn type_ascii(session: &mut Session, s: &str) {
 
 #[test]
 fn engine_loads_luna_pinyin_simp() {
-    let session = Session::create(&build_dir(), "luna_pinyin_simp");
+    let session = new_session(&build_dir(), "luna_pinyin_simp");
     assert!(
         session.engine.is_some(),
         "luna_pinyin_simp 引擎应能加载（检查 .schema.yaml / .bin 路径）"
@@ -120,7 +143,7 @@ fn debug_spelling_map() {
 
 #[test]
 fn engine_translates_nihao_to_candidates() {
-    let mut session = Session::create(&build_dir(), "luna_pinyin_simp");
+    let mut session = new_session(&build_dir(), "luna_pinyin_simp");
     type_ascii(&mut session, "nihao");
 
     let ctx = session.context().expect("应有上下文");
@@ -148,7 +171,7 @@ fn engine_translates_nihao_to_candidates() {
 
 #[test]
 fn engine_select_commit_nihao() {
-    let mut session = Session::create(&build_dir(), "luna_pinyin_simp");
+    let mut session = new_session(&build_dir(), "luna_pinyin_simp");
     type_ascii(&mut session, "nihao");
 
     let idx = {
@@ -179,7 +202,7 @@ fn engine_select_commit_nihao() {
 #[test]
 fn engine_per_syllable_confirmation() {
     // 逐音节确认：先选「你」(end=2)，剩余 "hao" 继续组字，再选「好」。
-    let mut session = Session::create(&build_dir(), "luna_pinyin_simp");
+    let mut session = new_session(&build_dir(), "luna_pinyin_simp");
     type_ascii(&mut session, "nihao");
 
     let ni_idx = {
@@ -234,7 +257,7 @@ fn key_binder_forwards_control_h_as_backspace() {
     // 真实方案里有 `{accept: "Control+h", send: BackSpace, when: composing}`：
     // key_binder 命中后把 BackSpace 塞回处理器链，等于"用 Ctrl+H 当退格"。
     // 这条端到端断言同时证明了三件事：绑定读到、转发生效、datordeleted 真的发生了。
-    let mut session = Session::create(&build_dir(), "luna_pinyin_simp");
+    let mut session = new_session(&build_dir(), "luna_pinyin_simp");
     type_ascii(&mut session, "nihao");
 
     let control_mask = librime_next::engine::key_event::K_CONTROL_MASK;
@@ -251,7 +274,7 @@ fn key_binder_forwards_control_h_as_backspace() {
 fn punctuator_turns_comma_into_full_width() {
     // 真实方案的 `punctuator/half_shape` 里 `,` 是 `{commit: "，"}`：
     // Punctuator 吃掉按键 → punct_segmentor 打标签 → punct_translator 出候选 → 直接上屏。
-    let mut session = Session::create(&build_dir(), "luna_pinyin_simp");
+    let mut session = new_session(&build_dir(), "luna_pinyin_simp");
     assert!(
         session.process_key(b',' as u32, 0),
         "逗号应被 punctuator 消费"
@@ -278,7 +301,7 @@ fn double_pinyin_build_dir() -> PathBuf {
 
 #[test]
 fn engine_loads_double_pinyin_ziranma() {
-    let session = Session::create(&double_pinyin_build_dir(), "double_pinyin_ziranma");
+    let session = new_session(&double_pinyin_build_dir(), "double_pinyin_ziranma");
     assert!(
         session.engine.is_some(),
         "double_pinyin_ziranma 引擎应能加载"
@@ -287,7 +310,7 @@ fn engine_loads_double_pinyin_ziranma() {
 
 #[test]
 fn engine_translates_double_pinyin_ziranma() {
-    let mut session = Session::create(&double_pinyin_build_dir(), "double_pinyin_ziranma");
+    let mut session = new_session(&double_pinyin_build_dir(), "double_pinyin_ziranma");
     type_ascii(&mut session, "nihk");
 
     let ctx = session.context().expect("应有上下文");
@@ -313,7 +336,7 @@ fn engine_translates_double_pinyin_ziranma() {
 fn double_pinyin_preedit_shows_full_syllables() {
     // preedit_format 应该把双拼键位还原成完整拼音，
     // 而不是显示裸键位 "nihk"。
-    let mut session = Session::create(&double_pinyin_build_dir(), "double_pinyin_ziranma");
+    let mut session = new_session(&double_pinyin_build_dir(), "double_pinyin_ziranma");
     type_ascii(&mut session, "nihk");
 
     let preedit = session.context().map(|c| c.get_preedit()).expect("应有预编辑");
@@ -333,7 +356,7 @@ fn double_pinyin_preedit_shows_full_syllables() {
 #[test]
 fn table_translator_wubi86_produces_candidates() {
     // wubi86 引擎（table_translator + 真实词典）应加载并出候选。
-    let mut session = Session::create(&build_dir(), "wubi86");
+    let mut session = new_session(&build_dir(), "wubi86");
     assert!(session.engine.is_some(), "wubi86 引擎应加载");
 
     type_ascii(&mut session, "wq");
@@ -344,7 +367,7 @@ fn table_translator_wubi86_produces_candidates() {
         &texts[..texts.len().min(12)]
     );
 
-    let mut session = Session::create(&build_dir(), "wubi86");
+    let mut session = new_session(&build_dir(), "wubi86");
     type_ascii(&mut session, "vb");
     let texts = candidate_texts(&mut session);
     assert!(texts.iter().any(|t| t == "好"), "vb 应出「好」，实际：{:?}", texts);
@@ -352,7 +375,7 @@ fn table_translator_wubi86_produces_candidates() {
 
 #[test]
 fn table_translator_stroke_produces_candidates() {
-    let mut session = Session::create(&build_dir(), "stroke");
+    let mut session = new_session(&build_dir(), "stroke");
     assert!(session.engine.is_some(), "stroke 引擎应加载");
 
     type_ascii(&mut session, "h");
@@ -360,7 +383,7 @@ fn table_translator_stroke_produces_candidates() {
     assert!(texts.iter().any(|t| t == "一"), "h 应出「一」，实际：{:?}", texts);
 
     // 前缀补全：打字 "hs"，码为 "h"（一）的词应作为补全候选出现。
-    let mut session = Session::create(&build_dir(), "stroke");
+    let mut session = new_session(&build_dir(), "stroke");
     type_ascii(&mut session, "hs");
     let texts = candidate_texts(&mut session);
     assert!(
@@ -377,7 +400,7 @@ fn table_translator_stroke_produces_candidates() {
 
 #[test]
 fn table_translator_wubi86_select_commit() {
-    let mut session = Session::create(&build_dir(), "wubi86");
+    let mut session = new_session(&build_dir(), "wubi86");
     type_ascii(&mut session, "wq");
     let idx = candidate_texts(&mut session)
         .iter()
@@ -390,7 +413,7 @@ fn table_translator_wubi86_select_commit() {
 
 #[test]
 fn table_translator_stroke_select_commit() {
-    let mut session = Session::create(&build_dir(), "stroke");
+    let mut session = new_session(&build_dir(), "stroke");
     type_ascii(&mut session, "h");
     let idx = candidate_texts(&mut session)
         .iter()
@@ -425,14 +448,14 @@ fn candidate_texts(session: &mut Session) -> Vec<String> {
 #[test]
 fn simplifier_probe_yuyan() {
     // 开关开着：应得到简体「语言」
-    let mut on = Session::create(&build_dir(), "luna_pinyin_simp");
+    let mut on = new_session(&build_dir(), "luna_pinyin_simp");
     on.context_mut().unwrap().set_option("zh_hans", true);
     type_ascii(&mut on, "yuyan");
     let on_texts = candidate_texts(&mut on);
     println!("zh_hans=ON  yuyan -> {:?}", &on_texts[..on_texts.len().min(12)]);
 
     // 开关关着：应保留繁体「語言」
-    let mut off = Session::create(&build_dir(), "luna_pinyin_simp");
+    let mut off = new_session(&build_dir(), "luna_pinyin_simp");
     off.context_mut().unwrap().set_option("zh_hans", false);
     type_ascii(&mut off, "yuyan");
     let off_texts = candidate_texts(&mut off);
@@ -441,7 +464,7 @@ fn simplifier_probe_yuyan() {
 
 #[test]
 fn simplifier_zh_hans_on_yields_simplified() {
-    let mut session = Session::create(&build_dir(), "luna_pinyin_simp");
+    let mut session = new_session(&build_dir(), "luna_pinyin_simp");
     session.context_mut().unwrap().set_option("zh_hans", true);
     type_ascii(&mut session, "yuyan");
     let texts = candidate_texts(&mut session);
@@ -459,7 +482,7 @@ fn simplifier_zh_hans_on_yields_simplified() {
 
 #[test]
 fn simplifier_zh_hans_off_yields_traditional() {
-    let mut session = Session::create(&build_dir(), "luna_pinyin_simp");
+    let mut session = new_session(&build_dir(), "luna_pinyin_simp");
     session.context_mut().unwrap().set_option("zh_hans", false);
     type_ascii(&mut session, "yuyan");
     let texts = candidate_texts(&mut session);
@@ -477,7 +500,7 @@ fn simplifier_zh_hans_off_yields_traditional() {
 
 #[test]
 fn sentence_nihaoshijie_yields_whole_sentence_first() {
-    let mut session = Session::create(&build_dir(), "luna_pinyin_simp");
+    let mut session = new_session(&build_dir(), "luna_pinyin_simp");
     type_ascii(&mut session, "nihaoshijie");
     let texts = candidate_texts(&mut session);
     assert_eq!(
@@ -497,7 +520,7 @@ fn sentence_nihaoshijie_yields_whole_sentence_first() {
 #[test]
 fn sentence_nihao_skips_sentence_for_exact_phrase() {
     // `nihao` 整段能命中精确词条「你好」—— 按 C++ 的条件 2 不组句。
-    let mut session = Session::create(&build_dir(), "luna_pinyin_simp");
+    let mut session = new_session(&build_dir(), "luna_pinyin_simp");
     type_ascii(&mut session, "nihao");
     let texts = candidate_texts(&mut session);
     assert_eq!(
@@ -515,7 +538,7 @@ fn sentence_nihao_skips_sentence_for_exact_phrase() {
 
 #[test]
 fn sentence_commit_yields_full_text() {
-    let mut session = Session::create(&build_dir(), "luna_pinyin_simp");
+    let mut session = new_session(&build_dir(), "luna_pinyin_simp");
     type_ascii(&mut session, "nihaoshijie");
     session.choose(0).expect("应能选中首个候选");
     let commit = session.take_commit();
@@ -562,11 +585,125 @@ fn grammar_schema_loads_and_makes_sentence() {
 #[test]
 fn grammar_schema_works_without_model_root() {
     // 找不到模型时应退化为 constant penalty，但方案本身仍能打字。
-    let mut session = Session::create(&build_dir(), "luna_pinyin_grammar");
+    let mut session = new_session(&build_dir(), "luna_pinyin_grammar");
     type_ascii(&mut session, "zhongguo");
     let texts = candidate_texts(&mut session);
     assert!(
         !texts.is_empty(),
         "缺语法模型时仍应产出候选（退回 non_collocation_penalty）"
     );
+}
+
+// ── 用户词典（学词 / 调频）端到端检测 ────────────────────────────────────
+//
+// 闭环：打 `nihao` → 选「你好」→ 提交 → 写进 `<用户目录>/userdb/luna_pinyin.userdb`
+// → 换一个会话（同一个用户目录）再打 `nihao`，用户词排在词表词前面。
+
+#[test]
+fn user_dict_learns_committed_phrase() {
+    use librime_next::dict::db::Db;
+    use librime_next::dict::level_db::LevelDb;
+
+    let user_dir = fresh_user_dir("learn");
+    let build = build_dir();
+    let roots = [user_dir.clone(), build.clone()];
+
+    // 第一次：正常打字 + 选第一个候选（「你好」）。
+    // 作用域收在这里 —— 会话持着 LevelDB 的独占锁，不放掉就打不开同一个库。
+    {
+        let mut session = Session::create_with_roots(&build, "luna_pinyin_simp", &roots);
+        type_ascii(&mut session, "nihao");
+        let texts = candidate_texts(&mut session);
+        assert_eq!(
+            texts.first().map(String::as_str),
+            Some("\u{4f60}\u{597d}"),
+            "首候选应是「你好」，实际：{:?}",
+            &texts[..texts.len().min(8)]
+        );
+        let result = session.choose(0).expect("应能选中第一个候选");
+        assert!(
+            format!("{result:?}").contains("Committed"),
+            "选「你好」应整段提交，实际 {result:?}"
+        );
+        assert_eq!(session.take_commit().as_deref(), Some("\u{4f60}\u{597d}"));
+    }
+
+    // 落盘检查：userdb 里应有一条 `ni hao \t你好`，且 commits = 1
+    let db_dir = user_dir.join("userdb");
+    let db = LevelDb::new_user_db(&db_dir, "luna_pinyin");
+    assert!(
+        db.open_readonly(),
+        "学词后应能只读打开 {db_dir:?}/luna_pinyin.userdb"
+    );
+    let raw = db.fetch("ni hao \t\u{4f60}\u{597d}").unwrap_or_else(|| {
+        let mut all = db.query_all().expect("应能扫 userdb");
+        let mut keys = Vec::new();
+        while let Some((key, value)) = all.get_next_record() {
+            keys.push((key, value));
+        }
+        panic!("userdb 里没有「ni hao \t你好」，实际内容：{keys:?}");
+    });
+    let value = librime_next::dict::user_db::UserDbValue::unpack(&raw).expect("值应可解析");
+    assert_eq!(value.commits, 1, "学过一次 commits 应为 1，实际值 {raw:?}");
+    assert!(value.tick >= 1, "tick 应被推进，实际值 {raw:?}");
+    assert!(db.close());
+
+    // 第二次：同一用户目录、新会话 —— 用户词典候选带上学过的记录，排第一
+    let mut again = Session::create_with_roots(&build, "luna_pinyin_simp", &roots);
+    type_ascii(&mut again, "nihao");
+    let texts = candidate_texts(&mut again);
+    assert_eq!(
+        texts.first().map(String::as_str),
+        Some("\u{4f60}\u{597d}"),
+        "用户词典候选应排第一，实际：{:?}",
+        &texts[..texts.len().min(8)]
+    );
+    let first_quality = again
+        .context()
+        .and_then(|ctx| ctx.composition.segmentation.segments.first())
+        .and_then(|seg| seg.menu.as_ref())
+        .and_then(|menu| menu.candidate_at(0))
+        .map(|c| c.quality);
+    // 用户词典候选 = `USER_DICT_QUALITY_BASE(1e5) + weight`，weight 是对数概率（负），
+    // 所以落在 9e4~1e5 之间；词表词条的量级只有 1e3~1e4，一眼能分开。
+    assert!(
+        first_quality.is_some_and(|q| q >= 9.0e4),
+        "首候选应来自用户词典（quality >= 9e4），实际 {first_quality:?}"
+    );
+    // 用户词条必须带着 code，否则下次学词接不上
+    let has_entry = again
+        .context()
+        .and_then(|ctx| ctx.composition.segmentation.segments.first())
+        .and_then(|seg| seg.menu.as_ref())
+        .and_then(|menu| menu.candidate_at(0))
+        .and_then(|c| c.entry.as_ref())
+        .is_some_and(|e| !e.code.0.is_empty());
+    assert!(has_entry, "用户词典候选应挂着 code 非空的词条");
+}
+
+/// 默认 `enable_user_dict` 为 true：没在方案里写配置也必须学词。
+#[test]
+fn user_dict_is_enabled_by_default() {
+    use librime_next::dict::db::Db;
+    use librime_next::dict::level_db::LevelDb;
+
+    let user_dir = fresh_user_dir("enabled_default");
+    let build = build_dir();
+    let roots = [user_dir.clone(), build.clone()];
+    {
+        let mut session = Session::create_with_roots(&build, "luna_pinyin_simp", &roots);
+        type_ascii(&mut session, "nihao");
+        session.choose(0).expect("选中首候选");
+        assert_eq!(session.take_commit().as_deref(), Some("\u{4f60}\u{597d}"));
+    }
+
+    let db = LevelDb::new_user_db(&user_dir.join("userdb"), "luna_pinyin");
+    assert!(db.open_readonly(), "userdb 应已存在");
+    let mut all = db.query_all().expect("应能扫 userdb");
+    let mut count = 0;
+    while all.get_next_record().is_some() {
+        count += 1;
+    }
+    assert_eq!(count, 1, "默认 enable_user_dict=true，提交后应恰好一条记录");
+    assert!(db.close());
 }
