@@ -469,3 +469,59 @@ fn simplifier_zh_hans_off_yields_traditional() {
         &texts[..texts.len().min(12)]
     );
 }
+
+// ── 整句组句（WordGraph + Poet）端到端检测 ───────────────────────────────
+//
+// grammar 的前置：把音节图上的词条拼成整句。三条断言分别验证
+// (1) 长输入出整句且排第一、(2) 有精确词条时不组句、(3) 整句能整体上屏。
+
+#[test]
+fn sentence_nihaoshijie_yields_whole_sentence_first() {
+    let mut session = Session::create(&build_dir(), "luna_pinyin_simp");
+    type_ascii(&mut session, "nihaoshijie");
+    let texts = candidate_texts(&mut session);
+    assert_eq!(
+        texts.first().map(String::as_str),
+        Some("\u{4f60}\u{597d}\u{4e16}\u{754c}"),
+        "整句「你好世界」应排第一，实际前若干：{:?}",
+        &texts[..texts.len().min(8)]
+    );
+    // 词级候选必须同时保留，不能只给整句。
+    assert!(
+        texts.iter().any(|t| t == "\u{4f60}\u{597d}"),
+        "词级「你好」应仍在候选里，实际：{:?}",
+        &texts[..texts.len().min(8)]
+    );
+}
+
+#[test]
+fn sentence_nihao_skips_sentence_for_exact_phrase() {
+    // `nihao` 整段能命中精确词条「你好」—— 按 C++ 的条件 2 不组句。
+    let mut session = Session::create(&build_dir(), "luna_pinyin_simp");
+    type_ascii(&mut session, "nihao");
+    let texts = candidate_texts(&mut session);
+    assert_eq!(
+        texts.first().map(String::as_str),
+        Some("\u{4f60}\u{597d}"),
+        "首候选应是词级「你好」，实际：{:?}",
+        &texts[..texts.len().min(8)]
+    );
+    assert!(
+        !texts.iter().any(|t| t == "\u{4f60}\u{8017}"),
+        "不应把「你耗」这类拼接当成精确匹配，实际：{:?}",
+        &texts[..texts.len().min(8)]
+    );
+}
+
+#[test]
+fn sentence_commit_yields_full_text() {
+    let mut session = Session::create(&build_dir(), "luna_pinyin_simp");
+    type_ascii(&mut session, "nihaoshijie");
+    session.choose(0).expect("应能选中首个候选");
+    let commit = session.take_commit();
+    assert_eq!(
+        commit.as_deref(),
+        Some("\u{4f60}\u{597d}\u{4e16}\u{754c}"),
+        "整句上屏应是「你好世界」，实际：{commit:?}"
+    );
+}

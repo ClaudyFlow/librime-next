@@ -48,7 +48,7 @@ pub mod dynamics;
 pub mod encoder;
 mod spelling;
 pub mod strings;
-mod syllabifier;
+pub mod syllabifier;
 pub mod utilities;
 
 pub use algebra::{Projection, Script};

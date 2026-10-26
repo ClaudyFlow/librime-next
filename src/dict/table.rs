@@ -1326,6 +1326,18 @@ impl<'a> TableAccessor<'a> {
         &self.index_code
     }
 
+    /// `TableAccessor::credibility()`（`table.h:127`）：这条路径上各音节 credibility 之和。
+    ///
+    /// C++ 是内联字段访问，这里补成方法：字段私有，`dict::dictionary` 的图查询要用。
+    pub fn credibility(&self) -> f64 {
+        self.credibility
+    }
+
+    /// `TableAccessor::quality_len()`（`table.h:128`）：其中**普通拼写**覆盖的字节数之和。
+    pub fn quality_len(&self) -> f64 {
+        self.quality_len
+    }
+
     /// `TableAccessor::code()`（`table.cc:83-93`）：`index_code` + `extra_code`。
     pub fn code(&self) -> Code {
         let mut code = self.index_code.clone();
@@ -1333,14 +1345,6 @@ impl<'a> TableAccessor<'a> {
             code.0.extend(extra);
         }
         code
-    }
-
-    pub fn credibility(&self) -> f64 {
-        self.credibility
-    }
-
-    pub fn quality_len(&self) -> f64 {
-        self.quality_len
     }
 }
 

@@ -5,6 +5,9 @@
 > 单方案 `luna_pinyin_simp` 的 `SchemaUpdate` 部署，并与 `fixture/build-20261023-current`
 > 的原版编译产物做语义 diff。
 
+> **与补丁版 librime 的逐项能力对照见 [`PARITY.md`](PARITY.md)** —— 那是唯一对照基准，
+> 推进顺序按其中的影响面排序（grammar → UserDb → reverse_lookup → history → affix）。
+
 ---
 
 ## 一、功能覆盖

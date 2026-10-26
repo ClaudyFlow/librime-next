@@ -28,6 +28,7 @@ pub mod matcher;
 pub mod key_binder;
 pub mod key_binding;
 pub mod navigator;
+pub mod poet;
 pub mod processor;
 pub mod punctuator;
 pub mod recognizer;

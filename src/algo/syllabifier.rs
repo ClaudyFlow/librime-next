@@ -347,6 +347,65 @@ impl Prism for InMemoryPrism {
     }
 }
 
+/// 把真实的 [`crate::dict::prism::Prism`]（`.prism.bin` 映射）适配到切分器要的
+/// [`Prism`] 接口。
+///
+/// C++ 里只有一个 `Prism` 类；Rust 这边因为 `dict` 依赖 `algo`（不能反过来），
+/// 切分器只能声明一个只含 5 个方法的小 trait。真实实现由这里补上 ——
+/// 放在 `algo` 模块内是为了能写 `SpellingProperties` 的 `pub(super)` 字段
+/// （`end_pos` / `tips` / `is_correction`），dict 层写不进去。
+impl Prism for crate::dict::prism::Prism {
+    fn max_key_length(&self) -> usize {
+        crate::dict::prism::Prism::max_key_length(self)
+    }
+
+    fn get_value(&self, key: &str) -> Option<SyllableId> {
+        crate::dict::prism::Prism::get_value(self, key)
+    }
+
+    fn common_prefix_search(&self, key: &str) -> Vec<PrismMatch> {
+        crate::dict::prism::Prism::common_prefix_search(self, key)
+            .into_iter()
+            .map(|m| PrismMatch {
+                value: m.value,
+                length: m.length,
+            })
+            .collect()
+    }
+
+    fn expand_search(&self, key: &str, limit: usize) -> Vec<PrismMatch> {
+        crate::dict::prism::Prism::expand_search(self, key, limit)
+            .into_iter()
+            .map(|m| PrismMatch {
+                value: m.value,
+                length: m.length,
+            })
+            .collect()
+    }
+
+    fn query_spelling(&self, spelling_id: SyllableId) -> Vec<SpellingDescriptor> {
+        let mut accessor = crate::dict::prism::Prism::query_spelling(self, spelling_id);
+        let mut out = Vec::new();
+        while !accessor.exhausted() {
+            let mut properties = SpellingProperties::default();
+            if let Some(descriptor) = accessor.descriptor() {
+                properties.r#type = descriptor.spelling_type();
+                properties.credibility = f64::from(descriptor.credibility);
+                properties.tips = descriptor.tips.clone();
+                properties.is_correction = descriptor.is_correction();
+            }
+            out.push((accessor.syllable_id(), properties));
+            accessor.next();
+        }
+        // C++（`dict/prism.cc:40-60`）：没有拼写表时 accessor **不空**，
+        // 把拼写 id 自己当音节 id 返回、属性全默认。
+        if out.is_empty() {
+            out.push((spelling_id, SpellingProperties::default()));
+        }
+        out
+    }
+}
+
 /// 模糊纠错接口。对应 `dict/corrector.h` 的 `Corrector::ToleranceSearch`
 /// 在 `syllabifier.cc:89-106` 的**调用点**。
 pub trait Corrector {
