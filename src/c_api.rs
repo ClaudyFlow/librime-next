@@ -332,7 +332,13 @@ pub struct RimeApi {
     pub highlight_candidate: Option<unsafe extern "C" fn(RimeSessionId, usize) -> Bool>,
     pub highlight_candidate_on_current_page: Option<unsafe extern "C" fn(RimeSessionId, usize) -> Bool>,
     pub change_page: Option<unsafe extern "C" fn(RimeSessionId, Bool) -> Bool>,
-    // ---- 三个根目录的 get/set（2026-10-25 增补，挂在 `change_page` 之后，DLL 尾部扩展）----
+    pub get_candidate_preview:
+        Option<unsafe extern "C" fn(RimeSessionId, *mut RimeCandidatePreview) -> Bool>,
+    pub free_candidate_preview: Option<unsafe extern "C" fn(*mut RimeCandidatePreview)>,
+    // ---- 三个根目录的 get/set（2026-10-25 增补，DLL 尾部扩展）。
+    //      **必须置于 RimeApi 末位**：否则会挤占 `get_candidate_preview` /
+    //      `free_candidate_preview` 这两位 C++ 原生函数的偏移，宿主按 C++ rime_api.h
+    //      编译时调用它们会落到错误的函数指针上。
     /// 程序文件夹（`program_dir`）。返回内部静态副本，调用方不应释放/改写。
     pub get_program_dir: Option<unsafe extern "C" fn() -> *const c_char>,
     /// 程序文件夹（带缓冲区的线程安全版本）。
@@ -343,9 +349,6 @@ pub struct RimeApi {
     pub set_shared_data_dir: Option<unsafe extern "C" fn(*const c_char)>,
     /// 设置用户数据目录（= `user_data_dir`）。
     pub set_user_data_dir: Option<unsafe extern "C" fn(*const c_char)>,
-    pub get_candidate_preview:
-        Option<unsafe extern "C" fn(RimeSessionId, *mut RimeCandidatePreview) -> Bool>,
-    pub free_candidate_preview: Option<unsafe extern "C" fn(*mut RimeCandidatePreview)>,
 }
 
 #[repr(C)]
