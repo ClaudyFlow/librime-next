@@ -1,0 +1,40 @@
+schema:
+  schema_id: stroke
+  name: "五筆畫 (e2e 验证)"
+engine:
+  processors:
+    - ascii_composer
+    - recognizer
+    - key_binder
+    - speller
+    - punctuator
+    - selector
+    - navigator
+    - express_editor
+  segmentors:
+    - ascii_segmentor
+    - matcher
+    - abc_segmentor
+    - punct_segmentor
+    - fallback_segmentor
+  translators:
+    - punct_translator
+    - table_translator
+speller:
+  alphabet: "abcdefghijklmnopqrstuvwxyz"
+  delimiter: " '"
+translator:
+  dictionary: stroke
+  preedit_format:
+    - xlit/hspnz/⼀⼁⼃⼂⼄/
+  comment_format:
+    - xlit/hspnz/⼀⼁⼃⼂⼄/
+menu:
+  page_size: 9
+switches:
+  - name: ascii_mode
+    states: [ 中文, 西文 ]
+  - name: full_shape
+    states: [ 半角, 全角 ]
+  - name: ascii_punct
+    states: [ 。，, ．， ]

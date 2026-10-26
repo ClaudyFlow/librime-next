@@ -127,7 +127,7 @@ impl fmt::Display for RuleError {
 impl std::error::Error for RuleError {}
 
 /// 一条拼写演算规则。对应 `calculus.h:18-26`。
-pub trait Calculation {
+pub trait Calculation: Send + Sync {
     /// 把规则作用到拼写上；返回"是否真的改了"。
     fn apply(&mut self, spelling: &mut Spelling) -> bool;
     /// 结果是否**可以新增**一个拼写（`derive` 系列 true，`erase` false）。
@@ -1342,7 +1342,7 @@ mod tests {
             let mut s = Spelling::new("");
             assert!(!c.apply(&mut s), "{formula} 不该改动空串");
         }
-    }
+    }
     #[test]
     fn backreference_xform_rule_now_takes_effect() {
         // 真实规则：`double_pinyin_ziranma` / `double_pinyin_flypy` 的 `speller/algebra`

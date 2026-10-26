@@ -35,5 +35,6 @@ pub mod registry;
 pub mod segmentor;
 pub mod selector;
 pub mod speller;
+pub mod table_translator;
 pub mod translator;
 pub mod translator_options;

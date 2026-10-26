@@ -300,7 +300,7 @@ impl Engine {
 
     /// C++ `TranslateSegments`：逐段取子串喂给每个 translator，候选偏移回绝对位置。
     fn translate_segments(&mut self) {
-        let translators = std::mem::take(&mut self.translators);
+        let mut translators = std::mem::take(&mut self.translators);
         let input = self.context.composition.segmentation.input.clone();
         let segs = &mut self.context.composition.segmentation.segments;
         for seg in segs.iter_mut() {
@@ -315,11 +315,13 @@ impl Engine {
                 continue;
             }
             let mut menu = Menu::new();
-            for entry in &translators {
+            // 段标签决定翻译器是否认领这段（C++ `segment.HasAnyTagIn(tags_)`）
+            let seg_tags = seg.tags.clone();
+            for entry in &mut translators {
                 if !entry.is_enabled() {
                     continue;
                 }
-                for mut c in entry.component.query(text, seg.start) {
+                for mut c in entry.component.query(text, seg.start, &seg_tags) {
                     // translator 返回的是**相对本段**的位置，这里还原成绝对偏移
                     c.start += seg.start;
                     c.end += seg.start;

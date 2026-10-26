@@ -44,7 +44,9 @@ use crate::engine::gear::recognizer::Recognizer;
 use crate::engine::gear::segmentor::Segmentor;
 use crate::engine::gear::selector::Selector;
 use crate::engine::gear::speller::Speller;
+use crate::engine::gear::table_translator::TableTranslator;
 use crate::engine::gear::translator::{ScriptTranslator, Translator};
+use crate::engine::gear::translator_options::TranslatorOptions;
 
 /// C++ `ParseCondition` 的递归深度上限（`engine.cc:kMaxConditionDepth`）。
 const MAX_CONDITION_DEPTH: usize = 32;
@@ -332,8 +334,18 @@ pub fn create_segmentor(ticket: &Ticket) -> Option<Box<dyn Segmentor + Send + Sy
 
 /// C++ `gears_module.cc` 的 translator 部分（当前已移植的那些）。
 pub fn create_translator(ticket: &Ticket) -> Option<Box<dyn Translator + Send + Sync>> {
+    let options = TranslatorOptions::from_config(ticket.config, &ticket.name_space);
     match ticket.klass.as_str() {
         "punct_translator" => Some(Box::new(PunctTranslator::with_config(ticket.config, false))),
+        "table_translator" => {
+            let (dict_name, prism_name) = translator_dict_name(ticket)?;
+            let dict = crate::dict::dictionary::Dictionary::open(
+                ticket.build_dir,
+                &dict_name,
+                &prism_name,
+            )?;
+            Some(Box::new(TableTranslator::new(dict, options)))
+        }
         "script_translator" | "r10n_translator" => {
             let (dict_name, prism_name) = translator_dict_name(ticket)?;
             let dict = crate::dict::dictionary::Dictionary::open(
@@ -341,7 +353,7 @@ pub fn create_translator(ticket: &Ticket) -> Option<Box<dyn Translator + Send + 
                 &dict_name,
                 &prism_name,
             )?;
-            Some(Box::new(ScriptTranslator::new(dict)))
+            Some(Box::new(ScriptTranslator::with_options(dict, options)))
         }
         _ => None,
     }

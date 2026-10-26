@@ -264,3 +264,154 @@ fn punctuator_turns_comma_into_full_width() {
         "已上屏的标点不该留在输入串里"
     );
 }
+
+// ── 双拼方案（natural-code 自然码）端到端 ─────────────────────────────────
+//
+// 自然码键位：ao=k，所以「好」hao = h + k。
+// 输入 "nihk" = ni(ni) + hao(hk) → 候选里应有「你好」。
+
+fn double_pinyin_build_dir() -> PathBuf {
+    // 双拼词典复用 luna_pinyin.table.bin，prism 单独（double_pinyin_ziranma.prism.bin）。
+    // 这两份都放在 test/e2e/build 下。
+    build_dir()
+}
+
+#[test]
+fn engine_loads_double_pinyin_ziranma() {
+    let session = Session::create(&double_pinyin_build_dir(), "double_pinyin_ziranma");
+    assert!(
+        session.engine.is_some(),
+        "double_pinyin_ziranma 引擎应能加载"
+    );
+}
+
+#[test]
+fn engine_translates_double_pinyin_ziranma() {
+    let mut session = Session::create(&double_pinyin_build_dir(), "double_pinyin_ziranma");
+    type_ascii(&mut session, "nihk");
+
+    let ctx = session.context().expect("应有上下文");
+    assert!(ctx.is_composing(), "nihk 应处于组字态");
+
+    let seg = ctx
+        .composition
+        .segmentation
+        .segments
+        .first()
+        .expect("应有组合段");
+    let menu = seg.menu.as_ref().expect("应有候选菜单");
+    let texts: Vec<&str> = menu.candidates().iter().map(|c| c.text.as_str()).collect();
+
+    assert!(
+        texts.iter().any(|t| *t == "你好"),
+        "「你好」应出现在候选里，实际前若干个：{:?}",
+        &texts[..texts.len().min(12)]
+    );
+}
+
+#[test]
+fn double_pinyin_preedit_shows_full_syllables() {
+    // preedit_format 应该把双拼键位还原成完整拼音，
+    // 而不是显示裸键位 "nihk"。
+    let mut session = Session::create(&double_pinyin_build_dir(), "double_pinyin_ziranma");
+    type_ascii(&mut session, "nihk");
+
+    let preedit = session.context().map(|c| c.get_preedit()).expect("应有预编辑");
+    // preedit_format 生效后，预编辑串应不同于裸键位 "nihk"
+    assert_ne!(preedit.text, "nihk", "preedit_format 应把键位还原成完整拼音");
+    // 且应包含还原后的音节（"hao" 由 "hk" 还原而来）
+    assert!(preedit.text.contains("hao"), "预编辑应包含还原后的音节 hao，实际：{}", preedit.text);
+}
+
+// ── 形码方案（table_translator）端到端验证 ───────────────────────────────
+//
+// 用真实 wubi86 / stroke 词典（test/e2e/build/*.table.bin + *.prism.bin，
+// 从已装 Rime 的 build/ 拷来）跑通「按键 → 整码命中/前缀补全 → 候选 → 选词 → 提交」。
+// 注意：本仓库的 wubi86 词典不含单字母简码（一=ggl/ggll，不是 g），所以单字母 g/d/k/l/r
+// 不是合法码；验证只用真实存在的码：wq=你, vb=好（五笔）；h=一, hs=十（笔画，h横 s竖 p撇 n捺 z折）。
+
+#[test]
+fn table_translator_wubi86_produces_candidates() {
+    // wubi86 引擎（table_translator + 真实词典）应加载并出候选。
+    let mut session = Session::create(&build_dir(), "wubi86");
+    assert!(session.engine.is_some(), "wubi86 引擎应加载");
+
+    type_ascii(&mut session, "wq");
+    let texts = candidate_texts(&mut session);
+    assert!(
+        texts.iter().any(|t| t == "你"),
+        "wq 应出「你」，实际前若干：{:?}",
+        &texts[..texts.len().min(12)]
+    );
+
+    let mut session = Session::create(&build_dir(), "wubi86");
+    type_ascii(&mut session, "vb");
+    let texts = candidate_texts(&mut session);
+    assert!(texts.iter().any(|t| t == "好"), "vb 应出「好」，实际：{:?}", texts);
+}
+
+#[test]
+fn table_translator_stroke_produces_candidates() {
+    let mut session = Session::create(&build_dir(), "stroke");
+    assert!(session.engine.is_some(), "stroke 引擎应加载");
+
+    type_ascii(&mut session, "h");
+    let texts = candidate_texts(&mut session);
+    assert!(texts.iter().any(|t| t == "一"), "h 应出「一」，实际：{:?}", texts);
+
+    // 前缀补全：打字 "hs"，码为 "h"（一）的词应作为补全候选出现。
+    let mut session = Session::create(&build_dir(), "stroke");
+    type_ascii(&mut session, "hs");
+    let texts = candidate_texts(&mut session);
+    assert!(
+        texts.iter().any(|t| t == "十"),
+        "hs 应出「十」，实际：{:?}",
+        &texts[..texts.len().min(12)]
+    );
+    assert!(
+        texts.iter().any(|t| t == "一"),
+        "hs 的补全候选里应含「一」（码 h 是 hs 的前缀），实际：{:?}",
+        &texts[..texts.len().min(12)]
+    );
+}
+
+#[test]
+fn table_translator_wubi86_select_commit() {
+    let mut session = Session::create(&build_dir(), "wubi86");
+    type_ascii(&mut session, "wq");
+    let idx = candidate_texts(&mut session)
+        .iter()
+        .position(|t| t == "你")
+        .expect("候选里应有「你」");
+    let result = session.choose(idx);
+    assert!(matches!(result, Some(librime_next::engine::SelectResult::Committed(_))), "选「你」应整段提交");
+    assert_eq!(session.take_commit().as_deref(), Some("你"), "提交文本应为「你」");
+}
+
+#[test]
+fn table_translator_stroke_select_commit() {
+    let mut session = Session::create(&build_dir(), "stroke");
+    type_ascii(&mut session, "h");
+    let idx = candidate_texts(&mut session)
+        .iter()
+        .position(|t| t == "一")
+        .expect("候选里应有「一」");
+    let result = session.choose(idx);
+    assert!(matches!(result, Some(librime_next::engine::SelectResult::Committed(_))), "选「一」应整段提交");
+    assert_eq!(session.take_commit().as_deref(), Some("一"), "提交文本应为「一」");
+}
+
+/// 取当前首个组合段的候选文本列表（端到端断言辅助）。
+fn candidate_texts(session: &mut Session) -> Vec<String> {
+    session
+        .context()
+        .and_then(|ctx| {
+            ctx.composition
+                .segmentation
+                .segments
+                .first()
+                .and_then(|seg| seg.menu.as_ref())
+                .map(|m| m.candidates().iter().map(|c| c.text.clone()).collect())
+        })
+        .unwrap_or_default()
+}

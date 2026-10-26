@@ -199,7 +199,7 @@ fn punct_candidate(text: &str, start: usize, end: usize) -> Candidate {
 }
 
 impl Translator for PunctTranslator {
-    fn query(&self, input: &str, start: usize) -> Vec<Candidate> {
+    fn query(&mut self, input: &str, start: usize, _seg_tags: &[String]) -> Vec<Candidate> {
         let Some(definition) = self.config.get_punct_definition(input) else {
             return Vec::new();
         };
@@ -440,40 +440,40 @@ mod tests {
 
     #[test]
     fn translator_expands_alternating_list() {
-        let t = PunctTranslator::with_config(&config(), false);
-        let cands = t.query("'", 0);
+        let mut t = PunctTranslator::with_config(&config(), false);
+        let cands = t.query("'", 0, &[]);
         let texts: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(texts, vec!["、", "‘", "’"]);
     }
 
     #[test]
     fn translator_expands_unique_mapping_and_pair() {
-        let t = PunctTranslator::with_config(&config(), false);
-        assert_eq!(t.query(",", 0)[0].text, "，");
+        let mut t = PunctTranslator::with_config(&config(), false);
+        assert_eq!(t.query(",", 0, &[])[0].text, "，");
         let pair: Vec<String> = t
-            .query("\"", 0)
+            .query("\"", 0, &[])
             .into_iter()
             .map(|c| c.text.clone())
             .collect();
         assert_eq!(pair, vec!["“".to_string(), "”".to_string()]);
         // `{ commit: … }`
-        assert_eq!(t.query("`", 0)[0].text, "`");
+        assert_eq!(t.query("`", 0, &[])[0].text, "`");
     }
 
     #[test]
     fn full_shape_option_switches_the_mapping() {
-        let half = PunctTranslator::with_config(&config(), false);
-        let full = PunctTranslator::with_config(&config(), true);
+        let mut half = PunctTranslator::with_config(&config(), false);
+        let mut full = PunctTranslator::with_config(&config(), true);
         // 半角表里有 `'` 的多选，全角表里没有 → 全角时该键不出候选
-        assert_eq!(half.query("'", 0).len(), 3);
-        assert!(full.query("'", 0).is_empty());
-        assert_eq!(full.query(",", 0)[0].text, "，");
+        assert_eq!(half.query("'", 0, &[]).len(), 3);
+        assert!(full.query("'", 0, &[]).is_empty());
+        assert_eq!(full.query(",", 0, &[])[0].text, "，");
     }
 
     #[test]
     fn unknown_punct_is_noop() {
-        let t = PunctTranslator::with_config(&config(), false);
-        assert!(t.query("z", 0).is_empty());
+        let mut t = PunctTranslator::with_config(&config(), false);
+        assert!(t.query("z", 0, &[]).is_empty());
     }
 
     #[test]
