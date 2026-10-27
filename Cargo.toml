@@ -70,6 +70,10 @@ name = "lever_deploy"
 path = "test/lever_deploy.rs"
 
 [[test]]
+name = "schema_manifest_generate"
+path = "test/schema_manifest_generate.rs"
+
+[[test]]
 name = "rime_next_dialect"
 path = "test/rime_next_dialect.rs"
 
@@ -84,6 +88,14 @@ path = "example/deploy_diff.rs"
 [[example]]
 name = "deploy_luna"
 path = "example/deploy_luna.rs"
+
+[[example]]
+name = "probe_variants"
+path = "example/probe_variants.rs"
+
+[[example]]
+name = "probe_compile"
+path = "example/probe_compile.rs"
 
 [[example]]
 name = "probe_simp"

@@ -34,5 +34,6 @@ pub mod deployer;
 pub mod deployment_tasks;
 pub mod paths;
 pub mod scan;
+pub mod schema_list;
 pub mod tree;
 pub mod user_dict_manager;

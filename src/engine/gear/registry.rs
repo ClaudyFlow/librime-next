@@ -517,16 +517,64 @@ pub fn create_translator(ticket: &Ticket) -> Option<Box<dyn Translator + Send + 
         }
         "script_translator" | "r10n_translator" => {
             let (dict_name, prism_name) = translator_dict_name(ticket)?;
-            let dict = crate::dict::dictionary::Dictionary::open(
+            // 变体词库缺失时的 opencc 兜底（Rime-Next 设计：一个方案挂 simp/trad
+            // 两本词库，繁简开关二选一；缺的那本借另一变体的词典 + opencc 实时
+            // 转换）。`<ns>/fallback` = 借哪本，`<ns>/opencc` = 转换方向配置。
+            let (dict, convert) = match crate::dict::dictionary::Dictionary::open(
                 ticket.build_dir,
                 &dict_name,
                 &prism_name,
-            )?;
+            ) {
+                Some(dict) => (dict, None),
+                None => {
+                    let fallback_ns = ticket
+                        .config
+                        .pointer(&format!("/{}/fallback", ticket.name_space))
+                        .and_then(|v| v.as_str())
+                        ?;
+                    let fb_dict = ticket
+                        .config
+                        .pointer(&format!("/{fallback_ns}/dict"))
+                        .or_else(|| ticket.config.pointer(&format!("/{fallback_ns}/dictionary")))
+                        .and_then(|v| v.as_str())
+                        ?;
+                    let fb_prism = ticket
+                        .config
+                        .pointer(&format!("/{fallback_ns}/prism"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(fb_dict);
+                    let dict = crate::dict::dictionary::Dictionary::open(
+                        ticket.build_dir,
+                        fb_dict,
+                        fb_prism,
+                    )?;
+                    let convert = ticket
+                        .config
+                        .pointer(&format!("/{}/opencc", ticket.name_space))
+                        .and_then(|v| v.as_str())
+                        .and_then(|name| {
+                            ticket.data_roots.iter().find_map(|root| {
+                                let path = root.join("opencc").join(name);
+                                path.is_file().then_some(path)
+                            })
+                        })
+                        .and_then(|path| crate::dict::opencc::Opencc::load(path).ok());
+                    (dict, convert)
+                }
+            };
             let mut translator = ScriptTranslator::with_options(dict, options);
-            // 语法模型：`grammar/language` → `<root>/model/<language>.gram`。
-            // 没有 `grammar/language` 的方桘就不装，`Poet` 走动态规划（等价 C++ 无 grammar）。
+            translator.convert = convert;
+            // 语法模型：优先 `<ns>/grammar`（每变体各自的 `han.simp.gram` /
+            // `han.trad.gram`），回退顶层 `grammar:`。都没有就不装，`Poet` 走
+            // 动态规划（等价 C++ 无 grammar）。
             let roots: Vec<&Path> = ticket.data_roots.iter().map(PathBuf::as_path).collect();
-            if let Some(octagram) = crate::engine::gear::grammar::create(ticket.config, &roots) {
+            let grammar_view = ticket
+                .config
+                .pointer(&format!("/{}/grammar", ticket.name_space))
+                .cloned()
+                .map(|grammar| serde_json::json!({ "grammar": grammar }));
+            let grammar_config = grammar_view.as_ref().unwrap_or(ticket.config);
+            if let Some(octagram) = crate::engine::gear::grammar::create(grammar_config, &roots) {
                 translator = translator.with_poet(Poet::new(Some(Box::new(octagram))));
             }
             // 用户词典（学词 / 调频）：`Translator::user_dict_`
@@ -611,9 +659,17 @@ fn language_component(name: &str) -> String {
 /// 的 `translator/dictionary`，与 `translator:` 节点吻合。`prism` 不给时与词典同名
 /// （librime 里拼音方案常另行指定，如 `luna_pinyin` + `luna_pinyin_simp`）。
 fn translator_dict_name(ticket: &Ticket) -> Option<(String, String)> {
+    // 方言双认:`dictionary:`(归一化形态)与 `dict:`(源文件方言单数——
+    // normalize_dialect 只在 translator: 节内改名,变体节 simp:/trad: 的
+    // dict: 保持原样,2026-10-27 双变体设计)。
     let dict = ticket
         .config
         .pointer(&format!("/{}/dictionary", ticket.name_space))
+        .or_else(|| {
+            ticket
+                .config
+                .pointer(&format!("/{}/dict", ticket.name_space))
+        })
         .and_then(|v| v.as_str())?;
     let prism = ticket
         .config

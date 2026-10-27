@@ -444,9 +444,21 @@ pub fn format_report(report: &AdmitReport) -> String {
     out
 }
 
-/// 把清单写回 `<user_data_dir>/schema/schema.yaml`。
+/// 清单头注释的默认版本（手改过的文件读入时不依赖它，纯注释）。
+pub const DEFAULT_MANIFEST_HEADER: &str = "# 方案信息 —— 勾选清单 + 当前使用的方案\n";
+
+/// 把清单写回 `<user_data_dir>/schema/schema.yaml`（默认头注释）。
 /// 发射走 `config::to_yaml_string`（全 crate 唯一出口），保留未知键与键序。
 pub fn save_schema_manifest(user_data_dir: &Path, manifest: &SchemaManifest) -> Result<PathBuf, String> {
+    save_schema_manifest_with_header(user_data_dir, manifest, DEFAULT_MANIFEST_HEADER)
+}
+
+/// 同上，但头注释由调用方给（生成清单时会写一段"这是自动生成的"说明）。
+pub fn save_schema_manifest_with_header(
+    user_data_dir: &Path,
+    manifest: &SchemaManifest,
+    header: &str,
+) -> Result<PathBuf, String> {
     let path = user_data_dir.join(SCHEMA_DIR).join(SCHEMA_MANIFEST);
     let mut map = serde_json::Map::new();
     if let Some(active) = &manifest.active {
@@ -458,8 +470,7 @@ pub fn save_schema_manifest(user_data_dir: &Path, manifest: &SchemaManifest) -> 
     );
     let item = crate::config::convert_from_yaml(&Value::Object(map), None);
     let mut text = crate::config::to_yaml_string(&item).map_err(|e| format!("序列化清单失败: {e}"))?;
-    // 头部注释（原文件有，纯人看的；读入器不依赖它）
-    let header = "# 方案信息 —— 勾选清单 + 当前使用的方案\n";
+    // 头部注释（纯人看的；读入器不依赖它）
     if !text.starts_with(header) {
         text = format!("{header}{text}");
     }

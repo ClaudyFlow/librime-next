@@ -42,7 +42,15 @@ impl Filter for Simplifier {
         }
     }
 
-    fn apply(&mut self, _ctx: &Context, candidates: &mut Vec<Candidate>) {
+    fn apply(&mut self, ctx: &Context, candidates: &mut Vec<Candidate>) {
+        // C++ `Simplifier::Apply` 第一道闸:开关关 ⇒ 整个过滤器不转换。
+        // 双变体设计(2026-10-27)下这闸是**正确性**依赖:繁体模式里
+        // trad 翻译器已经输出繁体,若 t2s 过滤器仍无脑转换会把繁体打回简体。
+        if let Some(name) = &self.option_name
+            && !ctx.get_option(name)
+        {
+            return;
+        }
         for cand in candidates.iter_mut() {
             cand.text = self.opencc.convert(&cand.text);
         }

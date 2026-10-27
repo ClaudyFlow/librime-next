@@ -429,8 +429,18 @@ impl Engine {
     }
 
     /// 设定开关（给组件之外的调用方复用）。
+    ///
+    /// C++ `set_option` 会发 `option_update_notifier` ⇒ `OnOptionUpdate` ⇒
+    /// `UpdateComponentConditions`——组件的 `when` 条件**立即**重算。漏了这一步,
+    /// 宿主经 API 切开关(简繁/西文中文)后,组件列表要等下一次按键才自愈。
     pub fn set_option(&mut self, name: &str, value: bool) {
         self.context.set_option(name, value);
+        self.refresh_component_conditions();
+        if self.context.is_composing() {
+            // C++ OnOptionUpdate:组字中 ⇒ `RefreshNonConfirmedComposition` ⇒ 重算
+            self.context.refresh_non_confirmed_composition();
+            self.compose();
+        }
     }
 
     /// C++ `ConcreteEngine::Compose`：caret 感知的重算入口。

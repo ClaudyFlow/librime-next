@@ -804,8 +804,14 @@ unsafe extern "C" fn rime_free_status(status: *mut RimeStatus) {
 unsafe extern "C" fn rime_set_option(id: RimeSessionId, option: *const c_char, value: Bool) {
     let Some(name) = read_cstr(option) else { return };
     if let Some(s) = global().lock().unwrap().sessions.get_mut(&id) {
-        if let Some(c) = s.context_mut() {
-            c.set_option(&name, value != 0);
+        match s.engine_mut() {
+            // 走引擎:开关变化立即重算组件条件(C++ OnOptionUpdate 语义)
+            Some(engine) => engine.set_option(&name, value != 0),
+            None => {
+                if let Some(c) = s.context_mut() {
+                    c.set_option(&name, value != 0);
+                }
+            }
         }
     }
 }

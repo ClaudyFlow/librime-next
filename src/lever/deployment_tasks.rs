@@ -812,15 +812,30 @@ fn run_schema_update(deployer: &mut Deployer, source_path: &Path, verbose: bool)
     // 2. reload 产物，看要不要编译词典（.bin 在 dict 层，留接缝）
     let layout = deployer.layout();
     let staged = layout.compiled_schema(&schema_id);
+    // 要不要编译词典:主 `translator/dictionary`,或任何**变体节**(`simp:` /
+    // `trad:` … 顶层带 `dict:`/`dictionary:` 的节,Rime-Next 双变体设计)。
     let has_dictionary = load_file(&staged)
         .ok()
         .and_then(|value| {
-            value
+            let main = value
                 .pointer("/translator/dictionary")
                 .and_then(|name| name.as_str())
                 .map(str::to_string)
+                .is_some_and(|name| !name.is_empty());
+            let variants = value.as_object().is_some_and(|map| {
+                map.iter()
+                    .any(|(key, node)| {
+                        key != "translator"
+                            && node
+                                .get("dict")
+                                .or_else(|| node.get("dictionary"))
+                                .and_then(|v| v.as_str())
+                                .is_some_and(|name| !name.is_empty())
+                    })
+            });
+            Some(main || variants)
         })
-        .is_some_and(|name| !name.is_empty());
+        .unwrap_or(false);
     if has_dictionary {
         // Dictionary::Create + DictCompiler::Compile（C++ deployment_tasks.cc:402-429）
         compile_dictionary(deployer, &schema_id, verbose)
@@ -837,6 +852,12 @@ fn run_schema_update(deployer: &mut Deployer, source_path: &Path, verbose: bool)
 /// `translator/prism` 缺省 = dict_name；`translator/packs` 是字符串列表。
 /// `schema_file` 用 deployed resolver 解出的编译产物（staging 优先、prebuilt 回退），
 /// 与 C++ `resolver->ResolvePath(schema_id)` 一致。
+///
+/// Rime-Next 双变体扩展（2026-10-27 设计）：除主 `translator/dictionary` 外，
+/// 顶层任何带 `dict:`/`dictionary:` 键的节（`simp:` / `trad:` …）都是**一个变体
+/// 词库**，逐个编译。变体词源缺失时**跳过不报错**——运行时该变体走 opencc
+/// 兜底（`<变体>/fallback` + `<变体>/opencc`），这正是"一个方案挂两本词库、
+/// 缺哪本 opencc 补"的部署侧配合。
 fn compile_dictionary(deployer: &mut Deployer, schema_id: &str, verbose: bool) -> bool {
     let layout = deployer.layout();
     let compiled_schema = layout.compiled_schema(schema_id);
@@ -847,63 +868,116 @@ fn compile_dictionary(deployer: &mut Deployer, schema_id: &str, verbose: bool) -
         ));
         return false;
     };
-    let Some(dict_name) = config
+
+    // 词典清单:主 `translator/dictionary` + 顶层变体节(`simp:` / `trad:` …)
+    let mut entries: Vec<(String, String, String, bool)> = Vec::new(); // (节名, dict, prism, 可跳过)
+    if let Some(dict_name) = config
         .pointer("/translator/dictionary")
         .and_then(|name| name.as_str())
         .map(str::to_string)
-    else {
+    {
+        if dict_name.is_empty() {
+            // not requiring a dictionary（C++ Create 直接返回 nullptr 前的早退）
+            return true;
+        }
+        let prism_name = config
+            .pointer("/translator/prism")
+            .and_then(|name| name.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| dict_name.clone());
+        entries.push(("translator".to_string(), dict_name, prism_name, false));
+    }
+    if let Some(map) = config.as_object() {
+        for (key, node) in map {
+            if key == "translator" {
+                continue; // 主词典上面已处理
+            }
+            let Some(dict_name) = node
+                .get("dict")
+                .or_else(|| node.get("dictionary"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            if dict_name.is_empty() {
+                continue;
+            }
+            let prism_name = node
+                .get("prism")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| dict_name.clone());
+            entries.push((key.clone(), dict_name, prism_name, true));
+        }
+    }
+    if entries.is_empty() {
         log_error(&format!(
             "translator/dictionary not specified in schema '{schema_id}'."
         ));
         return false;
-    };
-    if dict_name.is_empty() {
-        // not requiring a dictionary（C++ Create 直接返回 nullptr 前的早退）
-        return true;
     }
-    let prism_name = config
-        .pointer("/translator/prism")
-        .and_then(|name| name.as_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| dict_name.clone());
-    let packs: Vec<String> = config
-        .pointer("/translator/packs")
-        .and_then(|list| list.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+
     if !crate::lever::tree::maybe_create_directory(&deployer.staging_dir) {
         return false;
     }
-    let mut compiler = crate::dict::dict_compiler::DictCompiler::new(
-        dict_name.clone(),
-        prism_name,
-        packs,
-        &deployer.user_data_dir,
-        &deployer.shared_data_dir,
-        &deployer.staging_dir,
-        &deployer.prebuilt_data_dir,
-    );
-    if verbose {
-        // C++：verbose_ → kRebuild | kDump（kDump 未移植，只留 kRebuild）
-        compiler.set_options(crate::dict::dict_compiler::CompileOptions::rebuild_all());
-    }
-    match compiler.compile(Some(&compiled_schema)) {
-        Ok(()) => {
-            log_info(&format!("dictionary '{dict_name}' is ready."));
-            true
+    let mut all_ok = true;
+    for (section, dict_name, prism_name, skippable) in entries {
+        // 变体的 packs 暂不扩展(设计里变体词库不带 packs)
+        let packs: Vec<String> = if section == "translator" {
+            config
+                .pointer("/translator/packs")
+                .and_then(|list| list.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let mut compiler = crate::dict::dict_compiler::DictCompiler::new(
+            dict_name.clone(),
+            prism_name.clone(),
+            packs,
+            &deployer.user_data_dir,
+            &deployer.shared_data_dir,
+            &deployer.staging_dir,
+            &deployer.prebuilt_data_dir,
+        );
+        if verbose {
+            // C++：verbose_ → kRebuild | kDump（kDump 未移植，只留 kRebuild）
+            compiler.set_options(crate::dict::dict_compiler::CompileOptions::rebuild_all());
         }
-        Err(error) => {
-            log_error(&format!(
-                "dictionary '{dict_name}' failed to compile: {error}"
-            ));
-            false
+        match compiler.compile(Some(&compiled_schema)) {
+            Ok(()) => {
+                log_info(&format!("dictionary '{dict_name}' is ready."));
+            }
+            Err(error) => {
+                if skippable && dict_source_missing(&error) {
+                    log_info(&format!(
+                        "variant dictionary '{dict_name}' ({section}) has no source; \
+                         opencc fallback at runtime."
+                    ));
+                    continue;
+                }
+                log_error(&format!(
+                    "dictionary '{dict_name}' failed to compile: {error}"
+                ));
+                all_ok = false;
+            }
         }
     }
+    all_ok
+}
+
+/// 词典编译错误是否属于"词源文件不存在"(变体词库缺失的预期形态)。
+fn dict_source_missing(error: &str) -> bool {
+    // 两种形态:"source file 'X' does not exist." 与
+    // "neither X.dict.yaml nor X.table.bin exists."
+    error.contains("not exist") || error.contains("nor ") && error.contains("exists")
 }
 
 /// 编译产物落盘（目录自动建；YAML 序列化用 config 层的 emit）。
@@ -979,32 +1053,30 @@ fn run_workspace_update(deployer: &mut Deployer) -> bool {
     // 2. SymlinkingPrebuiltDictionaries —— 未移植（预编译词典符号链接），跳过
     log_info("[Weasel-Next] SymlinkingPrebuiltDictionaries 未移植，跳过");
 
-    // 3. 方案清单：`<user>/schema/schema.yaml`（点名制）优先，回退 default.yaml 的 schema_list
+    // 3. 方案清单：`<user>/schema/schema.yaml`（点名制）
     //
-    // 回退那份走 `default` 资源的解析规则（用户在目录优先、共享目录回退），
-    // 与 C++ `Config::Require("config")->Create("default")` 一致。
-    let manifest = load_schema_manifest(&deployer.user_data_dir);
-    let mut schema_ids = manifest.schemas.clone();
-    let default_config = if schema_ids.is_empty() {
-        load_file(&default_config_path(deployer)).ok()
-    } else {
-        None
-    };
-    if schema_ids.is_empty()
-        && let Some(value) = &default_config
-    {
-        schema_ids = schema_list_from_json(value);
-    }
-    if schema_ids.is_empty() && default_config.is_none() {
-        log_warn("schema list not defined.");
-        return false;
-    }
-    if !schema_ids.is_empty() {
+    // 2026-10-28：清单**缺失就生成** —— 识别程序文件夹（shared）里过准入四关的方案写进去。
+    // `default.yaml` 的 `schema_list` **不再当兜底**（用户拍板：直接生成，不过 default）：
+    // default 那份是出厂预设，而清单是用户的选择，二者不该混着用。
+    let outcome =
+        super::schema_list::ensure_manifest(&deployer.user_data_dir, &deployer.shared_data_dir);
+    if outcome.generated() {
         log_info(&format!(
-            "[Weasel-Next] 方案清单：{} 项（schema.yaml 优先，回退 default.yaml）",
-            schema_ids.len()
+            "[Weasel-Next] 方案清单缺失，已由程序文件夹识别生成：{} 项（active = {}）",
+            outcome.manifest().schemas.len(),
+            outcome.manifest().active.as_deref().unwrap_or("<无>")
         ));
     }
+    let manifest = load_schema_manifest(&deployer.user_data_dir);
+    let mut schema_ids = manifest.schemas.clone();
+    if schema_ids.is_empty() {
+        log_warn("schema list not defined; 程序文件夹里没识别到任何过准入检查的方案。");
+        return false;
+    }
+    log_info(&format!(
+        "[Weasel-Next] 方案清单：{} 项（schema/schema.yaml 为唯一权威）",
+        schema_ids.len()
+    ));
 
     // 4. 逐方案编译 + dependencies 递归（C++ 的 build_schema lambda）
     let layout = deployer.layout();
@@ -1060,9 +1132,7 @@ fn run_workspace_update(deployer: &mut Deployer) -> bool {
     // 5. schema_list 写回 staging/default.yaml（清单唯一落点是 schema/schema.yaml，
     //    但 librime 的菜单读 build/default.yaml 的 schema_list，所以两处都要有）
     if !schema_ids.is_empty()
-        && let Some(mut value) = default_config
-            .clone()
-            .or_else(|| load_file(&default_config_path(deployer)).ok())
+        && let Some(mut value) = load_file(&default_config_path(deployer)).ok()
     {
             let list: Vec<serde_json::Value> = schema_ids
                 .iter()
@@ -1144,6 +1214,11 @@ pub fn load_schema_manifest(user_data_dir: &std::path::Path) -> SchemaManifest {
     SchemaManifest { active, schemas }
 }
 
+/// 从 `default.yaml` 的配置树里取 `schema_list`。
+///
+/// 2026-10-28：部署**不再**拿它当清单兜底（清单缺失时直接由程序文件夹识别生成，
+/// 见 `schema_list::ensure_manifest`）。留着是因为第 5 步还要把清单写回
+/// `staging/default.yaml` 的 `schema_list`，以及外部工具可能读这份出厂预设。
 fn schema_list_from_json(value: &serde_json::Value) -> Vec<String> {
     value
         .get("schema_list")

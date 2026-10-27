@@ -66,6 +66,7 @@ fn main() {
         [cmd, a, b, c] if cmd == "compile" => compile(Path::new(a), Path::new(b), Path::new(c)),
         [cmd, path, rest @ ..] if cmd == "admit" => admit_cli(Path::new(path), rest),
         [cmd, rest @ ..] if cmd == "deploy" => deploy_cli(rest),
+        [cmd, rest @ ..] if cmd == "manifest" => manifest_cli(rest),
         _ => {
             eprintln!("用法:");
             eprintln!("  librime-next parse <目录|文件>    解析并报告");
@@ -367,17 +368,7 @@ fn deploy_cli(flags: &[String]) {
     let user = user
         .or_else(|| std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("Rime-Next")))
         .unwrap_or_else(|| PathBuf::from("."));
-    let shared = shared.unwrap_or_else(|| {
-        for candidate in [
-            PathBuf::from(r"C:\Program Files\Weasel-Next\Rime-Next"),
-            PathBuf::from(r"C:\code\Weasel-Next\Rime-Next"),
-        ] {
-            if candidate.join("default.yaml").is_file() {
-                return candidate;
-            }
-        }
-        PathBuf::from(".")
-    });
+    let shared = shared.unwrap_or_else(default_shared_dir);
 
     let mut deployer = Deployer::with_data_dirs(&shared, &user);
     let ok = deployer.deploy_workspace();
@@ -388,6 +379,106 @@ fn deploy_cli(flags: &[String]) {
     );
     if !ok {
         std::process::exit(1);
+    }
+}
+
+/// 程序文件夹（内置数据目录 `shared_data_dir`）的候选，按优先级找第一个有 `default.yaml` 的。
+///
+/// 2026-10-28 新布局优先：`Program Files\Rime-Next\data`（安装路径 + 产品名 + data）；
+/// 其次是旧装机 `Program Files\Weasel-Next\Rime-Next`，最后是代码仓里的源数据目录。
+fn default_shared_dir() -> PathBuf {
+    for candidate in [
+        PathBuf::from(r"C:\Program Files\Rime-Next\data"),
+        PathBuf::from(r"C:\Program Files\Weasel-Next\Rime-Next"),
+        PathBuf::from(r"C:\Code\Weasel-Next\Rime-Next"),
+        PathBuf::from(r"C:\code\Weasel-Next\Rime-Next"),
+    ] {
+        if candidate.join("default.yaml").is_file() {
+            return candidate;
+        }
+    }
+    PathBuf::from(".")
+}
+
+/// `manifest`：方案清单的识别与生成（部署第一步干的事，单独拎出来便于排查）。
+///
+/// * 不带参数：扫程序文件夹 → 列出收下/抛弃 → 清单缺失才生成（与部署同规则）。
+/// * `--rebuild`：先删掉现有清单再生成（**会丢掉用户已勾选的内容**，仅排查用）。
+fn manifest_cli(flags: &[String]) {
+    use librime_next::lever::schema_list;
+
+    let mut shared: Option<PathBuf> = None;
+    let mut user: Option<PathBuf> = None;
+    let mut rebuild = false;
+    let mut i = 0;
+    while i < flags.len() {
+        match flags[i].as_str() {
+            "--shared" => {
+                i += 1;
+                shared = flags.get(i).map(PathBuf::from);
+                if shared.is_none() {
+                    eprintln!("--shared 后面要跟目录");
+                    std::process::exit(2);
+                }
+            }
+            "--user" => {
+                i += 1;
+                user = flags.get(i).map(PathBuf::from);
+                if user.is_none() {
+                    eprintln!("--user 后面要跟目录");
+                    std::process::exit(2);
+                }
+            }
+            "--rebuild" => rebuild = true,
+            other => {
+                eprintln!("不认识的参数: {other}");
+                std::process::exit(2);
+            }
+        }
+        i += 1;
+    }
+
+    let user = user
+        .or_else(|| std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("Rime-Next")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let shared = shared.unwrap_or_else(default_shared_dir);
+    println!("程序文件夹（shared）: {}", shared.display());
+    println!("用户文件夹（user）  : {}", user.display());
+
+    if rebuild {
+        let path = user.join("schema").join("schema.yaml");
+        if path.is_file() {
+            let _ = std::fs::remove_file(&path);
+            println!("\n（--rebuild：已删除现有清单 {}）", path.display());
+        }
+    }
+
+    let found = schema_list::discover_roots(&[shared.clone(), user.clone()]);
+    println!(
+        "\n== 识别结果：收下 {} / 抛弃 {} ==",
+        found.accepted.len(),
+        found.rejected.len()
+    );
+    for item in &found.accepted {
+        println!("  [收下] {:<28} {}", item.id, item.name.as_deref().unwrap_or(""));
+    }
+    for (path, reason) in &found.rejected {
+        println!("  [抛弃] {}\n         └─ {reason}", path.display());
+    }
+
+    let outcome = schema_list::ensure_manifest(&user, &shared);
+    let manifest = outcome.manifest();
+    println!("\n== 清单 {} ==", user.join("schema").join("schema.yaml").display());
+    if outcome.generated() {
+        println!("  本次新生成：{} 项", manifest.schemas.len());
+    } else if manifest.schemas.is_empty() {
+        println!("  仍是空的（程序文件夹里没识别出任何合规方案）");
+    } else {
+        println!("  已存在，未改动：{} 项", manifest.schemas.len());
+    }
+    println!("  active: {}", manifest.active.as_deref().unwrap_or("<无>"));
+    for id in &manifest.schemas {
+        println!("    - {id}");
     }
 }
 
