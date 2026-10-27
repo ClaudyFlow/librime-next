@@ -86,6 +86,10 @@ name = "deploy_luna"
 path = "example/deploy_luna.rs"
 
 [[example]]
+name = "probe_simp"
+path = "example/probe_simp.rs"
+
+[[example]]
 name = "probe_trace"
 path = "example/probe_trace.rs"
 

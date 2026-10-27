@@ -9,8 +9,15 @@ fn main() {
     let build = PathBuf::from(std::env::args().nth(1).expect("build_dir"));
     let schema = std::env::args().nth(2).expect("schema_id");
     let input = std::env::args().nth(3).expect("input");
-    let mut session = Session::create(&build, &schema);
+    // 与 c_api 相同的 roots:用户目录优先、共享目录其次(simplifier 的 opencc 数据在这)
+    let user = std::env::var_os("APPDATA")
+        .map(|a| std::path::PathBuf::from(a).join("Rime-Next"))
+        .expect("APPDATA");
+    let shared = std::path::PathBuf::from(r"C:\Program Files\Weasel-Next\Rime-Next");
+    let roots = vec![user, shared];
+    let mut session = Session::create_with_roots(&build, &schema, &roots);
     println!("engine loaded: {}", session.engine.is_some());
+    println!("filters: {:?}", session.engine.as_ref().map(|e| e.filter_names()));
     for ch in input.chars() {
         let ok = session.process_key(ch as u32, 0);
         let now = session

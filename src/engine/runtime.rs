@@ -129,6 +129,7 @@ impl Engine {
         let (processors, segmentors, translators, filters) =
             install_engine_components(&self.schema.config, &self.build_dir, &self.data_roots);
         self.filters = filters;
+        self.initialize_options();
         if translators.is_empty() {
             // 方案没列 `engine/translators`（或列表里全是还没移植的 translator）：
             // 退回旧的「按 dictionary/prism 直接开拼音词典」路径，保证还能打字。
@@ -459,6 +460,26 @@ impl Engine {
         }
         self.calculate_segmentation(caret);
         self.translate_segments();
+    }
+
+    /// C++ `ConcreteEngine::InitializeOptions`（`engine.cc:616-635`）：
+    /// 方案 `switches:` 里配了 `reset:` 的开关，引擎启动/换方案时落到 context
+    /// 选项——明月简体的 `zh_simp`（`reset: 1`）就靠它置真，simplifier 才会
+    /// 生效。此前没移植，所有开关选项默认 false，simplifier 永远不生效。
+    fn initialize_options(&mut self) {
+        let switches = crate::engine::switches::Switches::new(&self.schema.config);
+        for option in switches.all_options() {
+            if option.reset_value < 0 {
+                continue; // 没配 reset 的开关保持默认
+            }
+            let value = match option.kind {
+                crate::engine::switches::SwitchType::ToggleOption => option.reset_value != 0,
+                crate::engine::switches::SwitchType::RadioGroup => {
+                    option.option_index as i32 == option.reset_value
+                }
+            };
+            self.context.set_option(&option.option_name, value);
+        }
     }
 
     /// C++ `CalculateSegmentation`：让每个 segmentor 依次 `Proceed`，跑完一轮 `Forward`。
