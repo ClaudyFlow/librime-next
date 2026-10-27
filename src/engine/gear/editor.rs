@@ -129,8 +129,12 @@ impl Editor {
     fn perform(&self, ctx: &mut Context, action: &str) -> bool {
         match action {
             "confirm" => {
-                // C++ `Editor::Confirm`：`ConfirmCurrentSelection() || Commit()`
-                let _ = ctx.confirm_current_selection() || ctx.commit();
+                // 对标 C++ `Editor::Confirm`：`ConfirmCurrentSelection()` 先把当前高亮段
+                // 标成 Selected，再由 `commit()` 真正上屏当前高亮候选。
+                // 注意：原生 `ConfirmCurrentSelection() || Commit()` 的 `||` 会短路，
+                // 导致 `Commit()` 永不执行、空格只标记不提交——这里显式两步都走。
+                let _ = ctx.confirm_current_selection();
+                ctx.commit();
                 true
             }
             "toggle_selection" => {

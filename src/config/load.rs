@@ -71,8 +71,90 @@ pub fn load_file(path: &Path) -> Result<serde_json::Value, String> {
                     map.insert("__entries".into(), serde_json::json!(rows));
                 }
             }
+            normalize_dialect(&mut doc);
             Ok(doc)
         }
         _ => Ok(serde_json::json!({ "__documents": docs })),
     }
+}
+
+/// Rime-Next 方言归一化（2026-10-27 定稿的单数键写法 → librime 复数键）。
+///
+/// 方案源文件允许人用**单数**键书写（`dependency` / `switch` / `state` /
+/// `processor` / `initial` / `dict` …），这里在读入时统一翻成 librime 认的
+/// 复数键，所有下游组件（编译器、gear、运行时）不用各自辨认两套词汇。
+///
+/// 规则（**只补缺**：复数键已存在时不动，避免覆盖原生 rime 方案）：
+/// * 顶层：`dependency`→`dependencies`、`switch`→`switches`
+/// * `schema:` 块：`id`→`schema_id`
+/// * `engine:` 块：`processor`→`processors`、`segmentor`→`segmentors`、
+///   `translator`→`translators`、`filter`→`filters`
+/// * `switch:` 列表项：`state`→`states`
+/// * `speller:` 块：`initial`→`initials`
+/// * `translator:` 块：`dict`→`dictionary`
+/// * `reverse_lookup:` 块：`schema`→`dictionary`（反查的是词典）
+///
+/// 别名都**限定上下文**（只在对应的父键下生效），避免误伤词典 / 预设文件里
+/// 恰好同名的键。`import_preset` 引用与 `grammar` 不在此处理。
+fn normalize_dialect(doc: &mut serde_json::Value) {
+    use serde_json::Value;
+
+    /// 把 `from` 键改名为 `to`；`to` 已存在时直接丢弃 `from`（原生写法优先）。
+    fn rename(map: &mut serde_json::Map<String, Value>, from: &str, to: &str) {
+        if let Some(value) = map.remove(from)
+            && !map.contains_key(to)
+        {
+            map.insert(to.to_string(), value);
+        }
+    }
+
+    /// 自顶向下递归：`key` 是当前节点在父映射里的键名（根为 ""）。
+    fn walk(key: &str, value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                for (child_key, child) in map.iter_mut() {
+                    walk(child_key, child);
+                }
+                match key {
+                    "engine" => {
+                        rename(map, "processor", "processors");
+                        rename(map, "segmentor", "segmentors");
+                        rename(map, "translator", "translators");
+                        rename(map, "filter", "filters");
+                    }
+                    "speller" => {
+                        rename(map, "initial", "initials");
+                    }
+                    "translator" => {
+                        rename(map, "dict", "dictionary");
+                    }
+                    "reverse_lookup" => {
+                        rename(map, "schema", "dictionary");
+                    }
+                    "schema" => {
+                        rename(map, "id", "schema_id");
+                    }
+                    _ => {}
+                }
+            }
+            Value::Array(items) => {
+                for item in items.iter_mut() {
+                    // 列表继承父键上下文：switch/switches 的元素是 {name, state, reset}
+                    let is_switch = key == "switch" || key == "switches";
+                    if is_switch
+                        && let Value::Object(map) = item
+                    {
+                        rename(map, "state", "states");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Value::Object(map) = doc {
+        rename(map, "dependency", "dependencies");
+        rename(map, "switch", "switches");
+    }
+    walk("", doc);
 }

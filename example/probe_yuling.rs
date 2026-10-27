@@ -7,14 +7,18 @@ fn main() {
     let staging = PathBuf::from(&staging);
     let mut session = Session::create(&staging, std::env::args().nth(2).unwrap_or("yuling".into()).as_str());
     println!("engine loaded: {}", session.engine.is_some());
-    for ch in std::env::args().nth(3).unwrap_or("yywa".into()).chars() {
+    let input = std::env::args().nth(3).unwrap_or("yywa".into());
+    for ch in input.chars() {
         let ok = session.process_key(ch as u32, 0);
         println!("key {ch}: consumed={ok}");
     }
     let ctx = session.context().unwrap();
     println!("input={:?} composing={}", ctx.input, ctx.is_composing());
     for (i, seg) in ctx.composition.segmentation.segments.iter().enumerate() {
-        println!("seg[{i}] [{},{}) tags={:?} menu={}", seg.start, seg.end, seg.tags,
-            seg.menu.as_ref().map_or(0, |m| m.candidate_count()));
+        if let Some(m) = seg.menu.as_ref() {
+            for (j, c) in m.candidates().iter().enumerate().take(8) {
+                println!("seg[{i}] cand[{j}] [{},{}) q={:.0} text={}", c.start, c.end, c.quality, c.text);
+            }
+        }
     }
 }

@@ -27,6 +27,12 @@
 //! * `diff <A> <B>` —— 把两份解析成 JSON 树，逐路径列出差异（两边自动剔掉 `__build_info`）。
 //! * `emit <输入> <输出>` —— 解析成树、转成 `ConfigItem`，再用**唯一出口**发射一份。
 //! * `compile <源schema> <default.yaml> <输出>` —— 按 config 层的真实语义编译一份方案。
+//! * `admit <schema.yaml> [--user <用户目录>] [--active] [--dry-run]` ——
+//!   方案准入检查（文件头标记 / 实际格式 / `schema:id` 三关），过了才写进
+//!   `<用户目录>/schema/schema.yaml` 点名清单（可视化方案列表）。
+//! * `deploy [--shared <共享目录>] [--user <用户目录>]` —— 跑一次完整部署
+//!   （等价于 Weasel-Next-Engine.exe --deploy）：重编译 `schema/schema.yaml`
+//!   清单里的每个方案，产物落到 `<用户文件夹>/build`。
 //!
 //! ## 读写各自的唯一出口
 //!
@@ -44,6 +50,7 @@
 use std::path::{Path, PathBuf};
 
 use librime_next::config;
+use librime_next::lever::deployer::Deployer;
 use librime_next::load_file;
 
 type Tree = serde_json::Value;
@@ -57,10 +64,16 @@ fn main() {
         [cmd, p] if cmd == "roundtrip" => roundtrip(Path::new(p)),
         // compile <源schema> <default.yaml> <输出>
         [cmd, a, b, c] if cmd == "compile" => compile(Path::new(a), Path::new(b), Path::new(c)),
+        [cmd, path, rest @ ..] if cmd == "admit" => admit_cli(Path::new(path), rest),
+        [cmd, rest @ ..] if cmd == "deploy" => deploy_cli(rest),
         _ => {
             eprintln!("用法:");
             eprintln!("  librime-next parse <目录|文件>    解析并报告");
             eprintln!("  librime-next diff  <A> <B>        逐路径列出差异");
+            eprintln!(
+                "  librime-next admit <schema.yaml> [--user <目录>] [--active] [--dry-run]"
+            );
+            eprintln!("                             方案准入检查，过了才进方案列表");
             std::process::exit(2);
         }
     }
@@ -234,6 +247,148 @@ fn compile(schema: &Path, defaults: &Path, output: &Path) {
         std::process::exit(1);
     }
     println!("已写出 {}", output.display());
+}
+
+/// `admit`：方案准入检查器 CLI。
+///
+/// 三关（文件头标记 / 实际格式匹配 / `schema:id` 内容）全过才把 id 写进
+/// `<用户目录>/schema/schema.yaml` 点名清单；任何一关挂掉不动清单。
+fn admit_cli(path: &Path, flags: &[String]) {
+    use librime_next::lever::admit;
+
+    let mut user_dir: Option<std::path::PathBuf> = None;
+    let mut set_active = false;
+    let mut dry_run = false;
+    let mut i = 0;
+    while i < flags.len() {
+        match flags[i].as_str() {
+            "--active" => set_active = true,
+            "--dry-run" => dry_run = true,
+            "--user" => {
+                i += 1;
+                match flags.get(i) {
+                    Some(dir) => user_dir = Some(std::path::PathBuf::from(dir)),
+                    None => {
+                        eprintln!("--user 后面要跟目录");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            other => {
+                eprintln!("不认识的参数: {other}");
+                std::process::exit(2);
+            }
+        }
+        i += 1;
+    }
+
+    let report = admit::check_schema_file(path);
+    print!("{}", admit::format_report(&report));
+    if !report.passed() {
+        std::process::exit(1);
+    }
+
+    if dry_run {
+        println!("（--dry-run：只检查，不写清单）");
+        return;
+    }
+
+    let user_dir = match user_dir.or_else(admit::default_user_data_dir) {
+        Some(dir) => dir,
+        None => {
+            eprintln!("找不到用户数据目录：请用 --user <目录> 或设 RIME_USER_DIR");
+            std::process::exit(2);
+        }
+    };
+    match admit::admit(path, &user_dir, set_active) {
+        Ok((_, added)) => {
+            let manifest =
+                librime_next::lever::deployment_tasks::load_schema_manifest(&user_dir);
+            if added {
+                println!(
+                    "已加入方案清单 {}（现共 {} 项）",
+                    user_dir.join("schema").join("schema.yaml").display(),
+                    manifest.schemas.len()
+                );
+            } else {
+                println!("该方案已在清单里（不重复加）");
+            }
+            if set_active {
+                println!("active 已指向 {}", manifest.active.unwrap_or_default());
+            }
+            println!("提示：跑一次部署（Weasel-Next-Engine.exe --deploy）后界面列表才更新");
+        }
+        Err(error) => {
+            eprintln!("写清单失败: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `deploy`：跑一次完整部署（installation_update → workspace_update → ...）。
+///
+/// 等价于 Weasel-Next-Engine.exe --deploy：重编译 `schema/schema.yaml` 清单里的每个方案，
+/// 产物落到 `<用户文件夹>/build`。默认目录取真实安装位置，可用参数覆盖：
+/// `librime-next deploy [--shared <共享目录>] [--user <用户目录>]`。
+fn deploy_cli(flags: &[String]) {
+    let mut shared: Option<PathBuf> = None;
+    let mut user: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < flags.len() {
+        match flags[i].as_str() {
+            "--shared" => {
+                i += 1;
+                match flags.get(i) {
+                    Some(d) => shared = Some(PathBuf::from(d)),
+                    None => {
+                        eprintln!("--shared 后面要跟目录");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--user" => {
+                i += 1;
+                match flags.get(i) {
+                    Some(d) => user = Some(PathBuf::from(d)),
+                    None => {
+                        eprintln!("--user 后面要跟目录");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            other => {
+                eprintln!("不认识的参数: {other}");
+                std::process::exit(2);
+            }
+        }
+        i += 1;
+    }
+
+    let user = user
+        .or_else(|| std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("Rime-Next")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let shared = shared.unwrap_or_else(|| {
+        for candidate in [
+            PathBuf::from(r"C:\Program Files\Weasel-Next\Rime-Next"),
+            PathBuf::from(r"C:\code\Weasel-Next\Rime-Next"),
+        ] {
+            if candidate.join("default.yaml").is_file() {
+                return candidate;
+            }
+        }
+        PathBuf::from(".")
+    });
+
+    let mut deployer = Deployer::with_data_dirs(&shared, &user);
+    let ok = deployer.deploy_workspace();
+    println!(
+        "部署完成：ok={ok}（shared={}，user={}）",
+        shared.display(),
+        user.display()
+    );
+    if !ok {
+        std::process::exit(1);
+    }
 }
 
 fn diff(a: &Path, b: &Path) {

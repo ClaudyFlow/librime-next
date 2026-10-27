@@ -117,6 +117,16 @@ impl ResourceResolver {
                 return candidate;
             }
         }
+        // 2026-10-27 方言回退：数据根下**递归**找同名文件。parse 数据住
+        // `parser\<大类>\` 子文件夹（如 `parser\pinyin\pinyin.parser.yaml`），
+        // 方案里只写 `import_preset: pinyin.parser`，不做全名路径拼写。
+        let normalized = base.replace('\\', "/");
+        let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
+        for root in &self.roots {
+            if let Some(found) = find_file_recursive(root, file_name) {
+                return found;
+            }
+        }
         first.unwrap_or_else(|| PathBuf::from(&base))
     }
 
@@ -161,6 +171,33 @@ fn resolve_in_root(root: &Path, base: &str, schema_stem: Option<&str>) -> PathBu
         format!("schema/{series}")
     };
     root.join(&subdir).join(base)
+}
+
+/// 在 `root` 下递归找文件名精确等于 `file_name` 的第一个文件（广度优先）。
+/// 给方言的 `import_preset: <名字>` 用：parse 数据可以住任意子文件夹。
+fn find_file_recursive(root: &Path, file_name: &str) -> Option<PathBuf> {
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(root.to_path_buf());
+    while let Some(dir) = queue.pop_front() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut subdirs = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                subdirs.push(path);
+            } else if path.file_name().and_then(|n| n.to_str()) == Some(file_name) {
+                return Some(path);
+            }
+        }
+        // 目录优先按名字序，保证结果稳定
+        subdirs.sort();
+        for dir in subdirs {
+            queue.push_back(dir);
+        }
+    }
+    None
 }
 
 #[cfg(test)]

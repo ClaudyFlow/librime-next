@@ -750,7 +750,11 @@ fn compare_version_string(left: &str, right: &str) -> i32 {
 }
 
 /// `SchemaUpdate::Run`（C++ deployment_tasks.cc:379-414）：
-/// 1. `schema_id` 取源文件的 `schema/schema_id` 字段（C++ 行为；回退文件名主干）；
+/// 1. 方案 id 取**文件名主干**——Rime-Next 标准里身份由清单确立
+///    （`schema/schema.yaml` 列出的 id = 文件夹名 = 文件名 = 文件内 `schema/id`，
+///    准入四步已验一致性），部署不再读内容键取身份；文件里显式写了
+///    `schema/id` 时做一致性校验，不一致拒收（旧式 `schema_id:` 不读、
+///    迁移由准入与数据迁移负责）；
 /// 2. `ConfigFileUpdate(<id>.schema.yaml, schema/version)` —— 编译写 staging；
 /// 3. reload 产物读 `translator/dictionary` —— 有词典才需要 `Dictionary::Create`
 ///    （`.bin` 编译，Rust 留 dict 层接缝）；没有词典的方案到此为止。
@@ -762,29 +766,38 @@ fn run_schema_update(deployer: &mut Deployer, source_path: &Path, verbose: bool)
         ));
         return false;
     }
-    // schema_id：文件内容的 schema/schema_id 优先（与 C++ 一致），回退文件名主干
-    let schema_id = load_file(source_path)
-        .ok()
-        .and_then(|value| {
-            value
-                .pointer("/schema/schema_id")
-                .and_then(|id| id.as_str())
-                .map(str::to_string)
-        })
-        .or_else(|| {
-            source_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .and_then(|name| name.strip_suffix(".schema.yaml"))
-                .map(str::to_string)
-        });
-    let Some(schema_id) = schema_id.filter(|id| !id.is_empty()) else {
+    // id = 文件名主干（清单归属；准入已保证与 `schema/id` 一致）
+    let Some(schema_id) = source_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".schema.yaml"))
+        .filter(|id| !id.is_empty())
+    else {
         log_warn(&format!(
             "invalid schema definition in '{}'.",
             source_path.display()
         ));
         return false;
     };
+    // 一致性校验：显式写了 `schema/id` 就必须与文件名一致（load_file 已把
+    // 方言单数 `id` 归一化出来；旧式 `schema_id:` 不再参与身份判定）
+    if let Some(declared) = load_file(source_path)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/schema/id")
+                .and_then(|id| id.as_str())
+                .map(str::to_string)
+        })
+        .filter(|id| !id.is_empty())
+        && declared != schema_id
+    {
+        log_warn(&format!(
+            "schema id mismatch in '{}': declared '{declared}', file name says '{schema_id}'.",
+            source_path.display()
+        ));
+        return false;
+    }
     if verbose {
         log_info(&format!("schema: {schema_id} <- {}", source_path.display()));
     }
@@ -894,12 +907,59 @@ fn compile_dictionary(deployer: &mut Deployer, schema_id: &str, verbose: bool) -
 }
 
 /// 编译产物落盘（目录自动建；YAML 序列化用 config 层的 emit）。
+///
+/// 对 `.schema.yaml` 产物按**标准写法**落盘：
+/// 1. 头部注释固定为 Rime-Next 标准三行（[`SCHEMA_HEADER`]）；
+/// 2. `schema.schema_id`（编译期 librime 复数键）反归一化为单数 `schema.id`
+///    （见 [`revert_schema_id`]，与 `normalize_dialect` 的上下文限制一致）。
+/// 其余配置（default.yaml 等）原样序列化：不加头、不动键。
 fn write_compiled_schema(item: &Item, output: &std::path::Path) -> Result<(), String> {
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent).map_err(|err| format!("create_dir_all: {err}"))?;
     }
-    let yaml = config::to_yaml_string(item).map_err(|err| format!("to_yaml_string: {err}"))?;
+    let mut yaml = config::to_yaml_string(item).map_err(|err| format!("to_yaml_string: {err}"))?;
+    if output
+        .file_name()
+        .map_or(false, |name| name.to_string_lossy().ends_with(".schema.yaml"))
+    {
+        yaml = revert_schema_id(yaml);
+        yaml = format!("{SCHEMA_HEADER}\n{yaml}");
+    }
     fs::write(output, yaml).map_err(|err| format!("write: {err}"))
+}
+
+/// Rime-Next 方案文件的标准头注释（与 `pinyin.schema.yaml` 等手写源一致）。
+const SCHEMA_HEADER: &str = "# Rime Schema\n# encode: utf-8\n# newline: lf";
+
+/// 把编译产物里 librime 的复数键 `schema_id` 反归一化为标准单数 `id`。
+///
+/// 只作用于 `schema:` 顶层块（与 `normalize_dialect` 的上下文限制一致：
+/// `id`→`schema_id` 仅在 `schema` 块内发生），其余键一律不动。
+fn revert_schema_id(yaml: String) -> String {
+    let mut in_schema = false;
+    let mut out = String::with_capacity(yaml.len());
+    for line in yaml.lines() {
+        let stripped = line.trim_start();
+        let indent = line.len() - stripped.len();
+        if indent == 0 && stripped.trim_end() == "schema:" {
+            in_schema = true;
+        } else if indent == 0 && !stripped.is_empty() && !stripped.starts_with('#') {
+            // 进入下一个顶层块，退出 schema 作用域
+            in_schema = false;
+        }
+        if in_schema && stripped.starts_with("schema_id:") {
+            if let Some(pos) = line.find("schema_id:") {
+                out.push_str(&line[..pos]);
+                out.push_str("id:");
+                out.push_str(&line[pos + "schema_id:".len()..]);
+                out.push('\n');
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 /// `WorkspaceUpdate::Run`（C++ deployment_tasks.cc:169-292 的移植）。

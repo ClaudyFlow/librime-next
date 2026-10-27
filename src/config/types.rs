@@ -124,7 +124,7 @@ impl Item {
         }
     }
 
-    pub(super) fn as_list(&self) -> Option<ListRef> {
+    pub fn as_list(&self) -> Option<ListRef> {
         if let Item::List(list) = self {
             Some(list.clone())
         } else {

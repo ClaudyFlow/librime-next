@@ -12,7 +12,7 @@ use std::rc::Rc;
 use super::compiler::{
     Dependency, DependencyPriority, IncludeReference, PatchReference, Reference,
 };
-use super::data::{ConfigData, cow, log_error, log_info};
+use super::data::{ConfigData, cow, log_error, log_info, traverse_copy_on_write};
 use super::resource::ResourceResolver;
 use super::types::{Item, ItemRef, MapEntryRef};
 
@@ -254,6 +254,112 @@ impl ConfigCompilerPlugin for LegacyPresetConfigPlugin {
 }
 
 // ---------------------------------------------------------------------------
+// rime_next_dialect_plugin.rs —— Rime-Next 方言扩展（2026-10-27）
+// ---------------------------------------------------------------------------
+
+/// **通用 `import_preset`**：方言允许任意节点写
+///
+/// ```yaml
+/// speller:
+///   algebra:
+///     import_preset: pinyin.parser
+/// ```
+///
+/// 语义：`<路径>/import_preset: <配置id>` —— 用配置 `<id>` 里**同路径**的节点
+/// 整体替换当前节点（对应 legacy 三处那种"从预设文件抄同名节"的行为，只是
+/// 不再限定 key_binder / punctuator / recognizer 三处）。
+///
+/// 只接管"**纯引用节点**"（映射里只有 `import_preset` 一个键）：
+/// * 不会碰 legacy 三处（它们可能带额外键、bindings 有追加语义，仍走
+///   [`LegacyPresetConfigPlugin`]）；
+/// * 也不会碰"引用 + 局部覆盖"的混合写法（那种语义未定，先报错不静默）。
+pub struct GeneralImportPresetPlugin;
+
+impl GeneralImportPresetPlugin {
+    /// 收集"纯引用节点"的路径。路径以 `/` 连接（`cow`/`traverse` 的同一风格）。
+    fn collect(node: &Item, path: &str, out: &mut Vec<(String, String)>) {
+        if let Some(map) = node.as_map() {
+            let borrowed = map.borrow();
+            // 纯引用节点：只有一个键且叫 import_preset
+            if borrowed.len() == 1
+                && let Some(Item::Scalar(id)) = borrowed.get("import_preset")
+            {
+                let first = path.split('/').next().unwrap_or("");
+                // legacy 三处仍由 LegacyPresetConfigPlugin 处理（含 bindings 追加语义）
+                if !matches!(first, "key_binder" | "punctuator" | "recognizer") {
+                    out.push((path.to_string(), id.clone()));
+                }
+                return;
+            }
+            for (key, child) in borrowed.iter() {
+                let child_path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}/{key}")
+                };
+                Self::collect(child, &child_path, out);
+            }
+        } else if let Some(list) = node.as_list() {
+            for (index, child) in list.borrow().iter().enumerate() {
+                let child_path = format!("{path}/{index}");
+                Self::collect(child, &child_path, out);
+            }
+        }
+    }
+}
+
+impl ConfigCompilerPlugin for GeneralImportPresetPlugin {
+    fn review_compile_output(
+        &self,
+        _compiler: &mut ConfigCompiler,
+        _resource: &Rc<ConfigResource>,
+    ) -> bool {
+        true
+    }
+
+    fn review_link_output(
+        &self,
+        compiler: &mut ConfigCompiler,
+        resource: &Rc<ConfigResource>,
+    ) -> bool {
+        if !resource.resource_id.ends_with(".schema") {
+            return true;
+        }
+        let head = resource_ref(resource);
+        let mut targets = Vec::new();
+        let root_item = head.get_item();
+        Self::collect(&root_item, "", &mut targets);
+        for (path, id) in targets {
+            log_info(&format!("interpreting {path}/import_preset: {id}"));
+            // ⚠️ cow() 是**单层键**；这里是多层路径，必须用 traverse_copy_on_write
+            let Some(target) = traverse_copy_on_write(head.clone(), &path) else {
+                log_error(&format!("cannot traverse to {path} for import_preset"));
+                return false;
+            };
+            // 先清空"纯引用节点"，让 include 进来的同路径节点整体落位
+            target.set_item(Item::Null);
+            if !LegacyPresetConfigPlugin::include_preset(
+                compiler,
+                resource,
+                &path,
+                &id,
+                target.clone(),
+            ) {
+                log_error(&format!("failed to import preset {id} at {path}"));
+                return false;
+            }
+            match target.get_item() {
+                Item::List(_) => log_info(&format!("import {path}: list ok")),
+                Item::Map(_) => log_info(&format!("import {path}: map ok")),
+                Item::Scalar(v) => log_info(&format!("import {path}: scalar {v:?}")),
+                Item::Null => log_info(&format!("import {path}: NULL (!!)")),
+            }
+        }
+        true
+    }
+}
+
+// ---------------------------------------------------------------------------
 // legacy_dictionary_config_plugin.cc
 // ---------------------------------------------------------------------------
 
@@ -446,6 +552,7 @@ impl ConfigBuilder {
         builder.install_plugin(Rc::new(AutoPatchConfigPlugin));
         builder.install_plugin(Rc::new(DefaultConfigPlugin));
         builder.install_plugin(Rc::new(LegacyPresetConfigPlugin));
+        builder.install_plugin(Rc::new(GeneralImportPresetPlugin));
         builder.install_plugin(Rc::new(LegacyDictionaryConfigPlugin));
         builder.install_plugin(Rc::new(BuildInfoPlugin));
         builder

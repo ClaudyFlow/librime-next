@@ -38,6 +38,14 @@ name = "all_schemas_e2e"
 path = "test/all_schemas_e2e.rs"
 
 [[test]]
+name = "full_pinyin_journey"
+path = "test/full_pinyin_journey.rs"
+
+[[test]]
+name = "pinyin_typing"
+path = "test/pinyin_typing.rs"
+
+[[test]]
 name = "algebra_real_rules"
 path = "test/algebra_real_rules.rs"
 
@@ -61,6 +69,10 @@ path = "test/key_order.rs"
 name = "lever_deploy"
 path = "test/lever_deploy.rs"
 
+[[test]]
+name = "rime_next_dialect"
+path = "test/rime_next_dialect.rs"
+
 [[example]]
 name = "algo_real"
 path = "example/algo_real.rs"
@@ -72,6 +84,10 @@ path = "example/deploy_diff.rs"
 [[example]]
 name = "deploy_luna"
 path = "example/deploy_luna.rs"
+
+[[example]]
+name = "probe_weight"
+path = "example/probe_weight.rs"
 
 [[example]]
 name = "probe_yuling2"
