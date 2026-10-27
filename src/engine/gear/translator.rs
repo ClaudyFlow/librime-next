@@ -10,19 +10,21 @@ use crate::engine::gear::poet::{Poet, Sentence, WordGraph};
 use crate::engine::gear::translator_options::TranslatorOptions;
 use crate::engine::segmentation::Segment;
 
-/// 整句候选在 `quality` 上的基数，远大于词级的 `音节数 * 1000 + weight` 量级。
+/// 候选质量的统一尺度，对齐 C++ `ScriptTranslation::Evaluate` 的结构序：
 ///
-/// C++ 靠 `PrepareCandidate` 的分支顺序让整句排最前；LRN 的菜单统一按 `quality`
-/// 降序排，所以把"整句优先"编码进分数里。见 [`ScriptTranslator::sentence_candidates`]。
-const SENTENCE_QUALITY_BASE: f64 = 1.0e6;
-
-/// 用户词典候选的 `quality` 基数：排在**整句之后、词表之前**。
+/// ```text
+/// quality = 码长(音节数) × 1e12 + 层级 × 1e9 + weight(对数尺度)
+/// 层级:整句 2 > 用户词典 1 > 系统词表 0(C++ PrepareCandidate 的分支顺序)
+/// ```
 ///
-/// C++ 的 `ScriptTranslation::Evaluate` 给用户词典词条一个 `credibility` 加成
-/// （`kUserDict` 分支），靠 `Translation` 内部的排序把它顶到词表词条前面。
-/// LRN 的菜单是单一 `quality` 排序，所以用一个高于词级（`音节数 * 1000 + weight`，
-/// 实测量级 1e3~1e4）但低于整句（1e6）的基数来表达"学过的最优先"。
-const USER_DICT_QUALITY_BASE: f64 = 1.0e5;
+/// C++ 里"整句/用户词优先"靠 `PrepareCandidate` 的分支顺序、"长码优先"靠
+/// `DictEntryCollector` 按 code_length 分桶 + `rbegin()` 最长先消费
+/// （`script_translator.cc:479`）——都是**结构序**，与数值无关。LRN 的菜单是
+/// 单一 `quality` 降序，所以把两级结构序都编码进分数：码长是主台阶
+/// （1e12 远超任何 weight 摆动），同码长内层级定"学过的最优先"。
+const QUALITY_SYLLABLE_STRIDE: f64 = 1.0e12;
+const QUALITY_TIER_SENTENCE: f64 = 2.0e9;
+const QUALITY_TIER_USER: f64 = 1.0e9;
 
 /// 翻译器（对照 C++ `Translator::Query(input, segment)`）。
 ///
@@ -204,7 +206,10 @@ impl ScriptTranslator {
             0,
             consumed,
             sentence.text,
-            SENTENCE_QUALITY_BASE + sentence.weight + self.options.initial_quality,
+            sentence.segments.len() as f64 * QUALITY_SYLLABLE_STRIDE
+                + QUALITY_TIER_SENTENCE
+                + sentence.weight
+                + self.options.initial_quality,
         );
         if !preedit.is_empty() {
             candidate = candidate.with_preedit(preedit);
@@ -317,7 +322,8 @@ impl ScriptTranslator {
                 if self.options.blacklist.contains(&entry.text) {
                     continue;
                 }
-                let quality = USER_DICT_QUALITY_BASE + entry.weight;
+                let quality =
+                    entry.code.len() as f64 * QUALITY_SYLLABLE_STRIDE + QUALITY_TIER_USER + entry.weight;
                 let mut candidate =
                     Candidate::new("script", 0, end, entry.text.clone(), quality).with_entry(entry);
                 let preedit = self.build_preedit(input, end);

@@ -86,16 +86,16 @@ name = "deploy_luna"
 path = "example/deploy_luna.rs"
 
 [[example]]
+name = "probe_trace"
+path = "example/probe_trace.rs"
+
+[[example]]
 name = "probe_weight"
 path = "example/probe_weight.rs"
 
 [[example]]
 name = "probe_yuling2"
 path = "example/probe_yuling2.rs"
-
-[[example]]
-name = "probe_yuling"
-path = "example/probe_yuling.rs"
 
 [[example]]
 name = "deploy_real"

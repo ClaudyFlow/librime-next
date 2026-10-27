@@ -391,6 +391,8 @@ impl Engine {
                 self.schema = schema;
                 self.initialize_components();
                 self.context.clear();
+                // C++ `Schema::page_size` 是引擎级的：selector 翻页、c_api 菜单都读它
+                self.context.page_size = self.schema.page_size;
                 // C++ `engine.cc:377`：切成功后 `switcher_->SetActiveSchema()`，
                 // 记下"上次用的方案"与访问时间 —— 菜单里的方案排序靠它。
                 switcher::record_active_schema(self.user_dir.as_deref(), schema_id);
@@ -447,11 +449,12 @@ impl Engine {
             }
         }
         if input.is_empty() {
+            // C++ `Compose("")` 的落点：`Reset("")` 弹光旧段后 `Forward()` 补的
+            // 空段，会被 `CalculateSegmentation` 尾部的 `Trim()` 摘掉——组合最终
+            // 为**空**，`IsComposing()` 才回到 false（Esc 清场的判定就靠它）。
+            // 这里不能学 C++ 补空段再摘，直接清干净即可。
             let comp = &mut self.context.composition;
             comp.segmentation.segments.clear();
-            comp.segmentation
-                .segments
-                .push(Segmentation::segment_zero(0));
             return;
         }
         self.calculate_segmentation(caret);

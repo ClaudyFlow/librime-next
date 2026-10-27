@@ -101,7 +101,7 @@ fn full_pinyin_typing_journey() {
     }
 
     // ---- ⑨ 长输入组词:tianqibucuo → 候选非空 ----------------------------
-    assert_eq!(type_str(&mut s, "tianqibucuo"), 10);
+    assert_eq!(type_str(&mut s, "tianqibucuo"), 11, "tian-q-i-bu-cuo = 11 个字母");
     let cands = candidates(&s);
     assert!(!cands.is_empty(), "天气不错 应有候选,前几个 {:?}", &cands[..cands.len().min(6)]);
     s.process_key(0xff1b, 0); // Esc

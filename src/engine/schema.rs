@@ -19,6 +19,9 @@ pub struct Schema {
     pub page_size: usize,
     /// `menu/alternative_select_keys`（C++ `Schema::select_keys`）。
     pub select_keys: String,
+    /// `menu/page_down_cycle`（C++ `Schema::page_down_cycle`）：
+    /// 末页再下翻时是否回到第一页。
+    pub page_down_cycle: bool,
 }
 
 impl Schema {
@@ -62,12 +65,17 @@ impl Schema {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        let page_down_cycle = config
+            .pointer("/menu/page_down_cycle")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         Some(Schema {
             schema_id: schema_id.to_string(),
             schema_name,
             config,
             page_size,
             select_keys,
+            page_down_cycle,
         })
     }
 
@@ -80,6 +88,7 @@ impl Schema {
             config: serde_json::Value::Object(serde_json::Map::new()),
             page_size: 5,
             select_keys: String::new(),
+            page_down_cycle: false,
         }
     }
 
@@ -96,6 +105,7 @@ impl Schema {
             config,
             page_size,
             select_keys: String::new(),
+            page_down_cycle: false,
         }
     }
 

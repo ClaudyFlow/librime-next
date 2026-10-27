@@ -117,10 +117,14 @@ impl Dictionary {
                         let text = table.entry_text(&entry);
                         if !text.is_empty() {
                             let weight = entry.weight as f64;
+                            // 质量尺度:码长(音节数)是主台阶——C++ 的
+                            // DictEntryCollector 按 code_length 分桶、rbegin()
+                            // 最长码先消费(`script_translator.cc:479`);同码长内
+                            // 才比 weight(对数尺度)。1e12 台阶远超任何 weight 摆动。
                             out.push(DictEntry {
                                 text,
                                 weight,
-                                quality: syllables * 1000.0 + weight,
+                                quality: syllables * 1.0e12 + weight,
                                 end: start,
                                 comment: String::new(),
                                 code: code.clone(),
