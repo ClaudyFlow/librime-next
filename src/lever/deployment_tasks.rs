@@ -191,7 +191,7 @@ fn run_installation_update(deployer: &mut Deployer) -> bool {
         if let Some(sync_dir) = crate::lever::tree::get_string(&config, "sync_dir") {
             deployer.sync_dir = PathBuf::from(sync_dir);
         } else {
-            deployer.sync_dir = deployer.user_data_dir.join("sync");
+            deployer.sync_dir = deployer.user_data_dir.join(crate::lever::paths::SYNC_DIR);
         }
         log_info(&format!("sync dir: {}", deployer.sync_dir.display()));
         if let Some(backup) = crate::lever::tree::get_bool(&config, "backup_config_files") {

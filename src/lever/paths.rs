@@ -76,6 +76,8 @@ pub const PLUGIN_DIR: &str = "plugin";
 pub const USERDB_DIR: &str = "userdb";
 pub const TRASH_DIR: &str = "trash";
 pub const SYNC_DIR: &str = "sync";
+pub const BACKUP_DIR: &str = "backup";
+pub const OPENCC_DIR: &str = "opencc";
 
 /// `schema/` 下的**方案清单文件名**（点名制：`schemas:` 列出要部署的方案 id）。
 ///

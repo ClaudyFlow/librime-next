@@ -115,7 +115,7 @@ mod tests {
         // 真机数据:优先程序目录,其次用户目录
         let candidates = [
             std::path::PathBuf::from(r"C:\Program Files\Weasel-Next\Rime-Next\opencc\TSCharacters.ocd2"),
-            dir.join("opencc").join("TSCharacters.ocd2"),
+            dir.join(crate::lever::paths::OPENCC_DIR).join("TSCharacters.ocd2"),
         ];
         let Some(path) = candidates.iter().find(|p| p.is_file()) else {
             eprintln!("跳过:没有真机 opencc 数据");

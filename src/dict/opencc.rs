@@ -265,7 +265,7 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("Rime-Next")
-            .join("opencc")
+            .join(crate::lever::paths::OPENCC_DIR)
     }
 
     #[test]

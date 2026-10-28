@@ -350,13 +350,13 @@ pub fn create_filter(ticket: &Ticket) -> Option<Box<dyn Filter + Send + Sync>> {
             // 而 opencc 落在**共享目录** —— 所以必须按 roots 逐个试，不能只看 `build_dir.parent()`。
             for root in ticket.data_roots {
                 if let Some(simplifier) =
-                    Simplifier::new(&root.join("opencc"), config_name, option_name.clone())
+                    Simplifier::new(&root.join(crate::lever::paths::OPENCC_DIR), config_name, option_name.clone())
                 {
                     return Some(Box::new(simplifier));
                 }
             }
             // 单根布局（roots 为空）时的回退：兼容直接构造 Ticket 的调用方。
-            let opencc_dir = ticket.build_dir.parent()?.join("opencc");
+            let opencc_dir = ticket.build_dir.parent()?.join(crate::lever::paths::OPENCC_DIR);
             Simplifier::new(&opencc_dir, config_name, option_name)
                 .map(|s| Box::new(s) as Box<dyn Filter + Send + Sync>)
         }
@@ -554,7 +554,7 @@ pub fn create_translator(ticket: &Ticket) -> Option<Box<dyn Translator + Send + 
                         .and_then(|v| v.as_str())
                         .and_then(|name| {
                             ticket.data_roots.iter().find_map(|root| {
-                                let path = root.join("opencc").join(name);
+                                let path = root.join(crate::lever::paths::OPENCC_DIR).join(name);
                                 path.is_file().then_some(path)
                             })
                         })

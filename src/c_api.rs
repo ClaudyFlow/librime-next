@@ -464,7 +464,7 @@ unsafe extern "C" fn rime_deployer_initialize(traits: *mut RimeTraits) {
     //   `deployer_initialize` 之后直接改 `Deployer.staging_dir` 字段。
     d.prebuilt_data_dir = PathBuf::new();
     d.staging_dir = d.user_data_dir.join("build");
-    d.sync_dir = d.user_data_dir.join("sync");
+    d.sync_dir = d.user_data_dir.join(crate::lever::paths::SYNC_DIR);
     if let Some(v) = read_cstr(t.log_dir) {
         d.log_dir = PathBuf::from(v);
     }
