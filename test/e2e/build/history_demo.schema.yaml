@@ -37,7 +37,7 @@ speller:
   alphabet: "zyxwvutsrqponmlkjihgfedcba"
   delimiter: " '"
 translator:
-  dictionary: luna_pinyin
+  dict: luna_pinyin
   # 词典名与拼写表名不同：`luna_pinyin.table.bin` + `luna_pinyin_simp.prism.bin`
   prism: luna_pinyin_simp
 history:

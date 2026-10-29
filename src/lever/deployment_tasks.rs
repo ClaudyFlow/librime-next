@@ -756,7 +756,7 @@ fn compare_version_string(left: &str, right: &str) -> i32 {
 ///    `schema/id` 时做一致性校验，不一致拒收（旧式 `schema_id:` 不读、
 ///    迁移由准入与数据迁移负责）；
 /// 2. `ConfigFileUpdate(<id>.schema.yaml, schema/version)` —— 编译写 staging；
-/// 3. reload 产物读 `translator/dictionary` —— 有词典才需要 `Dictionary::Create`
+/// 3. reload 产物读 `translator/dict`（正式键；旧产物回退 `dictionary`）—— 有词典才需要 `Dictionary::Create`
 ///    （`.bin` 编译，Rust 留 dict 层接缝）；没有词典的方案到此为止。
 fn run_schema_update(deployer: &mut Deployer, source_path: &Path, verbose: bool) -> bool {
     if !source_path.is_file() {
@@ -812,30 +812,33 @@ fn run_schema_update(deployer: &mut Deployer, source_path: &Path, verbose: bool)
     // 2. reload 产物，看要不要编译词典（.bin 在 dict 层，留接缝）
     let layout = deployer.layout();
     let staged = layout.compiled_schema(&schema_id);
-    // 要不要编译词典:主 `translator/dictionary`,或任何**变体节**(`simp:` /
-    // `trad:` … 顶层带 `dict:`/`dictionary:` 的节,Rime-Next 双变体设计)。
+    // 要不要编译词典:主 `translator/dict`，
+    // 或 `translator` 下的变体节 (`translator/simp` / `translator/trad` …,Rime-Next 双变体设计)。
+    // 只认嵌套写法:旧式顶层 `simp:` / `trad:` 不再识别。
     let has_dictionary = load_file(&staged)
         .ok()
         .and_then(|value| {
             let main = value
-                .pointer("/translator/dictionary")
+                .pointer("/translator/dict")
                 .and_then(|name| name.as_str())
                 .map(str::to_string)
                 .is_some_and(|name| !name.is_empty());
-            let variants = value.as_object().is_some_and(|map| {
-                map.iter()
-                    .any(|(key, node)| {
-                        key != "translator"
-                            && node
-                                .get("dict")
-                                .or_else(|| node.get("dictionary"))
-                                .and_then(|v| v.as_str())
-                                .is_some_and(|name| !name.is_empty())
+            // 变体节只认 `translator` 下的子项
+            let variants = value
+                .pointer("/translator")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|tr| {
+                    tr.iter().any(|(_, node)| {
+                        node.get("dict")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|name| !name.is_empty())
                     })
-            });
+                });
             Some(main || variants)
         })
         .unwrap_or(false);
+    // 词库一律**单文件直接用**：`translator/dict` 指到哪本就编译哪本，
+    // 部署期不做 opencc 生成（没有 simp/trad 标记的更不碰）。
     if has_dictionary {
         // Dictionary::Create + DictCompiler::Compile（C++ deployment_tasks.cc:402-429）
         compile_dictionary(deployer, &schema_id, verbose)
@@ -848,16 +851,17 @@ fn run_schema_update(deployer: &mut Deployer, source_path: &Path, verbose: bool)
 /// `DictionaryComponent::Create` + `DictCompiler::Compile`
 /// （C++ `deployment_tasks.cc:402-429` + `dictionary.cc:425-451`）。
 ///
-/// 配置语义：`translator/dictionary` 必填（空 = 不需要静态词典）；
+/// 配置语义：`translator/dict` 必填（正式键，2026-10-28 定；旧产物 `dictionary` 也认；
+/// 空 = 不需要静态词典）；
 /// `translator/prism` 缺省 = dict_name；`translator/packs` 是字符串列表。
 /// `schema_file` 用 deployed resolver 解出的编译产物（staging 优先、prebuilt 回退），
 /// 与 C++ `resolver->ResolvePath(schema_id)` 一致。
 ///
-/// Rime-Next 双变体扩展（2026-10-27 设计）：除主 `translator/dictionary` 外，
-/// 顶层任何带 `dict:`/`dictionary:` 键的节（`simp:` / `trad:` …）都是**一个变体
-/// 词库**，逐个编译。变体词源缺失时**跳过不报错**——运行时该变体走 opencc
-/// 兜底（`<变体>/fallback` + `<变体>/opencc`），这正是"一个方案挂两本词库、
-/// 缺哪本 opencc 补"的部署侧配合。
+/// Rime-Next 双变体扩展（2026-10-27 设计，2026-10-28 定稿）：主 `translator/dict`
+/// 之外，嵌套在 `translator` 下、带 `dict:` 的子项（`translator/simp` /
+/// `translator/trad` …）是**一个变体词库**，逐个编译。旧式顶层 `simp:` / `trad:` 一节
+/// 不再识别（不兼容）。词库一律单文件直接用：变体（`translator/simp` / `translator/trad`）
+/// 各自指到一份现成的 `.dict.yaml`，**不做 opencc 生成/转换**；源缺失就跳过该变体。
 fn compile_dictionary(deployer: &mut Deployer, schema_id: &str, verbose: bool) -> bool {
     let layout = deployer.layout();
     let compiled_schema = layout.compiled_schema(schema_id);
@@ -869,10 +873,10 @@ fn compile_dictionary(deployer: &mut Deployer, schema_id: &str, verbose: bool) -
         return false;
     };
 
-    // 词典清单:主 `translator/dictionary` + 顶层变体节(`simp:` / `trad:` …)
+    // 词典清单:主 `translator/dict` + 变体节(`simp:` / `trad:` …)
     let mut entries: Vec<(String, String, String, bool)> = Vec::new(); // (节名, dict, prism, 可跳过)
     if let Some(dict_name) = config
-        .pointer("/translator/dictionary")
+        .pointer("/translator/dict")
         .and_then(|name| name.as_str())
         .map(str::to_string)
     {
@@ -887,14 +891,12 @@ fn compile_dictionary(deployer: &mut Deployer, schema_id: &str, verbose: bool) -
             .unwrap_or_else(|| dict_name.clone());
         entries.push(("translator".to_string(), dict_name, prism_name, false));
     }
-    if let Some(map) = config.as_object() {
-        for (key, node) in map {
-            if key == "translator" {
-                continue; // 主词典上面已处理
-            }
+    // 变体词库只认嵌套在 `translator` 下的子项（translator/simp / translator/trad …）。
+    // 旧式顶层 `simp:` / `trad:` 不再识别。
+    if let Some(translator) = config.pointer("/translator").and_then(|t| t.as_object()) {
+        for (key, node) in translator {
             let Some(dict_name) = node
                 .get("dict")
-                .or_else(|| node.get("dictionary"))
                 .and_then(|v| v.as_str())
                 .map(str::to_string)
             else {
@@ -908,12 +910,12 @@ fn compile_dictionary(deployer: &mut Deployer, schema_id: &str, verbose: bool) -
                 .and_then(|v| v.as_str())
                 .map(str::to_string)
                 .unwrap_or_else(|| dict_name.clone());
-            entries.push((key.clone(), dict_name, prism_name, true));
+            entries.push((format!("translator/{key}"), dict_name, prism_name, true));
         }
     }
     if entries.is_empty() {
         log_error(&format!(
-            "translator/dictionary not specified in schema '{schema_id}'."
+            "translator/dict not specified in schema '{schema_id}'."
         ));
         return false;
     }
@@ -958,8 +960,7 @@ fn compile_dictionary(deployer: &mut Deployer, schema_id: &str, verbose: bool) -
             Err(error) => {
                 if skippable && dict_source_missing(&error) {
                     log_info(&format!(
-                        "variant dictionary '{dict_name}' ({section}) has no source; \
-                         opencc fallback at runtime."
+                        "variant dictionary '{dict_name}' ({section}) has no source; skipped."
                     ));
                     continue;
                 }
@@ -1294,6 +1295,7 @@ mod tests {
         assert!(DeploymentTask::from_name("").is_none());
     }
 
+    #[test]
     #[test]
     fn all_eleven_tasks_are_now_implemented() {
         let mut deployer = Deployer::new();

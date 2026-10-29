@@ -67,6 +67,7 @@ fn main() {
         [cmd, path, rest @ ..] if cmd == "admit" => admit_cli(Path::new(path), rest),
         [cmd, rest @ ..] if cmd == "deploy" => deploy_cli(rest),
         [cmd, rest @ ..] if cmd == "manifest" => manifest_cli(rest),
+        [cmd, rest @ ..] if cmd == "dicts" => dicts_cli(rest),
         _ => {
             eprintln!("用法:");
             eprintln!("  librime-next parse <目录|文件>    解析并报告");
@@ -75,6 +76,8 @@ fn main() {
                 "  librime-next admit <schema.yaml> [--user <目录>] [--active] [--dry-run]"
             );
             eprintln!("                             方案准入检查，过了才进方案列表");
+            eprintln!("  librime-next dicts [--shared <目录>] [--user <目录>]");
+            eprintln!("                             词库识别：列 `<根>/dict/**` 的收下/抛弃名单");
             std::process::exit(2);
         }
     }
@@ -479,6 +482,68 @@ fn manifest_cli(flags: &[String]) {
     println!("  active: {}", manifest.active.as_deref().unwrap_or("<无>"));
     for id in &manifest.schemas {
         println!("    - {id}");
+    }
+}
+
+/// `dicts`：词库识别（`<数据根>/dict/**/*.dict.yaml`），与 `manifest` 同构。
+///
+/// 四关与方案完全同一套：文件头标记 → 实际编码/换行 → 顶层 `id:` 单数写法/内容/
+/// 与文件名一致 → 系列摆放（`dict/<id 按点分段>/…`）。只报告，不写任何清单。
+fn dicts_cli(flags: &[String]) {
+    use librime_next::lever::schema_list;
+
+    let mut shared: Option<PathBuf> = None;
+    let mut user: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < flags.len() {
+        match flags[i].as_str() {
+            "--shared" | "--root" => {
+                i += 1;
+                shared = flags.get(i).map(PathBuf::from);
+                if shared.is_none() {
+                    eprintln!("--shared 后面要跟目录");
+                    std::process::exit(2);
+                }
+            }
+            "--user" => {
+                i += 1;
+                user = flags.get(i).map(PathBuf::from);
+                if user.is_none() {
+                    eprintln!("--user 后面要跟目录");
+                    std::process::exit(2);
+                }
+            }
+            other => {
+                eprintln!("不认识的参数: {other}");
+                std::process::exit(2);
+            }
+        }
+        i += 1;
+    }
+
+    let user = user
+        .or_else(|| std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("Rime-Next")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let shared = shared.unwrap_or_else(default_shared_dir);
+    println!("程序文件夹（shared）: {}", shared.display());
+    println!("用户文件夹（user）  : {}", user.display());
+
+    let found = schema_list::discover_roots_dicts(&[shared.clone(), user.clone()]);
+    println!(
+        "\n== 词库识别：收下 {} / 抛弃 {} ==",
+        found.accepted.len(),
+        found.rejected.len()
+    );
+    for item in &found.accepted {
+        println!(
+            "  [收下] {:<24} {}  ({})",
+            item.id,
+            item.name.as_deref().unwrap_or(""),
+            item.path.display()
+        );
+    }
+    for (path, reason) in &found.rejected {
+        println!("  [抛弃] {}\n         └─ {reason}", path.display());
     }
 }
 

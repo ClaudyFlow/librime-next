@@ -94,7 +94,7 @@ impl Engine {
             data_roots.to_vec()
         };
         let user_dir = data_roots.first().cloned();
-        let default_config = switcher::load_default_config(&data_roots);
+        let default_config = switcher::load_default_config(build_dir, &data_roots);
         // `.default` / 空 id：C++ 的 `Switcher` 在这个位置替引擎挑一个方案
         // （`engine.cc:570-574`：`if (schema_->schema_id() == ".default")` 用
         // `switcher_->CreateSchema()` 的结果）。挑法是"上次用过的，否则清单第一条"。

@@ -30,7 +30,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::paths::{BUILD_DIR, EASSY_DIR, MODEL_DIR, PLUGIN_DIR, SCHEMA_DIR, THEME_DIR};
+use super::paths::{BUILD_DIR, DICT_DIR, EASSY_DIR, MODEL_DIR, PLUGIN_DIR, SCHEMA_DIR, THEME_DIR};
 
 // --------------------------------------------------------------------------
 // 资源类别与摆放规则
@@ -77,7 +77,8 @@ impl ResourceKind {
     /// `None` 表示就在数据根下扁平放置。
     pub fn category_root(self) -> Option<&'static str> {
         match self {
-            ResourceKind::Schema | ResourceKind::Dict => Some(SCHEMA_DIR),
+            ResourceKind::Schema => Some(SCHEMA_DIR),
+            ResourceKind::Dict => Some(DICT_DIR),
             ResourceKind::Theme => Some(THEME_DIR),
             ResourceKind::Lua | ResourceKind::PluginData => Some(PLUGIN_DIR),
             ResourceKind::Essay => Some(EASSY_DIR),
@@ -516,10 +517,10 @@ mod tests {
 
     #[test]
     fn dict_series_and_bin_naming() {
-        // a.b.c → schema/a/b/c/a.b.c.dict.yaml；文件名永远是完整 id
+        // a.b.c → dict/a/b/c/a.b.c.dict.yaml；文件名永远是完整 id
         let root = temp("dict-series");
         let _ = std::fs::remove_dir_all(&root);
-        let dict = root.join("schema/a/b/c/a.b.c.dict.yaml");
+        let dict = root.join("dict/a/b/c/a.b.c.dict.yaml");
         touch(&dict);
         let scanned = classify(&dict, &root).expect("应识别");
         assert_eq!(scanned.resource_id, "a.b.c");

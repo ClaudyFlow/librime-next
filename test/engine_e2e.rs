@@ -6,7 +6,7 @@
 use librime_next::dict::dictionary::Dictionary;
 use librime_next::engine::gear::charset_filter::is_extended_cjk;
 use librime_next::engine::{SelectResult, Session};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn build_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test/e2e/build")
@@ -47,6 +47,36 @@ fn type_ascii(session: &mut Session, s: &str) {
 /// **关键**：必须按真机宿主的 `data_roots` 顺序传根 —— 用户目录优先、共享目录其次，
 /// 否则 `grammar`（`model/*.gram`）和 `simplifier`（`opencc/`）找不到资源，
 /// 会误判成"引擎没修好"。
+/// 真机部署产物是不是"新键"那一版（`translator/dict`）。
+///
+/// 2026-10-28 20:5x 起词库键只认 `dict`、**去掉** `dictionary:` 兼容层。旧的部署产物
+/// 读不出词库（0 候选），属于"还没重新部署"，不是代码回归 —— 这种环境跳过真机复现。
+fn real_build_uses_dict_key(build: &Path) -> bool {
+    let mut stack = vec![build.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".schema.yaml"))
+            {
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    if text.contains("\n  dict:") {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 #[test]
 fn repro_real_luna_pinyin() {
     let appdata = std::env::var("APPDATA").unwrap_or_default();
@@ -55,6 +85,10 @@ fn repro_real_luna_pinyin() {
     let shared_dir = PathBuf::from("C:/Program Files/Weasel-Next/Rime-Next");
     if !real_build.exists() {
         eprintln!("skip: 真实 build 目录不存在");
+        return;
+    }
+    if !real_build_uses_dict_key(&real_build) {
+        eprintln!("skip: 真实产物还是旧键（dictionary:），重新部署后再跑");
         return;
     }
     println!("REAL build dir: {}", real_build.display());

@@ -60,9 +60,17 @@ impl TranslatorOptions {
             blacklist: HashSet::new(),
         };
 
+        // 变体命名空间（simp/trad）配置挂在 `translator/` 下（Rime-Next 双变体设计，
+        // 2026-10-28），读键时加 `translator/` 前缀；其余命名空间原样。
+        let section_prefix = if name_space == "simp" || name_space == "trad" {
+            format!("/translator/{name_space}")
+        } else {
+            format!("/{name_space}")
+        };
+
         // 分隔符：先本命名空间，回退 `speller/delimiter`。键是单数 `delimiter`。
         if let Some(v) = config
-            .pointer(&format!("/{}/delimiter", name_space))
+            .pointer(&format!("{}/delimiter", section_prefix))
             .or_else(|| config.pointer("/speller/delimiter"))
             .and_then(Value::as_str)
         {
@@ -73,19 +81,19 @@ impl TranslatorOptions {
         }
 
         if let Some(v) = config
-            .pointer(&format!("/{}/enable_completion", name_space))
+            .pointer(&format!("{}/enable_completion", section_prefix))
             .and_then(Value::as_bool)
         {
             options.enable_completion = v;
         }
         if let Some(v) = config
-            .pointer(&format!("/{}/initial_quality", name_space))
+            .pointer(&format!("{}/initial_quality", section_prefix))
             .and_then(Value::as_f64)
         {
             options.initial_quality = v;
         }
         if let Some(v) = config
-            .pointer(&format!("/{}/strict_spelling", name_space))
+            .pointer(&format!("{}/strict_spelling", section_prefix))
             .and_then(Value::as_bool)
         {
             options.strict_spelling = v;
@@ -94,7 +102,7 @@ impl TranslatorOptions {
         // tag / tags：配了 `tag` 就替换第一个；**没配** `tag` 就把默认的 `abc` 清空，
         // 完全交给 `tags` 列表（translator_commons.cc:145-158）。
         let tag = config
-            .pointer(&format!("/{}/tag", name_space))
+            .pointer(&format!("{}/tag", section_prefix))
             .and_then(Value::as_str)
             .map(str::to_string);
         match tag {
@@ -102,7 +110,7 @@ impl TranslatorOptions {
             None => options.tags.clear(),
         }
         if let Some(list) = config
-            .pointer(&format!("/{}/tags", name_space))
+            .pointer(&format!("{}/tags", section_prefix))
             .and_then(Value::as_array)
         {
             for item in list {
@@ -117,14 +125,14 @@ impl TranslatorOptions {
 
         // 格式化规则：节点不存在是常态（C++ `Load` 拿空列表直接返回 false），不算错误。
         options.preedit_formatter =
-            Projection::from_config_path(config, &format!("{}/preedit_format", name_space))
+            Projection::from_config_path(config, &format!("{}/preedit_format", section_prefix))
                 .unwrap_or_default();
         options.comment_formatter =
-            Projection::from_config_path(config, &format!("{}/comment_format", name_space))
+            Projection::from_config_path(config, &format!("{}/comment_format", section_prefix))
                 .unwrap_or_default();
 
         if let Some(list) = config
-            .pointer(&format!("/{}/dictionary_exclude", name_space))
+            .pointer(&format!("{}/dictionary_exclude", section_prefix))
             .and_then(Value::as_array)
         {
             for item in list {

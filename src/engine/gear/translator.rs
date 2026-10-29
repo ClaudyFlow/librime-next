@@ -89,9 +89,6 @@ pub struct ScriptTranslator {
     /// 用户词典（`Translator::user_dict_`）。`None` = 方案没开 `enable_user_dict`
     /// 或者拿不到词典名。
     pub user_dict: Option<UserDictionary>,
-    /// 变体词库缺失时的 opencc 兜底（Rime-Next 设计：一个方案挂 simp/trad 两本
-    /// 词库，缺的那本借另一本 + opencc 实时转换）。`None` = 不转换。
-    pub convert: Option<crate::dict::opencc::Opencc>,
 }
 
 impl ScriptTranslator {
@@ -105,7 +102,6 @@ impl ScriptTranslator {
             options,
             poet: Poet::new(None),
             user_dict: None,
-            convert: None,
         }
     }
 
@@ -389,11 +385,6 @@ impl Translator for ScriptTranslator {
         }
         out.append(&mut words);
 
-        if let Some(opencc) = self.convert.as_ref() {
-            for c in &mut out {
-                c.text = opencc.convert(&c.text);
-            }
-        }
         for c in &mut out {
             self.options.format_comment(&mut c.comment);
             self.options.format_preedit(&mut c.preedit);

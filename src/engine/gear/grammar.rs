@@ -25,7 +25,9 @@
 //! * 完全没有命中 → `non_collocation_penalty`(-12)
 //! * 整句末尾（`is_rear`）再查一次 `word + "$"`，命中则给 `rear_penalty`(-18)
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::Value;
 
@@ -199,9 +201,14 @@ fn first_n_unicode(text: &str, max: usize) -> (usize, usize) {
 }
 
 /// 语法模型实例（`class Octagram`，`octagram.h:19-33`）。
+///
+/// Rime-Next 2026-10-28 扩展：**可以挂多本 `.gram`**。方案里写的是**前缀**
+/// （`model: zh-han.simp`），引擎把所有 `zh-han.simp.*.gram` 都挂上，查询时取
+/// 各本里最高的分（与单本内部"取最大"的语义一致）。
 pub struct Octagram {
     config: GrammarConfig,
-    db: Option<GramDb>,
+    /// 已加载的 `.gram` 集合。用 `Arc` 与进程内缓存共享 —— 见 [`shared_dbs`]。
+    dbs: Arc<Vec<GramDb>>,
     language: String,
 }
 
@@ -210,45 +217,143 @@ impl Octagram {
     pub fn new(config: GrammarConfig, language: impl Into<String>, db: Option<GramDb>) -> Self {
         Self {
             config,
-            db,
+            dbs: Arc::new(db.into_iter().collect()),
             language: language.into(),
         }
     }
 
-    /// 按 `grammar/language` 到 `model/` 里找 `<language>.gram` 并加载。
+    /// 用**多本**已加载的数据库造一个（前缀写法会命中多本）。
+    pub fn with_dbs(
+        config: GrammarConfig,
+        language: impl Into<String>,
+        dbs: Vec<GramDb>,
+    ) -> Self {
+        Self::with_shared(config, language, Arc::new(dbs))
+    }
+
+    /// 用共享的已加载集合造一个；不做任何 I/O。
+    pub fn with_shared(
+        config: GrammarConfig,
+        language: impl Into<String>,
+        dbs: Arc<Vec<GramDb>>,
+    ) -> Self {
+        Self {
+            config,
+            dbs,
+            language: language.into(),
+        }
+    }
+}
+
+/// 一个数据根里**文件名以 `prefix` 开头**的所有 `.gram`（按名字排序，顺序稳定）。
+///
+/// 前缀写法：`model: zh-han.simp` → `zh-han.simp.essay-bgc.gram`、
+/// `zh-han.simp.essay-bgw.gram` 全部命中；写全名则只命中那一本。
+fn model_files_in(dir: &Path, prefix: &str) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut hits: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension().is_some_and(|ext| ext == "gram")
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| name.starts_with(prefix))
+        })
+        .collect();
+    hits.sort();
+    hits
+}
+
+/// 进程内共享的语法模型集合：同一批 `.gram` 只真正读一次，之后各会话共用。
+///
+/// ⚠️ 2026-10-29 实测（用户报「打字很卡、速度很慢」）：
+/// `%APPDATA%\Rime-Next\model\` 下 4 本模型共 **414 MB**，`GramDb::open` 一套要
+/// **351 ms**；而一次 `probe_all_schemas`（只探测 1 个方案）里这批模型被完整加载了
+/// **28 次** —— 前后 4.6 s 里有 3.6 s 花在这里（把 `model\` 挪走后同一命令只要 0.99 s）。
+/// 放大原因是"每建一次会话就重新 `Octagram::load` 一遍"，而引擎按上下文建会话
+/// （切窗口/切输入框就会重建）。这里按"前缀 + 解析后的文件列表"缓存，加载一次之后
+/// 直接复用 `Arc`，既省 I/O 也省那 414 MB 的重复副本。
+///
+/// 缓存键包含完整路径，所以不同数据根（用户目录 / 程序文件夹）不会串；`.gram` 文件
+/// 更换后需要重启引擎（部署本来就会重启引擎），与 `MappedFile` 的既有语义一致。
+fn shared_dbs(prefix: &str, files: &[PathBuf]) -> Arc<Vec<GramDb>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Arc<Vec<GramDb>>>>> = OnceLock::new();
+    let mut key = String::from(prefix);
+    for file in files {
+        key.push('|');
+        key.push_str(&file.to_string_lossy());
+    }
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = match cache.lock() {
+        Ok(guard) => guard,
+        // 锁中毒只可能是别的线程 panic；退化成"每次都重新加载"，不影响正确性。
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(existing) = guard.get(&key) {
+        return Arc::clone(existing);
+    }
+    let mut dbs: Vec<GramDb> = Vec::with_capacity(files.len());
+    for path in files {
+        match GramDb::open(path) {
+            Ok(opened) => {
+                eprintln!(
+                    "[librime-next] 已加载语法模型：{}（{} 单元）",
+                    path.display(),
+                    opened.array_size()
+                );
+                dbs.push(opened);
+            }
+            Err(e) => {
+                eprintln!("[librime-next] 语法模型加载失败 {}：{e}", path.display());
+            }
+        }
+    }
+    if !dbs.is_empty() {
+        eprintln!("[librime-next] 前缀 {prefix} 共挂载 {} 本语法模型", dbs.len());
+    }
+    let shared = Arc::new(dbs);
+    guard.insert(key, Arc::clone(&shared));
+    shared
+}
+
+impl Octagram {
+    /// 按**前缀**到 `model/` 里收集所有匹配的 `.gram` 并全部加载。
     ///
-    /// 与 C++ 的 `ResourceResolver` 一致：**用户目录优先，其次共享目录**。
-    /// `roots` 的顺序就是查找顺序。
-    pub fn load(config: GrammarConfig, language: &str, roots: &[&Path]) -> Option<Self> {
-        let file_name = format!("{language}.gram");
-        let mut db = None;
+    /// 命名规则 `zh-han.<变体>.<语料>-<级别>.gram`：方案里写前缀 `zh-han.simp`，
+    /// 就把 `zh-han.simp.essay-bgc.gram`、`zh-han.simp.essay-bgw.gram` 都挂上；
+    /// 写全名 `zh-han.simp.essay-bgc` 则只命中那一本。
+    ///
+    /// 与 C++ 的 `ResourceResolver` 一样**用户目录优先，其次共享目录**；
+    /// 同名文件只取先出现的那个（用户目录覆盖程序文件夹）。
+    pub fn load(config: GrammarConfig, prefix: &str, roots: &[&Path]) -> Option<Self> {
+        // 先只算"要挂哪几本"，真正的读取交给进程内缓存。
+        let mut files: Vec<PathBuf> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
         for root in roots {
-            let candidate = root.join("model").join(&file_name);
-            if !candidate.is_file() {
-                continue;
-            }
-            match GramDb::open(&candidate) {
-                Ok(opened) => {
-                    eprintln!(
-                        "[librime-next] 已加载语法模型：{}（{} 单元）",
-                        candidate.display(),
-                        opened.array_size()
-                    );
-                    db = Some(opened);
-                    break;
+            let dir = root.join("model");
+            // 同目录内按名字排序，保证加载顺序稳定（不依赖文件系统返回顺序）
+            for candidate in model_files_in(&dir, prefix) {
+                let Some(name) = candidate.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if seen.iter().any(|loaded| loaded == name) {
+                    continue; // 用户目录已加载过同名文件
                 }
-                Err(e) => {
-                    eprintln!(
-                        "[librime-next] 语法模型加载失败 {}：{e}",
-                        candidate.display()
-                    );
-                }
+                seen.push(name.to_string());
+                files.push(candidate);
             }
         }
-        if db.is_none() {
-            eprintln!("[librime-next] 找不到语法模型 {file_name}，语法分退化为常量");
+        let dbs = shared_dbs(prefix, &files);
+        if dbs.is_empty() {
+            eprintln!(
+                "[librime-next] 找不到前缀为 {prefix} 的语法模型，语法分退化为常量"
+            );
         }
-        Some(Self::new(config, language, db))
+        Some(Self::with_shared(config, prefix, dbs))
     }
 
     pub fn language(&self) -> &str {
@@ -256,7 +361,12 @@ impl Octagram {
     }
 
     pub fn has_db(&self) -> bool {
-        self.db.is_some()
+        !self.dbs.is_empty()
+    }
+
+    /// 挂载的模型本数（`model: zh-han.simp` 这种前缀写法通常 > 1）。
+    pub fn db_count(&self) -> usize {
+        self.dbs.len()
     }
 
     pub fn config(&self) -> &GrammarConfig {
@@ -267,10 +377,8 @@ impl Octagram {
 impl Grammar for Octagram {
     /// `Octagram::Query(context, word, is_rear)`（`octagram.cc:107-162`）。
     fn query(&self, context: &str, word: &str, is_rear: bool) -> f64 {
-        let Some(db) = &self.db else {
-            return self.config.non_collocation_penalty;
-        };
-        if context.is_empty() {
+        // 一本都没挂上（或没有前文）：退化为"非搭配"常量惩罚
+        if self.dbs.is_empty() || context.is_empty() {
             return self.config.non_collocation_penalty;
         }
         let mut result = self.config.non_collocation_penalty;
@@ -290,22 +398,25 @@ impl Grammar for Octagram {
         // 对 context 的每个后缀问一次：这个后缀 + word 前缀是否成 n-gram。
         let mut context_ptr = 0usize;
         while context_len > 0 {
-            let matches = db.lookup_bytes(&context_query[context_ptr..], &word_query);
-            for m in &matches {
-                let match_len = unicode_length(&word_query, m.length);
-                let collocation_len = context_len as i32 + match_len as i32;
-                // `matches_whole_query`：从 context 开头算起且把 word 整个匹配上
-                let whole_query = context_ptr == 0 && m.length == word_query.len();
-                let penalty = if collocation_len >= self.config.collocation_min_length
-                    || whole_query
-                {
-                    self.config.collocation_penalty
-                } else {
-                    self.config.weak_collocation_penalty
-                };
-                let candidate = scale_value(m.value) + penalty;
-                if candidate > result {
-                    result = candidate;
+            // 多本模型各查一次，取最高分（与单本内部"取最大"同一套语义）
+            for db in self.dbs.iter() {
+                let matches = db.lookup_bytes(&context_query[context_ptr..], &word_query);
+                for m in &matches {
+                    let match_len = unicode_length(&word_query, m.length);
+                    let collocation_len = context_len as i32 + match_len as i32;
+                    // `matches_whole_query`：从 context 开头算起且把 word 整个匹配上
+                    let whole_query = context_ptr == 0 && m.length == word_query.len();
+                    let penalty = if collocation_len >= self.config.collocation_min_length
+                        || whole_query
+                    {
+                        self.config.collocation_penalty
+                    } else {
+                        self.config.weak_collocation_penalty
+                    };
+                    let candidate = scale_value(m.value) + penalty;
+                    if candidate > result {
+                        result = candidate;
+                    }
                 }
             }
             context_len -= 1;
@@ -318,11 +429,13 @@ impl Grammar for Octagram {
         if is_rear {
             let word_len = word.chars().count();
             if word_query_len == word_len {
-                let matches = db.lookup_bytes(&word_query, b"$");
-                if let Some(first) = matches.first() {
-                    let candidate = scale_value(first.value) + self.config.rear_penalty;
-                    if candidate > result {
-                        result = candidate;
+                for db in self.dbs.iter() {
+                    let matches = db.lookup_bytes(&word_query, b"$");
+                    if let Some(first) = matches.first() {
+                        let candidate = scale_value(first.value) + self.config.rear_penalty;
+                        if candidate > result {
+                            result = candidate;
+                        }
                     }
                 }
             }
@@ -343,6 +456,51 @@ pub fn create(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 前缀写法：`model: zh-han.simp` 要命中该前缀下的**所有** `.gram`。
+    #[test]
+    fn model_prefix_matches_every_gram_under_it() {
+        let dir = std::env::temp_dir().join("rime-next-model-prefix-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        for name in [
+            "zh-han.simp.essay-bgc.gram",
+            "zh-han.simp.essay-bgw.gram",
+            "zh-han.trad.essay-bgc.gram",
+            "zh-han.trad.essay-bgw.gram",
+            "not-a-model.gram",
+            "zh-han.simp.notes.txt",
+        ] {
+            std::fs::write(dir.join(name), b"").expect("写临时文件");
+        }
+
+        let simp: Vec<String> = model_files_in(&dir, "zh-han.simp")
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            simp,
+            vec![
+                "zh-han.simp.essay-bgc.gram".to_string(),
+                "zh-han.simp.essay-bgw.gram".to_string()
+            ],
+            "前缀 zh-han.simp 应命中字级+词级两本，且不跨变体、不收 .txt"
+        );
+
+        let trad: Vec<String> = model_files_in(&dir, "zh-han.trad")
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(trad.len(), 2, "zh-han.trad 也应命中两本");
+
+        // 写全名就只命中那一本
+        let exact = model_files_in(&dir, "zh-han.simp.essay-bgc");
+        assert_eq!(exact.len(), 1);
+
+        // 不存在的前缀 → 空
+        assert!(model_files_in(&dir, "zh-han.jp").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn encode_ascii_is_identity() {

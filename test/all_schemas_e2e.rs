@@ -39,7 +39,7 @@ fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 /// 从 staged 方案里拿它的词典源里的一个**真实编码**（探针用）：
-/// staged schema.yaml → translator/dictionary → classified_dict_source（用户→共享、
+/// staged schema.yaml → translator/dict → classified_dict_source（用户→共享、
 /// 系列规则 + 兄弟目录宽容搜索）→ 正文首个 `词条	编码` 的编码。
 fn real_code_for(staging: &Path, shared: &Path, sandbox_user: &Path, schema_id: &str) -> Option<String> {
     use librime_next::dict::dict_compiler::classified_dict_source;
@@ -48,7 +48,7 @@ fn real_code_for(staging: &Path, shared: &Path, sandbox_user: &Path, schema_id: 
         .join(format!("{schema_id}.schema.yaml"));
     let value = librime_next::load_file(&schema_file).ok()?;
     let dict = value
-        .pointer("/translator/dictionary")
+        .pointer("/translator/dict")
         .and_then(|v| v.as_str())?
         .to_string();
     if dict.is_empty() {

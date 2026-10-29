@@ -68,6 +68,8 @@ use std::path::{Path, PathBuf};
 // 根（共享数据目录 / 用户数据目录）拼出来。根路径本身由 Weasel 通过 `RimeTraits`
 // API 注入，lrn 不设置、也不决定根路径（2026-10-25 架构澄清）。
 pub const SCHEMA_DIR: &str = "schema";
+/// 词库分类根（2026-10-28 起与 `schema/` 分家：`schema/` 只放方案，词库放这里）。
+pub const DICT_DIR: &str = "dict";
 pub const BUILD_DIR: &str = "build";
 pub const MODEL_DIR: &str = "model";
 pub const EASSY_DIR: &str = "eassy";

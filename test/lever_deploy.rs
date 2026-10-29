@@ -8,7 +8,7 @@
 //! * `staging/default.yaml` 的 `schema_list` 与 `schema/schema.yaml` 一致（写回逻辑）；
 //! * dependencies 递归编译（被依赖方案的产物也在）；
 //! * **`.bin` 三件套**（2026-10-25 接上 dict 层后新增）：编译产物里
-//!   `translator/dictionary` 非空的方案，必须产出 `staging/<系列…>/<id>.{table,prism,reverse}.bin`。
+//!   `translator/dict` 非空的方案，必须产出 `staging/<系列…>/<id>.{table,prism,reverse}.bin`。
 
 use std::path::{Path, PathBuf};
 
@@ -107,7 +107,7 @@ fn workspace_update_writes_staging_per_schema() {
         "yuling 的依赖 yuhao_pinyin 未被递归编译"
     );
 
-    // `.bin` 三件套：编译产物里 translator/dictionary 非空 → 表/反查按**词典名**、
+    // `.bin` 三件套：编译产物里 translator/dict 非空 → 表/反查按**词典名**、
     // prism 按 **prism 名**（缺省 = 词典名）落位。多个方案共享同一词典时表只建一次，
     // 位置是 `<系列…>/<词典名>.{table,reverse}.bin`，不是 schema id 名下。
     // 缺任何一件都说明 dict 编译链（entry_collector → table/prism/reverse db）断了。
@@ -118,7 +118,7 @@ fn workspace_update_writes_staging_per_schema() {
             continue;
         };
         let Some(dict_name) = config
-            .pointer("/translator/dictionary")
+            .pointer("/translator/dict")
             .and_then(|name| name.as_str())
             .filter(|name| !name.is_empty())
         else {

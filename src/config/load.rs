@@ -91,8 +91,11 @@ pub fn load_file(path: &Path) -> Result<serde_json::Value, String> {
 ///   `translator`→`translators`、`filter`→`filters`
 /// * `switch:` 列表项：`state`→`states`
 /// * `speller:` 块：`initial`→`initials`
-/// * `translator:` 块：`dict`→`dictionary`
-/// * `reverse_lookup:` 块：`schema`→`dictionary`（反查的是词典）
+/// * `translator:` 块：**不动** —— 词库键的正式写法就是单数 `dict`（2026-10-28 20:5x 定），
+///   全链路（源文件 / 编译产物 / 运行时）只认 `dict`，**没有** `dictionary` 兼容层
+/// * `reverse_lookup:` 块：**不动** —— `schema:` 是"用哪份**方案**反查"的正式键，
+///   由 `engine/gear/reverse_lookup_translator.rs` 直接按方案引用解析（取目标方案
+///   自己的 `translator/dict` + `translator/prism`）
 ///
 /// 别名都**限定上下文**（只在对应的父键下生效），避免误伤词典 / 预设文件里
 /// 恰好同名的键。`import_preset` 引用与 `grammar` 不在此处理。
@@ -124,12 +127,6 @@ fn normalize_dialect(doc: &mut serde_json::Value) {
                     }
                     "speller" => {
                         rename(map, "initial", "initials");
-                    }
-                    "translator" => {
-                        rename(map, "dict", "dictionary");
-                    }
-                    "reverse_lookup" => {
-                        rename(map, "schema", "dictionary");
                     }
                     "schema" => {
                         rename(map, "id", "schema_id");

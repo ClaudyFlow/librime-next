@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 use super::deployment_tasks::{load_schema_manifest, SchemaManifest};
-use super::paths::{SCHEMA_DIR, SCHEMA_MANIFEST};
+use super::paths::{DICT_DIR, SCHEMA_DIR, SCHEMA_MANIFEST};
 use super::scan::{self, ResourceKind};
 
 // --------------------------------------------------------------------------
@@ -218,11 +218,26 @@ pub fn id_from_file_name(file_name: &str) -> Option<&str> {
     file_name.strip_suffix(".schema.yaml")
 }
 
+/// 从文件名剥出**词典 id**：`pinyin.luna.dict.yaml` → `pinyin.luna`。
+pub fn id_from_dict_file_name(file_name: &str) -> Option<&str> {
+    file_name.strip_suffix(".dict.yaml")
+}
+
 /// 由文件路径反推数据根：向上找名为 `schema` 的目录，其父即数据根。
 /// 找不到返回 `None`（摆放检查跳过，只记提示）。
 fn find_data_root(path: &Path) -> Option<PathBuf> {
     for anc in path.ancestors().skip(1) {
         if anc.file_name().is_some_and(|n| n == SCHEMA_DIR) {
+            return anc.parent().map(|p| p.to_path_buf());
+        }
+    }
+    None
+}
+
+/// 由词典文件路径反推数据根：向上找名为 `dict` 的目录，其父即数据根。
+fn find_dict_data_root(path: &Path) -> Option<PathBuf> {
+    for anc in path.ancestors().skip(1) {
+        if anc.file_name().is_some_and(|n| n == DICT_DIR) {
             return anc.parent().map(|p| p.to_path_buf());
         }
     }
@@ -378,15 +393,14 @@ fn check_identity(path: &Path, report: &mut AdmitReport) {
     }
 
     // 词典提示：translator 块里声明的词典若在，记一笔（不设卡）。
-    // 归一化会把方言单数 `dict` 改名成 librime 的 `dictionary`，两个键都认。
+    // 键是单数 `dict`（2026-10-28 20:5x 起；不再认 `dictionary`）。
     let dict = tree
-        .pointer("/translator/dictionary")
-        .or_else(|| tree.pointer("/translator/dict"))
+        .pointer("/translator/dict")
         .and_then(|v| v.as_str())
         .map(str::to_string);
     if let Some(dict) = dict {
         let dict_file = data_root.map(|r| {
-            r.join(SCHEMA_DIR)
+            r.join(DICT_DIR)
                 .join(dict.replace('.', "/"))
                 .join(format!("{dict}.dict.yaml"))
         });
@@ -422,6 +436,187 @@ pub fn check_schema_file(path: &Path) -> AdmitReport {
     check_format(&bytes, &mut report);
     check_identity(path, &mut report);
     report
+}
+
+/// 词典的第三关：YAML 头解析 + 顶层 `id:` + 系列摆放（与方案同一套规矩）。
+///
+/// 词典身份键是**顶层 `id:`**（方言单数，与文件名/文件夹一致）；
+/// `name:` 是显示名（允许中文），不参与身份；写 `dict_id:` 或两个都写一律拒收。
+fn check_dict_identity(path: &Path, report: &mut AdmitReport) {
+    // 部署期读词典头走同一个读入器，这里挂了部署也会挂。
+    if let Err(error) = crate::load_file(path) {
+        report.push("YAML 解析", false, format!("{error}"));
+        return;
+    }
+    report.push("YAML 解析", true, "读入器通过（与部署同一入口）");
+
+    let raw = match raw_parse(path) {
+        Ok(raw) => raw,
+        Err(error) => {
+            report.push("dict.id 写法", false, format!("源文件读不了: {error}"));
+            return;
+        }
+    };
+    let raw_id = raw.get("id").and_then(|v| v.as_str()).map(str::to_string);
+    let native_id = raw
+        .get("dict_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let name = raw.get("name").and_then(|v| v.as_str()).map(str::to_string);
+
+    let id = match (raw_id, native_id) {
+        (Some(id), None) => {
+            report.push(
+                "dict.id 写法",
+                true,
+                format!("dict.id = \"{id}\"（方言单数，合规）"),
+            );
+            id
+        }
+        (None, Some(_)) => {
+            report.push(
+                "dict.id 写法",
+                false,
+                "写的是 `dict_id`；本仓库强制方言写法 `id:`",
+            );
+            return;
+        }
+        (Some(_), Some(_)) => {
+            report.push(
+                "dict.id 写法",
+                false,
+                "`id` 与 `dict_id` 同时写；请只写 `id`",
+            );
+            return;
+        }
+        (None, None) => {
+            report.push(
+                "dict.id 写法",
+                false,
+                "词典头没有 `id:`（身份键必填，须与文件名/文件夹一致）",
+            );
+            return;
+        }
+    };
+    report.schema_id = Some(id.clone());
+    report.schema_name = name;
+
+    if !id_is_sane(&id) {
+        report.push(
+            "dict.id 内容",
+            false,
+            format!("`{id}` 含非法字符/空分段（只允许字母数字与 . _ -，点表达系列层级）"),
+        );
+    } else {
+        report.push("dict.id 内容", true, format!("id = \"{id}\""));
+    }
+
+    // 系列恒等式：文件名主干必须等于 id。
+    let stem = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(id_from_dict_file_name);
+    match stem {
+        Some(stem) if stem == id => {
+            report.push("id 与文件名一致", true, format!("{stem}.dict.yaml"));
+        }
+        Some(stem) => report.push(
+            "id 与文件名一致",
+            false,
+            format!("文件名主干 `{stem}` 与 id `{id}` 不符（文件名永远是完整 id）"),
+        ),
+        None => report.push(
+            "id 与文件名一致",
+            false,
+            "文件名不是 `<id>.dict.yaml` 形态",
+        ),
+    }
+
+    // 摆放：`dict/<id 分段的前缀…>/<id>.dict.yaml`。
+    //
+    // 方案是「全部分段」严格对齐；**词库放宽到前缀**（2026-10-28 用户定）：
+    // `cangjie.5.base` 这类被 `import_tables` 吃掉的片段不必各自建文件夹，
+    // 只要目录是 id 分段的某个前缀（`dict/`、`dict/cangjie/`、`dict/cangjie/5/`…）
+    // 就算摆放合适；查找侧按「精确优先、再逐级退前缀」找（见
+    // `dict_compiler::classified_dict_source`）。
+    match &find_dict_data_root(path) {
+        Some(data_root) => match dict_placement(path, data_root, &id) {
+            Ok(under) => report.push(
+                "系列摆放",
+                true,
+                if under.is_empty() {
+                    "dict/（id 分段的前缀）".to_string()
+                } else {
+                    format!("dict/{under}（id 分段的前缀）")
+                },
+            ),
+            Err(note) => report.push("系列摆放", false, note),
+        },
+        None => report.push(
+            "系列摆放",
+            false,
+            "找不到数据根（文件不在 `dict/` 目录链下）",
+        ),
+    }
+}
+
+/// 词库摆放判定：目录必须是 `dict/` + **id 分段的某个前缀**。
+///
+/// 返回目录相对 `dict/` 的部分（空串 = 直接放在 `dict/` 根下）；不合法返回原因。
+/// 例：`id = cangjie.5.base` 时，`dict/`、`dict/cangjie/`、`dict/cangjie/5/`、
+/// `dict/cangjie/5/base/` 全部合格；`dict/wubi/` 不合格。
+fn dict_placement(path: &Path, data_root: &Path, id: &str) -> Result<String, String> {
+    let dir = path.parent().unwrap_or(Path::new(""));
+    let not_under = || "文件不在 `dict/` 目录链下".to_string();
+    let Ok(rel) = dir.strip_prefix(data_root) else {
+        return Err(not_under());
+    };
+    let parts: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect();
+    if parts.first().map(String::as_str) != Some(DICT_DIR) {
+        return Err(not_under());
+    }
+    let under: Vec<&str> = parts[1..].iter().map(String::as_str).collect();
+    let segments: Vec<&str> = id.split('.').filter(|s| !s.is_empty()).collect();
+    if under.len() > segments.len()
+        || under.iter().zip(segments.iter()).any(|(actual, want)| actual != want)
+    {
+        return Err(format!(
+            "目录 `dict/{}` 不是 id `{id}` 分段的前缀（可放 `dict/{}` 下任一层前缀目录，或直接放 `dict/`）",
+            under.join("/"),
+            segments.join("/")
+        ));
+    }
+    Ok(under.join("/"))
+}
+
+/// 只检查词典文件，不动任何清单（与 [`check_schema_file`] 同构）。
+pub fn check_dict_file(path: &Path) -> AdmitReport {
+    let mut report = AdmitReport {
+        path: path.to_path_buf(),
+        schema_id: None,
+        schema_name: None,
+        items: Vec::new(),
+    };
+    let Ok(bytes) = std::fs::read(path) else {
+        report.push("读取文件", false, format!("读不了 {}", path.display()));
+        return report;
+    };
+    check_format(&bytes, &mut report);
+    check_dict_identity(path, &mut report);
+    report
+}
+
+/// 报告里第一条失败原因（`项名：说明`），供日志/抛弃名单用。
+pub fn first_failure(report: &AdmitReport) -> String {
+    report
+        .items
+        .iter()
+        .find(|item| !item.ok)
+        .map(|item| format!("{}：{}", item.name, item.detail))
+        .unwrap_or_else(|| "未知原因".to_string())
 }
 
 /// 人看的报告（门卫小票）。
@@ -558,6 +753,76 @@ mod tests {
             .iter()
             .find(|i| i.name == name)
             .unwrap_or_else(|| panic!("报告里没有检查项 `{name}`"))
+    }
+
+    /// 造一份合规词库：头三行标记 + `id/name/version`。
+    fn good_dict(root: &Path, id: &str) -> PathBuf {
+        let dir = root.join(DICT_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{id}.dict.yaml"));
+        std::fs::write(
+            &path,
+            format!(
+                "# Rime Dictionary\n# encode: utf-8\n# newline: lf\n---\nid: {id}\nname: {id}\nversion: 2026.10.28\n...\n"
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    /// 词库摆放 = 「`dict/` + id 分段的某个前缀」，片段词库不必各建文件夹。
+    #[test]
+    fn dict_placement_accepts_id_prefixes() {
+        let root = temp_dir("dict-prefix");
+        let id = "cangjie.5.base";
+
+        // 每一层前缀都合格
+        for under in ["", "cangjie", "cangjie/5", "cangjie/5/base"] {
+            let dir = if under.is_empty() {
+                root.join(DICT_DIR)
+            } else {
+                root.join(DICT_DIR).join(under)
+            };
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(format!("{id}.dict.yaml"));
+            std::fs::write(&path, "x").unwrap();
+            assert_eq!(
+                dict_placement(&path, &root, id),
+                Ok(under.to_string()),
+                "dict/{under} 应是合法前缀"
+            );
+        }
+
+        // 不是前缀 → 不合格（写错系列）
+        let wrong = root.join(DICT_DIR).join("wubi/86");
+        std::fs::create_dir_all(&wrong).unwrap();
+        let path = wrong.join(format!("{id}.dict.yaml"));
+        std::fs::write(&path, "x").unwrap();
+        assert!(dict_placement(&path, &root, id).is_err(), "dict/wubi/86 不是前缀");
+
+        // 比 id 更深的目录也不合格（多了分段）
+        let deeper = root.join(DICT_DIR).join("cangjie/5/base/x");
+        std::fs::create_dir_all(&deeper).unwrap();
+        let path = deeper.join(format!("{id}.dict.yaml"));
+        std::fs::write(&path, "x").unwrap();
+        assert!(dict_placement(&path, &root, id).is_err(), "多一层分段不合格");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 词库可以平铺在 `dict/` 下；不在 `dict/` 下则不合格。
+    #[test]
+    fn dict_outside_dict_dir_fails() {
+        let root = temp_dir("dict-outside");
+        let dir = root.join(SCHEMA_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.dict.yaml");
+        std::fs::write(&path, "x").unwrap();
+        assert!(dict_placement(&path, &root, "a").is_err());
+
+        let flat = good_dict(&root, "a");
+        assert_eq!(dict_placement(&flat, &root, "a"), Ok(String::new()));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -3442,7 +3442,8 @@ mod tests {
                 sort_original = value.trim() == "original";
                 continue;
             }
-            if trimmed == "columns:" {
+            // 方言单数 `column:` 与原生 `columns:` 都认（与 DictSettings 同一套）
+            if trimmed == "columns:" || trimmed == "column:" {
                 in_columns = true;
                 continue;
             }

@@ -46,7 +46,7 @@ reverse_lookup:
   preedit_format:
     - xlit/hspnz/一丨丿丶乙/
 translator:
-  dictionary: luna_pinyin
+  dict: luna_pinyin
 menu:
   page_size: 9
 switches:

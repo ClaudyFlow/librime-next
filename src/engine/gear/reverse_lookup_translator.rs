@@ -7,8 +7,8 @@
 //!
 //! | 角色 | 配置键 | 实际文件 | 拿去干什么 |
 //! |---|---|---|---|
-//! | 正查 | `reverse_lookup/dictionary`（`stroke`） | `build/stroke.table.bin` | 码 → 字（`hspnz` → 「你」） |
-//! | 反查 | `reverse_lookup/target`（默认 `translator`）→ `translator/dictionary`（`luna_pinyin`） | `build/luna_pinyin.reverse.bin` | 字 → 码（「你」 → `ni`），填候选注释 |
+//! | 正查 | `reverse_lookup/dictionary`（原生写法；本仓库数据改用 `reverse_lookup/schema:`） | `build/stroke.table.bin` | 码 → 字（`hspnz` → 「你」） |
+//! | 反查 | `reverse_lookup/target`（默认 `translator`）→ 目标方案的 `translator/dict`（`luna_pinyin`） | `build/luna_pinyin.reverse.bin` | 字 → 码（「你」 → `ni`），填候选注释 |
 //!
 //! 反查表是编译期从词表建的（`ReverseDb::build`），键是**词面**、值是**码串**，
 //! 正好和主词典相反。所以"反查"这个名字是从用户视角起的：用户想从字形查到读音。
@@ -51,6 +51,48 @@ const K_DEFAULT_TARGET: &str = "translator";
 /// 补全模式下的首屏额度（C++ `LookupWords(&iter, code, true, 100, nullptr)`）。
 const K_INITIAL_SEARCH_LIMIT: usize = 100;
 
+/// 反查的目标从哪来：**`schema:` 是第一写法（用哪份方案反查）**。
+///
+/// 方案方言里 `reverse_lookup: schema: <id>` 的意思就是"把输入交给这份方案"，
+/// 所以目标方案的**词典和棱镜都归它自己**（2026-10-28 20:0x 起 `prism:` 名一律等于
+/// 方案 id：`pinyin.luna` 的棱镜叫 `pinyin.luna`、`zhuyin` 的叫 `zhuyin`）。
+/// 这里直接打开 `build/` 里那份已部署的方案，取它的
+/// `translator/dict` + `translator/prism`——不再需要调用方写 `prism:`，也不会
+/// 因为方案改名（`luna_pinyin` → `pinyin.luna`）就静默掉翻译器（旧行为：棱镜名
+/// 缺省按词典名推，C++ `dictionary.cc:439-441`，只在两个名字恰好相同时才对）。
+///
+/// 兼容：原生 rime 写法 `dictionary:`(+`prism:`) 照旧认 —— `schema:` 缺省时才走它，
+/// 行为与 C++ 完全一致。
+///
+/// 兜底：写了 `schema:` 但 `build/` 里没有那份方案（没部署/没选进清单）→ 把 id
+/// 当词典名用（棱镜名同 id），至少不会连带把当前方案的翻译器打掉。
+fn resolve_target(
+    build_dir: &Path,
+    config: &Value,
+    ns: &str,
+) -> Option<(String, String)> {
+    let get = |key: &str| {
+        config
+            .pointer(&format!("/{ns}/{key}"))
+            .and_then(Value::as_str)
+    };
+    if let Some(schema_id) = get("schema") {
+        if let Some((dict, prism)) = crate::engine::schema::Schema::open(build_dir, schema_id)
+            .and_then(|schema| schema.first_translator_dict())
+        {
+            return Some((dict, prism));
+        }
+        return Some((
+            schema_id.to_string(),
+            get("prism").unwrap_or(schema_id).to_string(),
+        ));
+    }
+    // 没写 `schema:` 时走原生 rime 写法 `reverse_lookup/dictionary` —— 这是**反查表源**
+    // 的键，跟 translator 的词库键 `dict` 不是一回事；Rime-Next 自己的方案一律用 `schema:`。
+    let dict = get("dictionary")?;
+    Some((dict.to_string(), get("prism").unwrap_or(dict).to_string()))
+}
+
 pub struct ReverseLookupTranslator {
     /// 认领哪些段（`segment.HasTag(tag_)`）。
     tag: String,
@@ -84,9 +126,8 @@ impl ReverseLookupTranslator {
                 .and_then(Value::as_str)
         };
 
-        let dict_name = get("dictionary")?;
-        let prism_name = get("prism").unwrap_or(dict_name);
-        let dict = Dictionary::open(build_dir, dict_name, prism_name)?;
+        let (dict_name, prism_name) = resolve_target(build_dir, config, ns)?;
+        let dict = Dictionary::open(build_dir, &dict_name, &prism_name)?;
 
         let mut options = TranslatorOptions::from_config(config, ns);
         // C++ 的写法值得单独解释：`GetBool(...)` 返回 **false 表示键不存在**，
@@ -106,19 +147,20 @@ impl ReverseLookupTranslator {
         let suffix = get("suffix").unwrap_or("").to_string();
         let tips = get("tips").unwrap_or("").to_string();
 
-        // 反查表的目标命名空间：默认读 `translator/dictionary`，也就是"主词典的
-        // 反查表"。找不到就用正查词典名兜底（stroke 方案里两者同名）。
+        // 反查表的目标命名空间：读 `{target}/dict`（默认 `translator/dict`），
+        // 也就是"主词典的反查表"。找不到就用正查词典名兜底（stroke 方案里两者同名）。
         let target = get("target").unwrap_or(K_DEFAULT_TARGET);
         let rev_name = config
-            .pointer(&format!("/{target}/dictionary"))
+            .pointer(&format!("/{target}/dict"))
             .and_then(Value::as_str)
-            .unwrap_or(dict_name);
+            .map(str::to_string)
+            .unwrap_or_else(|| dict_name.clone());
         // `open` 只把文件映进来，`load` 才解析两个 trie —— 少这一步 `lookup` 恒返回
         // `None`，表现为"候选出得来、注释永远是空的"（C++ 侧对应
         // `ReverseLookupDictionary::Load()` 里的 `db_->Load()`）。
         let rev_dict = ReverseDb::open(crate::dict::dictionary::bin_resource_path(
             build_dir,
-            rev_name,
+            &rev_name,
             ".reverse",
         ))
         .ok()
@@ -276,7 +318,7 @@ mod tests {
                 "tips": "〔筆畫〕",
                 "preedit_format": ["xlit/hspnz/一丨丿丶乙/"]
             },
-            "translator": { "dictionary": "luna_pinyin" }
+            "translator": { "dict": "luna_pinyin" }
         })
     }
 
@@ -296,7 +338,7 @@ mod tests {
     fn enable_completion_defaults_to_false_not_true() {
         let config = json!({
             "reverse_lookup": { "dictionary": "stroke" },
-            "translator": { "dictionary": "luna_pinyin" }
+            "translator": { "dict": "luna_pinyin" }
         });
         let t = ReverseLookupTranslator::load(&config, "translator", &build_dir()).unwrap();
         assert!(!t.options.enable_completion, "反查默认不做前缀补全");
@@ -341,6 +383,58 @@ mod tests {
         let mut seg = segment_with("reverse_lookup");
         let cands = t.query("`h", &mut seg, &crate::engine::commit_history::CommitHistory::new());
         assert!(cands.iter().any(|c| c.text == "一"), "`h 不带后缀也要能出「一」");
+    }
+
+    /// 反查目标解析：`schema:` 是方言主写法（用方案反查），`dictionary:` 是原生写法。
+    ///
+    /// 造一份假的 `build/`（只有编译后的方案 YAML，没有 .bin）来验规则：
+    /// `pinyin.luna` 方案里 `translator/prism: pinyin`，所以 `schema: pinyin.luna`
+    /// 必须解析成词典 `pinyin.luna` + 棱镜 `pinyin`（旧行为会按词典名推成
+    /// `pinyin.luna`，棱镜文件不存在 → 翻译器静默建不出来）。
+    #[test]
+    fn schema_ref_resolves_target_scheme() {
+        let root = std::env::temp_dir().join(format!(
+            "lrn-rl-target-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let schema_dir = root.join("pinyin/luna");
+        std::fs::create_dir_all(&schema_dir).unwrap();
+        std::fs::write(
+            schema_dir.join("pinyin.luna.schema.yaml"),
+            "schema:\n  schema_id: pinyin.luna\ntranslator:\n  dict: pinyin.luna\n  prism: pinyin\n",
+        )
+        .unwrap();
+
+        let target = |config: Value| resolve_target(&root, &config, "reverse_lookup");
+
+        // 1) 方言主写法 `schema:`：词典+棱镜都取目标方案自己的
+        assert_eq!(
+            target(json!({ "reverse_lookup": { "schema": "pinyin.luna" } })),
+            Some(("pinyin.luna".to_string(), "pinyin".to_string())),
+            "`schema: X` 应解析成 X 方案自己的 translator 词典+棱镜"
+        );
+        // 2) 原生写法 `dictionary:`：行为与 C++ 完全一致（棱镜缺省 = 词典名）
+        assert_eq!(
+            target(json!({ "reverse_lookup": { "dictionary": "stroke" } })),
+            Some(("stroke".to_string(), "stroke".to_string()))
+        );
+        assert_eq!(
+            target(json!({
+                "reverse_lookup": { "dictionary": "luna_pinyin", "prism": "pinyin" }
+            })),
+            Some(("luna_pinyin".to_string(), "pinyin".to_string()))
+        );
+        // 3) 写了方案但没部署：兜底把 id 当词典名，不把翻译器搞没
+        assert_eq!(
+            target(json!({ "reverse_lookup": { "schema": "没部署的方案" } })),
+            Some(("没部署的方案".to_string(), "没部署的方案".to_string()))
+        );
+        // 4) 什么都没写：不是反查
+        assert_eq!(target(json!({ "reverse_lookup": { "prefix": "`" } })), None);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

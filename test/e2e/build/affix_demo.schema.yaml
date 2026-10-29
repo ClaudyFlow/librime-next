@@ -40,14 +40,14 @@ recognizer:
     zaoci: "^[a-z]*`[a-z`]*$"
   # `disable_user_dict_for_patterns` 在这个验证方案里不需要
 translator:
-  dictionary: luna_pinyin
+  dict: luna_pinyin
   prism: luna_pinyin_simp
 # 前缀段与码段的配置**共用同一个命名空间**，这不是巧合：`affix_segmentor@zaoci`
 # 读 `prefix`/`tips`/`tag`，而 `script_translator@zaoci` 读 `dictionary`/`prism`/`tag`
 # —— `tag: zaoci` 这一行同时决定了「码段打什么标签」和「哪个翻译器认领它」。
 # 真实方案里 `zaoci: __include: translator` 就是把整段翻译器配置继承过来。
 zaoci:
-  dictionary: luna_pinyin
+  dict: luna_pinyin
   prism: luna_pinyin_simp
   prefix: "`"
   tips: "〔用户造詞〕"

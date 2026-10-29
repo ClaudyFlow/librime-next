@@ -38,7 +38,7 @@ speller:
   delimiter: " '"
 
 translator:
-  dictionary: luna_pinyin
+  dict: luna_pinyin
   prism: luna_pinyin_simp
 
 chord_composer:

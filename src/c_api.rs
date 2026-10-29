@@ -594,9 +594,30 @@ fn default_schema_id(g: &Global) -> String {
     "luna_pinyin".to_string()
 }
 
-/// 从 `schema/schema.yaml` 的 `schemas:` 或 `default.yaml` 的 `schema_list` 取第一个 id。
+/// 从 `schema/schema.yaml` 的 `active:` / `schemas:`，或 `default.yaml` 的 `schema_list` 取方案 id。
+///
+/// 顺序：**`active:` 优先**（那是"当前方案"，新会话一建出来就该是它），
+/// 没有 `active` 才退到清单第一条（首次运行、还没定过当前方案时）。
+///
+/// ⚠️ 2026-10-29：原来只看清单第一条，而 `schema.yaml` 的清单是按 id 排序的
+/// （第一条是 `cangjie.5`），于是每个新会话先落在**仓颉**上；靠 Engine 侧再
+/// `select_schema(active)` 纠正 —— 而那条路当时又是坏的（见 `Engine/src/librime/api.rs`
+/// 漏装 `select_schema`），结果"设置里选的方案不生效"。两道修一起才对。
 fn extract_first_schema_id(text: &str) -> Option<String> {
-    // 简单解析：找 `schema_list:` 后的 `- schema: xxx` 或 `schemas:` 后的 `- xxx`
+    // ① `active: <id>`（schema.yaml 的当前方案）
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("active:") {
+            let id = rest.trim().trim_matches(['"', '\''].as_ref()).trim();
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        }
+    }
+    // ② 清单第一条：`schema_list:` 后的 `- schema: xxx` 或 `schemas:` 后的 `- xxx`
     let mut lines = text.lines().peekable();
     let mut in_list = false;
     for line in lines.by_ref() {
@@ -977,7 +998,14 @@ unsafe extern "C" fn rime_select_schema(id: RimeSessionId, schema_id: *const c_c
     let build_dir = g.build_dir();
     let roots = g.data_roots();
     if let Some(s) = g.sessions.get_mut(&id) {
-        *s = Session::create_with_roots(&build_dir, &sid, &roots);
+        let fresh = Session::create_with_roots(&build_dir, &sid, &roots);
+        // 方案文件缺失/编译产物不全时 `Session` 的 engine 是 None。这里**不能**直接换掉
+        // 原会话：换了之后这个会话对任何按键都返回"没吃掉、没候选"，用户看到的就是
+        // "输入法突然哑了"（2026-10-29 的教训：选择必须是原子的"成功才换"）。
+        if fresh.engine.is_none() {
+            return 0;
+        }
+        *s = fresh;
         1
     } else {
         0
@@ -1427,11 +1455,73 @@ mod host_smoke {
     use super::*;
     use std::ffi::{CStr, CString};
 
+    /// 新会话的初始方案：`active:` 优先，其次清单第一条。
+    ///
+    /// 真机后果（2026-10-29）：只看清单第一条时，`schema.yaml` 排第一的 `cangjie.5`
+    /// 会成为每个新会话的起始方案 —— 表现是"刚开一个输入框，打拼音出来的是仓颉码"。
+    #[test]
+    fn active_schema_wins_for_initial_session() {
+        let manifest = "# 方案信息\nactive: pinyin.luna\nschemas:\n  - cangjie.5\n  - pinyin.luna\n";
+        assert_eq!(extract_first_schema_id(manifest).as_deref(), Some("pinyin.luna"));
+
+        // 没有 active：退到清单第一条（首次运行）
+        let no_active = "schemas:\n  - cangjie.5\n  - stroke\n";
+        assert_eq!(extract_first_schema_id(no_active).as_deref(), Some("cangjie.5"));
+
+        // default.yaml 的写法（`- schema: xxx`）
+        let deployed = "schema_list:\n  - schema: zhuyin\n  - schema: stroke\n";
+        assert_eq!(extract_first_schema_id(deployed).as_deref(), Some("zhuyin"));
+
+        // 注释里的 active 不算数
+        let commented = "# active: stroke\nschemas:\n  - pinyin.terra\n";
+        assert_eq!(extract_first_schema_id(commented).as_deref(), Some("pinyin.terra"));
+    }
+
+    /// 宿主机上有没有按新键（`translator/dict`）部署的产物。
+    ///
+    /// 2026-10-28 20:5x 起词库键只认 `dict`、去掉 `dictionary` 兼容层，所以
+    /// **旧部署产物**（`build/**/*.schema.yaml` 里还是 `dictionary:`）读不出词库。
+    /// 这种情况下跳过冒烟，免得把"没重新部署"误报成代码回归。
+    fn host_has_dict_keyed_build(user_dir: &str) -> bool {
+        let build = std::path::Path::new(user_dir).join("build");
+        let mut stack = vec![build];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(".schema.yaml"))
+                {
+                    if let Ok(text) = std::fs::read_to_string(&path) {
+                        if text.contains("\n  dict:") {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
     #[test]
     fn host_path_typing_nihao_yields_candidates() {
         let appdata = std::env::var("APPDATA").unwrap_or_default();
+        let user_str = format!("{appdata}/Rime-Next");
+        if !host_has_dict_keyed_build(&user_str) {
+            eprintln!(
+                "跳过：%APPDATA%\\Rime-Next\\build 里没有 `dict:` 的新产物（重新部署后再测；\
+                 旧产物的 dictionary: 已不兼容）"
+            );
+            return;
+        }
         let shared = CString::new("C:/Program Files/Weasel-Next/Rime-Next").unwrap();
-        let user = CString::new(format!("{appdata}/Rime-Next")).unwrap();
+        let user = CString::new(user_str).unwrap();
         let app = CString::new("rime.weasel-next").unwrap();
 
         let mut traits = RimeTraits {

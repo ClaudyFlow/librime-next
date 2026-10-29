@@ -201,22 +201,34 @@ fn dialect_keys_are_recognized_and_imports_resolved() {
         s(&compiled, "speller/algebra/import_preset").is_none(),
         "import_preset 引用键应被消费掉"
     );
-    // translator/dict → dictionary；preedit_format 同样 import 进来
+    // translator/dict：词库键的正式写法就是单数 `dict`（2026-10-28 20:5x 定），
+    // 没有 `dictionary` 兼容层 ⇒ 编译产物里也只会出现 `dict`
     assert_eq!(
-        s(&compiled, "translator/dictionary").as_deref(),
+        s(&compiled, "translator/dict").as_deref(),
         Some("luna_pinyin"),
-        "translator/dict 应被识别为 dictionary"
+        "translator/dict 是词库键的正式写法"
+    );
+    assert_eq!(
+        s(&compiled, "translator/dictionary"),
+        None,
+        "编译产物不该出现 dictionary"
     );
     assert_eq!(
         s(&compiled, "translator/preedit_format/@0").as_deref(),
         Some("xform/([nl])v/$1ü/"),
         "translator/preedit_format 的 import_preset 应解析出 parser 数据"
     );
-    // reverse_lookup/schema → dictionary
+    // reverse_lookup/schema 保持原样：它是"用哪份方案反查"的正式键，由反查翻译器
+    // 直接按方案引用解析（取目标方案自己的 `translator/dict` + `prism`），不做改名。
     assert_eq!(
-        s(&compiled, "reverse_lookup/dictionary").as_deref(),
+        s(&compiled, "reverse_lookup/schema").as_deref(),
         Some("stroke"),
-        "reverse_lookup/schema 应被识别为 dictionary"
+        "reverse_lookup/schema 应原样保留（反查 = 用方案）"
+    );
+    assert_eq!(
+        s(&compiled, "reverse_lookup/dictionary"),
+        None,
+        "不该再被改写成 dictionary"
     );
     // legacy import_preset 不受影响：punctuator 仍从 symbols 预设并进来
     assert_eq!(

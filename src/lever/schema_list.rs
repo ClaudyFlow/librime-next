@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 use super::admit::{self, AdmitReport};
 use super::deployment_tasks::{SchemaManifest, load_schema_manifest};
-use super::paths::SCHEMA_DIR;
+use super::paths::{DICT_DIR, SCHEMA_DIR};
 use super::tree::{log_info, log_warn};
 
 /// 一个被识别（过四关）的方案。
@@ -143,13 +143,89 @@ pub fn discover_roots(roots: &[PathBuf]) -> DiscoverResult {
     merged
 }
 
-/// 挑默认 `active`：`pinyin` 优先（标准样板），否则第一个。
+/// 扫多个数据根并合并**词库**（与 [`discover_roots`] 同构，id 去重、先到先得）。
+pub fn discover_roots_dicts(roots: &[PathBuf]) -> DiscoverResult {
+    let mut merged = DiscoverResult::default();
+    let mut seen = std::collections::BTreeSet::new();
+    for root in roots {
+        let one = discover_dicts(root);
+        for item in one.accepted {
+            if seen.insert(item.id.clone()) {
+                merged.accepted.push(item);
+            }
+        }
+        merged.rejected.extend(one.rejected);
+    }
+    merged.accepted.sort_by(|a, b| a.id.cmp(&b.id));
+    merged
+}
+
+/// 递归收集 `dir` 下所有 `*.dict.yaml`（只走 `dict/` 分类目录）。
+fn collect_dict_files(dir: &Path, out: &mut Vec<PathBuf>) {    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .collect();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            collect_dict_files(&path, out);
+            continue;
+        }
+        let is_dict = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(".dict.yaml"));
+        if is_dict {
+            out.push(path);
+        }
+    }
+}
+
+/// 扫描一个数据根里的**词库**（`<数据根>/dict/**`），校验方法与方案完全同一套四关：
+/// 文件头标记 → 实际编码/换行 → 顶层 `id:` 单数写法/内容/与文件名一致 → 系列摆放。
+///
+/// `dict/` 目录不存在就返回空结果（与 `discover` 一样不是错误）。
+pub fn discover_dicts(data_root: &Path) -> DiscoverResult {
+    let mut result = DiscoverResult::default();
+    let mut files = Vec::new();
+    collect_dict_files(&data_root.join(DICT_DIR), &mut files);
+    for path in files {
+        let report = admit::check_dict_file(&path);
+        if !report.passed() {
+            result
+                .rejected
+                .push((path.clone(), DiscoverResult::reject_reason(&report)));
+            continue;
+        }
+        let Some(id) = report.schema_id.clone() else {
+            result
+                .rejected
+                .push((path.clone(), "通过了检查却取不到 id".to_string()));
+            continue;
+        };
+        result.accepted.push(Discovered {
+            id,
+            name: report.schema_name.clone(),
+            path,
+        });
+    }
+    result.accepted.sort_by(|a, b| a.id.cmp(&b.id));
+    result
+}
+
+/// 挑默认 `active`：拼音类优先（标准样板），否则第一个。
+///
+/// 2026-10-29：认出 `pinyin.luna` 这种**带系列前缀**的拼音方案 —— 只认字面 `pinyin`
+/// 时，新外来的方案只要 id 排得更靠前（例如 `092`）就会抢走默认方案。
 fn pick_active(ids: &[String]) -> Option<String> {
     if ids.is_empty() {
         return None;
     }
     ids.iter()
-        .find(|id| *id == "pinyin")
+        .find(|id| id.as_str() == "pinyin")
+        .or_else(|| ids.iter().find(|id| id.starts_with("pinyin.")))
         .or_else(|| ids.first())
         .cloned()
 }

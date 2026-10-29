@@ -86,7 +86,7 @@ speller:
     - "xform/in$/N/"
     - "xlit/QWRTYUIOPSDFGHJKLZXCVBNM/qwrtyuiopsdfghjklzxcvbnm/"
 translator:
-  dictionary: luna_pinyin
+  dict: luna_pinyin
   preedit_format:
     - "xform/([jqx])s/$1iong/"
     - "xform/(\\w)s/$1ong/"

@@ -131,6 +131,22 @@ path = "example/scan_report.rs"
 name = "schema_diff"
 path = "example/schema_diff.rs"
 
+[[example]]
+name = "probe_all_schemas"
+path = "example/probe_all_schemas.rs"
+
+[[example]]
+name = "probe_menu"
+path = "example/probe_menu.rs"
+
+[[example]]
+name = "probe_sp_step"
+path = "example/probe_sp_step.rs"
+
+[[example]]
+name = "deploy_live"
+path = "example/deploy_live.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 # `preserve_order`：把 `serde_json::Value::Object` 的后备映射从 `BTreeMap` 换成
@@ -156,3 +172,11 @@ rsmarisa = "0.4"
 # 仍有的两处手工翻译见 `algo/calculus.rs`。
 rusty-leveldb = "4.0.2"
 fancy-regex = "0.20.0"
+
+[[test]]
+name = "reverse_lookup_scheme"
+path = "test/reverse_lookup_scheme.rs"
+
+[[example]]
+name = "probe_schema"
+path = "example/probe_schema.rs"

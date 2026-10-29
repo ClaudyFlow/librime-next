@@ -36,6 +36,7 @@ use crate::dict::prism::Prism;
 use crate::dict::reverse_lookup_dictionary::ReverseDb;
 use crate::dict::table::Table;
 use crate::dict::vocabulary::{Code, ShortDictEntry, Syllabary, Vocabulary};
+use crate::lever::paths::DICT_DIR;
 
 /// `DictCompiler::Options`（`dict_compiler.h` 的枚举）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -405,7 +406,7 @@ impl DictCompiler {
     }
 
     /// `classified_dict_source`（`dict_compiler.cc:56-86`）：词典源只认分类路径。
-    /// id 含 '/' 时按显式相对路径；裸 id 按点号分段进 `schema/<系列…>/`。
+    /// id 含 '/' 时按显式相对路径；裸 id 按点号分段进 `dict/<系列…>/`。
     fn classified_dict_source(&self, dict_name: &str) -> Option<PathBuf> {
         classified_dict_source(&self.user_data_dir, &self.shared_data_dir, dict_name)
     }
@@ -432,14 +433,20 @@ impl DictCompiler {
 }
 
 /// `classified_dict_source`（`dict_compiler.cc:56-86`，C++ 的 static 函数）：
-/// 先用户目录后共享目录，**没有扁平回退**；找不到返回 `None`。
+/// 先用户目录后共享目录；找不到返回 `None`。
 ///
-/// [Weasel-Next 宽容项 2026-10-26] 裸 id 的系列路径失手后，再扫两个数据根的
-/// `schema/<一级子目录>/`（兄弟方案目录）。场景：用户目录里留着**旧版无前缀**
+/// **词库路径放宽到"前缀"**（2026-10-28 用户定）：方案要求目录 = id 全部分段，
+/// 词库不要求 —— 目录只要是 `dict/` + **id 分段的某个前缀**即可
+/// （`cangjie.5.base` 可以住在 `dict/cangjie/5/`、`dict/cangjie/`，甚至 `dict/`）。
+/// 理由：`cangjie.5.base` / `.stem` / `.extended` 是被 `import_tables` 吃掉的片段，
+/// 为它们各建一层文件夹没有收益。所以查找顺序是**精确优先、再逐级退前缀**：
+/// `dict/cangjie/5/base/…` → `dict/cangjie/5/…` → `dict/cangjie/…` → `dict/…`。
+///
+/// [Weasel-Next 宽容项 2026-10-26] 前缀都失手后，再扫两个数据根的
+/// `dict/<一级子目录>/`（兄弟词库目录）。场景：用户目录里留着**旧版无前缀**
 /// `import_tables`（`- yustar.quick`）的词典头，而带前缀写法的新版在共享目录
-/// `schema/yuhao/` 下——旧副本按优先级胜出后，系列规则
-/// `schema/yustar/quick/…` 找不到文件，真机 deploy 因此 18/2。
-/// 只扫一级目录、只认完整文件名，不会把扁平文件捞回来。
+/// `dict/yuhao/` 下——旧副本按优先级胜出后，系列规则找不到文件，真机 deploy 因此 18/2。
+/// 只扫一级目录、只认完整文件名。
 pub fn classified_dict_source(
     user_data_dir: &Path,
     shared_data_dir: &Path,
@@ -451,25 +458,31 @@ pub fn classified_dict_source(
         if root.as_os_str().is_empty() {
             continue;
         }
-        let mut nested = root.to_path_buf();
-        if !explicit {
-            nested = nested.join("schema");
-            for segment in dict_name.split('.') {
-                if !segment.is_empty() {
-                    nested = nested.join(segment);
-                }
+        if explicit {
+            let path = root.join(&file_name);
+            if path.is_file() {
+                return Some(path);
+            }
+            continue;
+        }
+        // 精确在前，逐级退前缀（前缀层级从深到浅）
+        let segments: Vec<&str> = dict_name.split('.').filter(|s| !s.is_empty()).collect();
+        for depth in (0..=segments.len()).rev() {
+            let mut nested = root.join(DICT_DIR);
+            for segment in &segments[..depth] {
+                nested = nested.join(segment);
+            }
+            let candidate = nested.join(&file_name);
+            if candidate.is_file() {
+                return Some(candidate);
             }
         }
-        nested = nested.join(&file_name);
-        if nested.is_file() {
-            return Some(nested);
-        }
     }
-    // 宽容搜索：裸 id 在兄弟方案目录里找（见函数头注释）。
+    // 宽容搜索：裸 id 在兄弟词库目录里找（见函数头注释）。
     if !explicit {
         for root in [user_data_dir, shared_data_dir] {
-            let schema_dir = root.join("schema");
-            let Ok(entries) = std::fs::read_dir(&schema_dir) else {
+            let dict_dir = root.join(DICT_DIR);
+            let Ok(entries) = std::fs::read_dir(&dict_dir) else {
                 continue;
             };
             for entry in entries.flatten() {
@@ -599,26 +612,26 @@ mod tests {
         // 扁平存在也**不认**（零扁平回退）
         std::fs::write(shared.join("luna_pinyin.dict.yaml"), "x").unwrap();
         assert_eq!(classified_dict_source(&user, &shared, "luna_pinyin"), None);
-        // 分类路径才认
-        std::fs::create_dir_all(shared.join("schema/luna_pinyin")).unwrap();
-        std::fs::write(shared.join("schema/luna_pinyin/luna_pinyin.dict.yaml"), "x").unwrap();
+        // 分类路径才认（词库只进 `dict/`）
+        std::fs::create_dir_all(shared.join("dict/luna_pinyin")).unwrap();
+        std::fs::write(shared.join("dict/luna_pinyin/luna_pinyin.dict.yaml"), "x").unwrap();
         assert_eq!(
             classified_dict_source(&user, &shared, "luna_pinyin"),
-            Some(shared.join("schema/luna_pinyin/luna_pinyin.dict.yaml"))
+            Some(shared.join("dict/luna_pinyin/luna_pinyin.dict.yaml"))
         );
         // 用户目录优先
-        std::fs::create_dir_all(user.join("schema/yuling/five")).unwrap();
-        std::fs::write(user.join("schema/yuling/five/yuling.five.dict.yaml"), "x").unwrap();
+        std::fs::create_dir_all(user.join("dict/yuling/five")).unwrap();
+        std::fs::write(user.join("dict/yuling/five/yuling.five.dict.yaml"), "x").unwrap();
         assert_eq!(
             classified_dict_source(&user, &shared, "yuling.five"),
-            Some(user.join("schema/yuling/five/yuling.five.dict.yaml"))
+            Some(user.join("dict/yuling/five/yuling.five.dict.yaml"))
         );
         // 显式相对路径：不套系列规则
-        std::fs::create_dir_all(shared.join("schema/yuhao")).unwrap();
-        std::fs::write(shared.join("schema/yuhao/yuling.quick.dict.yaml"), "x").unwrap();
+        std::fs::create_dir_all(shared.join("dict/yuhao")).unwrap();
+        std::fs::write(shared.join("dict/yuhao/yuling.quick.dict.yaml"), "x").unwrap();
         assert_eq!(
-            classified_dict_source(&user, &shared, "schema/yuhao/yuling.quick"),
-            Some(shared.join("schema/yuhao/yuling.quick.dict.yaml"))
+            classified_dict_source(&user, &shared, "dict/yuhao/yuling.quick"),
+            Some(shared.join("dict/yuhao/yuling.quick.dict.yaml"))
         );
         std::fs::remove_dir_all(&root).ok();
     }
@@ -630,8 +643,8 @@ mod tests {
         let user = root.join("user");
         let shared = root.join("shared");
         let staging = root.join("build");
-        // 源：schema/luna_pinyin/luna_pinyin.dict.yaml（单字 + 一个无码词组）
-        let dict_dir = shared.join("schema/luna_pinyin");
+        // 源：dict/luna_pinyin/luna_pinyin.dict.yaml（单字 + 一个无码词组）
+        let dict_dir = shared.join("dict/luna_pinyin");
         std::fs::create_dir_all(&dict_dir).unwrap();
         std::fs::write(
             dict_dir.join("luna_pinyin.dict.yaml"),
@@ -648,7 +661,9 @@ sort: by_weight
         )
         .unwrap();
         // schema 源（给 speller/algebra 用；编译后的产物由调用方写 staging）
-        let schema_src = shared.join("schema/luna_pinyin/luna_pinyin.schema.yaml");
+        let schema_dir = shared.join("schema/luna_pinyin");
+        std::fs::create_dir_all(&schema_dir).unwrap();
+        let schema_src = schema_dir.join("luna_pinyin.schema.yaml");
         std::fs::write(
             &schema_src,
             "\
@@ -701,12 +716,15 @@ translator:
     }
 
     /// 真实数据诊断：同一词典连续编译两次，第二次必须**复用**（mtime 不变）。
+    /// 真实数据已按 `dict/` + `schema/` 拆家（2026-10-28）：明月拼音的 id 是
+    /// `pinyin.luna`，词库在 `dict/pinyin/luna/`、方案在 `schema/pinyin/luna/`。
     /// 仓库共享目录不在时跳过（CI / 换机器）。
     #[test]
     fn real_luna_pinyin_second_compile_reuses_table() {
         let shared = Path::new("C:/code/Weasel-Next/Rime-Next");
-        let schema = shared.join("schema/luna_pinyin/luna_pinyin.schema.yaml");
-        if !schema.is_file() {
+        let schema = shared.join("schema/pinyin/luna/pinyin.luna.schema.yaml");
+        let dict = shared.join("dict/pinyin/luna/pinyin.luna.dict.yaml");
+        if !schema.is_file() || !dict.is_file() {
             eprintln!("skip: no real shared data dir");
             return;
         }
@@ -715,8 +733,8 @@ translator:
         let staging = root.join("build");
         std::fs::create_dir_all(&user).unwrap();
         let mut compiler = DictCompiler::new(
-            "luna_pinyin",
-            "luna_pinyin",
+            "pinyin.luna",
+            "pinyin.luna",
             Vec::new(),
             &user,
             shared,
@@ -724,7 +742,7 @@ translator:
             shared.join("prebuilt"),
         );
         compiler.compile(Some(&schema)).expect("first compile");
-        let table = staging.join("luna_pinyin/luna_pinyin.table.bin");
+        let table = staging.join("pinyin/luna/pinyin.luna.table.bin");
         let before = std::fs::metadata(&table).unwrap().modified().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1100));
         compiler.compile(Some(&schema)).expect("second compile");
@@ -739,11 +757,12 @@ translator:
         let user = root.join("user");
         let shared = root.join("shared");
         let staging = root.join("build");
-        let dict_dir = shared.join("schema/luna_pinyin");
+        let dict_dir = shared.join("dict/luna_pinyin");
         std::fs::create_dir_all(&dict_dir).unwrap();
         let dict_file = dict_dir.join("luna_pinyin.dict.yaml");
         std::fs::write(&dict_file, "---\nname: luna_pinyin\nversion: \"1.0\"\n...\n你\tni\n").unwrap();
         let schema_src = shared.join("schema/luna_pinyin/luna_pinyin.schema.yaml");
+        std::fs::create_dir_all(schema_src.parent().unwrap()).unwrap();
         std::fs::write(&schema_src, "schema:\n  schema_id: luna_pinyin\ntranslator:\n  dictionary: luna_pinyin\n").unwrap();
         let mut compiler = DictCompiler::new(
             "luna_pinyin",

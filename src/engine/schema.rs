@@ -130,7 +130,8 @@ impl Schema {
     ///
     /// librime 把 `script_translator` 的配置放在顶层 `translator:` 命名空间（不是
     /// `translator/script_translator/`），所以先逐个试每个 `engine/translators` 命名空间，
-    /// 找不到 `dictionary` 时退回顶层 `/translator/`。
+    /// 找不到 `dict` 时退回顶层 `/translator/`。正式键是单数 `dict`（2026-10-28 20:5x 起；
+    /// **不再认** `dictionary`）。
     pub fn first_translator_dict(&self) -> Option<(String, String)> {
         // 先试每个命名空间，再退回顶层默认命名空间
         let mut namespaces = self.translator_namespaces();
@@ -141,7 +142,7 @@ impl Schema {
             } else {
                 format!("translator/{ns}")
             };
-            if let Some(dict) = self.get_string(&format!("/{base}/dictionary")) {
+            if let Some(dict) = self.get_string(&format!("/{base}/dict")) {
                 let prism = self
                     .get_string(&format!("/{base}/prism"))
                     .unwrap_or_else(|| dict.clone());

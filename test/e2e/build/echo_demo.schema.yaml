@@ -40,7 +40,7 @@ speller:
   alphabet: "zyxwvutsrqponmlkjihgfedcba"
   delimiter: " '"
 translator:
-  dictionary: luna_pinyin
+  dict: luna_pinyin
   prism: luna_pinyin_simp
 menu:
   page_size: 9

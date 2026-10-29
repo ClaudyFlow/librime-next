@@ -87,11 +87,26 @@ pub struct SwitcherItem {
 
 // ── 与 Switcher 实例无关的入口（引擎构造 / 切换方案时要用）──────────────
 
-/// 在数据根里找 `default.yaml`：**用户目录优先、共享目录回退**。
+/// 找方案菜单要用的 `default.yaml`：**部署产物优先，其次数据根（用户目录 → 共享目录）**。
 ///
-/// 与补丁版 `Config::Require("config")->Create("default")` 的解析根顺序一致
-/// （`Service::CreateResourceResolver({...})` 的根是用户目录、回退根是共享目录）。
-pub fn load_default_config(data_roots: &[PathBuf]) -> Value {
+/// ① `build/default.yaml` = **部署产物**。部署时 `WorkspaceUpdate` 会把
+///    `schema/schema.yaml` 的勾选清单原样写进 `staging/default.yaml`
+///    （见 `lever/deployment_tasks.rs` 第 5 步），所以这份才是"用户在设置里勾了什么"。
+///    C++ `Switcher` 读的也正是它（`Config::Require("config")->Create("default")`
+///    解析到部署目录，不是用户的源文件）。
+/// ② 数据根里的源文件 `<用户>\default.yaml` / `<共享>\default.yaml` 只在**还没部署过**时兜底。
+///
+/// ⚠️ 2026-10-29 修：原来只查 ②，于是菜单永远读用户的**源** `default.yaml`。真实故障是
+/// 用户那份还是 10-27 的旧 id（`luna_pinyin_simp` / `pinyin` / `wubi86`），而 8 个新方案
+/// （`cangjie.5`、`pinyin.terra`…）一个都不在菜单里 —— 表现就是"设置里勾了 8 个，
+/// 输入法里只有两项能切"，且切过去的旧 id 早已没有 translator，候选恒为 0。
+pub fn load_default_config(build_dir: &Path, data_roots: &[PathBuf]) -> Value {
+    let deployed = build_dir.join("default.yaml");
+    if deployed.is_file()
+        && let Ok(config) = crate::load_file(&deployed)
+    {
+        return config;
+    }
     for root in data_roots {
         let path = root.join("default.yaml");
         if path.is_file()
@@ -676,5 +691,77 @@ mod tests {
             "不在 save_options 里的不碰"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 方案菜单必须读**部署产物** `build/default.yaml`（= `schema/schema.yaml` 的勾选清单），
+    /// 不能被用户目录里过期的源 `default.yaml` 抢走。
+    ///
+    /// 回归自 2026-10-29 真机故障：用户设置里勾了 8 个方案，
+    /// `<用户>\build\default.yaml` 也是 8 个，但菜单只显示旧源文件里的 4 个
+    /// （其中 3 个 id 已废弃、候选恒为 0），表现为"只有两项能用"。
+    #[test]
+    fn deployed_default_yaml_wins_over_stale_user_source() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "lrn_switcher_deployed_{}_{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let user = root.join("user");
+        let build = user.join("build");
+        std::fs::create_dir_all(&build).unwrap();
+        // 部署产物：8 项里取两项代表（顺序 = 菜单顺序）
+        std::fs::write(
+            build.join("default.yaml"),
+            "schema_list:\n  - schema: pinyin.luna\n  - schema: double_pinyin.flypy\n",
+        )
+        .unwrap();
+        // 用户源文件：过期 id + 只剩一项
+        std::fs::write(
+            user.join("default.yaml"),
+            "schema_list:\n  - schema: luna_pinyin_simp\n  - schema: pinyin\n",
+        )
+        .unwrap();
+
+        let config = load_default_config(&build, &[user.clone()]);
+        let ids = schema_list_translator::for_each_schema_list_entry(&config, |id| {
+            assert_ne!(id, "luna_pinyin_simp", "过期源文件的清单不该被读到");
+            true
+        });
+        assert_eq!(ids, 2);
+        let first = config
+            .pointer("/schema_list/0/schema")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert_eq!(first, "pinyin.luna");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 没部署过（`build/default.yaml` 不存在）时才回退到数据根的源文件，且用户目录优先。
+    #[test]
+    fn falls_back_to_data_roots_before_first_deploy() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "lrn_switcher_fallback_{}_{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let user = root.join("user");
+        let shared = root.join("shared");
+        let build = user.join("build");
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(user.join("default.yaml"), "schema_list:\n  - schema: stroke\n").unwrap();
+        std::fs::write(shared.join("default.yaml"), "schema_list:\n  - schema: zhuyin\n").unwrap();
+
+        let config = load_default_config(&build, &[user, shared]);
+        let first = config
+            .pointer("/schema_list/0/schema")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert_eq!(first, "stroke", "用户目录优先于共享目录");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

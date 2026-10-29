@@ -24,7 +24,7 @@ speller:
   alphabet: "abcdefghijklmnopqrstuvwxyz"
   delimiter: " '"
 translator:
-  dictionary: stroke
+  dict: stroke
   preedit_format:
     - xlit/hspnz/⼀⼁⼃⼂⼄/
   comment_format:

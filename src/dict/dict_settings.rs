@@ -65,7 +65,8 @@ impl DictSettings {
                 break;
             }
         }
-        let config = parse_yaml_header(&header)?;
+        let mut config = parse_yaml_header(&header)?;
+        normalize_dict_dialect(&mut config);
         // `(*this)["name"].IsNull() || (*this)["version"].IsNull()` → 不完整
         if config.get("name").is_none_or(Value::is_null)
             || config.get("version").is_none_or(Value::is_null)
@@ -89,6 +90,22 @@ impl DictSettings {
     /// `dict_name()`：`name` 的字符串值（null → ""）。
     pub fn dict_name(&self) -> String {
         scalar_str(self.config.get("name")).unwrap_or_default()
+    }
+
+    /// 词典 `id`：**身份键**（与文件名、`dict/<id 分段>/` 摆放一致）。
+    ///
+    /// 老词库没有 `id`（那时 `name` 兼作身份），返回 `None`；
+    /// 新标准要求写方言单数 `id:`（见 `lever::admit::check_dict_file`）。
+    pub fn dict_id(&self) -> Option<String> {
+        scalar_str(self.config.get("id"))
+    }
+
+    /// 词典身份：优先 `id`，没有 `id` 的老文件回退 `name`。
+    ///
+    /// `name` 在新数据里是**显示名**（如 `pinyin.luna` 的「明月拼音」），
+    /// 拿它拼 `<name>.dict.yaml` 会找不到文件 —— 身份必须以 `id` 为准。
+    pub fn identity(&self) -> String {
+        self.dict_id().unwrap_or_else(|| self.dict_name())
     }
 
     /// `dict_version()`：`version` 的字符串值。
@@ -139,19 +156,23 @@ impl DictSettings {
         self.to_double("min_phrase_weight")
     }
 
-    /// `GetTables()`：`[name] + import_tables`，跳过"导自己"的项
+    /// `GetTables()`：`[身份] + import_tables`，跳过"导自己"的项
     /// （`dict_settings.cc:79-96`）。空头返回空表。
+    ///
+    /// 身份用 [`Self::identity`]（`id` 优先、老文件回退 `name`）—— 新数据里
+    /// `name` 是显示名，拿它去找 `<name>.dict.yaml` 会扑空。
     pub fn get_tables(&self) -> Vec<String> {
         if self.is_empty() {
             return Vec::new();
         }
-        let mut tables = vec![self.dict_name()];
+        let identity = self.identity();
+        let mut tables = vec![identity.clone()];
         if let Some(imports) = self.config.get("import_tables").and_then(Value::as_array) {
             for item in imports {
                 let Some(table) = scalar_str(Some(item)) else {
                     continue; // `Is<ConfigValue>`：非标量跳过
                 };
-                if table == self.dict_name() {
+                if table == identity {
                     continue; // cannot import from itself
                 }
                 tables.push(table);
@@ -220,6 +241,20 @@ fn parse_yaml_header(header: &str) -> Option<Value> {
     };
     let value: serde_norway::Value = serde::Deserialize::deserialize(document).ok()?;
     serde_json::to_value(&value).ok()
+}
+
+/// 词典头的方言归一化：单数键 → librime 认的复数键（**只补缺**，复数已写就不动）。
+///
+/// 与方案侧 [`crate::config::load`] 的 `normalize_dialect` 同一套规矩：人写单数、
+/// 读入时翻成 librime 的复数，下游不用辨认两套词汇。目前只有一条：
+/// `column` → `columns`（`GetColumnIndex` 只认复数名）。
+fn normalize_dict_dialect(config: &mut Value) {
+    if let Some(map) = config.as_object_mut()
+        && !map.contains_key("columns")
+        && let Some(value) = map.remove("column")
+    {
+        map.insert("columns".to_string(), value);
+    }
 }
 
 /// `ConfigItem::ToString()`：标量才给字符串（null / 列表 / 映射 → None）。
@@ -396,6 +431,43 @@ columns:
         assert_eq!(bare.get_column_index("text"), 0);
         assert_eq!(bare.get_column_index("weight"), 2);
         assert_eq!(bare.get_column_index("nope"), -1);
+    }
+
+    /// 方言单数 `column:` 与原生 `columns:` 等价（**只补缺**：两个都写时认复数）。
+    #[test]
+    fn singular_column_is_accepted() {
+        let singular = "\
+name: cangjie.5.stem
+version: 2026.10.28
+column:
+  - text
+  - code
+  - stem
+...
+";
+        let (s, _) = DictSettings::load_dict_header(singular).expect("header");
+        assert_eq!(s.get_column_index("text"), 0);
+        assert_eq!(s.get_column_index("code"), 1);
+        assert_eq!(s.get_column_index("stem"), 2, "单数 column 的列序要生效");
+
+        // 复数写法照旧
+        let (c, _) = DictSettings::load_dict_header(SAMPLE).expect("header");
+        assert_eq!(c.get_column_index("weight"), 2);
+
+        // 两个都写：复数优先，单数被忽略（不覆盖人手写的原生写法）
+        let both = "\
+name: d
+version: \"1\"
+column:
+  - text
+columns:
+  - text
+  - code
+  - weight
+...
+";
+        let (b, _) = DictSettings::load_dict_header(both).expect("header");
+        assert_eq!(b.get_column_index("weight"), 2, "columns 存在时不被 column 覆盖");
     }
 
     #[test]
