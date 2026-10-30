@@ -1509,19 +1509,44 @@ mod host_smoke {
         false
     }
 
+    fn copy_dir_contents(src: &std::path::Path, dst: &std::path::Path) {
+        std::fs::create_dir_all(dst).unwrap();
+        for entry in std::fs::read_dir(src).unwrap().flatten() {
+            let to = dst.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir_contents(&entry.path(), &to);
+            } else {
+                let _ = std::fs::copy(entry.path(), to);
+            }
+        }
+    }
+
     #[test]
     fn host_path_typing_nihao_yields_candidates() {
+        // 沙箱隔离:真机 UserDb 里学过的词(如「你和傲」)会优先顶到候选第一位,
+        // 污染本测试的「你好」断言。用临时目录装 build 产物(不含 userdb),
+        // 测的是同一条部署代码路径,但不带用户学习数据。
         let appdata = std::env::var("APPDATA").unwrap_or_default();
-        let user_str = format!("{appdata}/Rime-Next");
-        if !host_has_dict_keyed_build(&user_str) {
+        let real_user = format!("{appdata}/Rime-Next");
+        if !host_has_dict_keyed_build(&real_user) {
             eprintln!(
                 "跳过：%APPDATA%\\Rime-Next\\build 里没有 `dict:` 的新产物（重新部署后再测；\
                  旧产物的 dictionary: 已不兼容）"
             );
             return;
         }
-        let shared = CString::new("C:/Program Files/Weasel-Next/Rime-Next").unwrap();
-        let user = CString::new(user_str).unwrap();
+        // 沙箱:拷 build\ 和 schema\ 到临时目录,不带 userdb\ 和 installation.yaml
+        let sandbox = std::env::temp_dir().join(format!("host-smoke-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sandbox);
+        std::fs::create_dir_all(sandbox.join("build")).unwrap();
+        // 拷 build 产物
+        let src_build = format!("{real_user}/build");
+        copy_dir_contents(std::path::Path::new(&src_build), &sandbox.join("build"));
+        // 拷 schema 源(reload 用)
+        let src_schema = format!("{real_user}/schema");
+        copy_dir_contents(std::path::Path::new(&src_schema), &sandbox.join("schema"));
+        let shared = CString::new("C:/Program Files/Rime-Next/Weasel-Next-0.18.4/data").unwrap();
+        let user = CString::new(sandbox.to_string_lossy().as_bytes()).unwrap();
         let app = CString::new("rime.weasel-next").unwrap();
 
         let mut traits = RimeTraits {
