@@ -90,6 +90,10 @@ name = "deploy_luna"
 path = "example/deploy_luna.rs"
 
 [[example]]
+name = "bench_keystroke"
+path = "example/bench_keystroke.rs"
+
+[[example]]
 name = "probe_variants"
 path = "example/probe_variants.rs"
 
