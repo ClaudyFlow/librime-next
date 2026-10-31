@@ -282,7 +282,12 @@ impl ScriptTranslator {
     ///
     /// `predict_word_from_depth` 传 0（`script_translator` 出厂方案不开预测），
     /// 与 C++ 的 `user_dict_->Lookup(syllable_graph, start, 0, 0)` 一致。
-    fn user_dict_candidates(&mut self, input: &str, seg_start: usize) -> Vec<Candidate> {
+        fn user_dict_candidates(
+        &mut self,
+        input: &str,
+        seg_start: usize,
+        ngram_bonus: &dyn Fn(&str) -> f64,
+    ) -> Vec<Candidate> {
         if self.user_dict.is_none() {
             return Vec::new();
         }
@@ -313,7 +318,7 @@ impl ScriptTranslator {
                     seg_start,
                     seg_start + end,
                     entry.text.clone(),
-                    quality,
+                    quality + ngram_bonus(&entry.text),
                 )
                 .with_entry(entry);
                 let preedit = self.build_preedit(input, end);
@@ -365,8 +370,18 @@ impl Translator for ScriptTranslator {
             )));
         }
 
+        // 个人 n-gram 加成(青简):上文最后两个"词样"记录 → 词级候选加分。
+        // 只加不减、没学过=0,不改变候选集合;整句候选(层 0)不吃这个。
+        let (ngram_before, ngram_prev) =
+            crate::engine::user_ngram::last_two_words(history);
+        let ngram_bonus = |text: &str| -> f64 {
+            crate::engine::user_ngram::global().lock().ok().map_or(0.0, |ngram| {
+                ngram.bonus(ngram_before.as_deref(), ngram_prev.as_deref(), text, crate::engine::user_ngram::DEFAULT_WEIGHT)
+            })
+        };
+
         // ---- 层 1:用户词典 ------------------------------------------------
-        let user = self.user_dict_candidates(input, segment.start);
+        let user = self.user_dict_candidates(input, segment.start, &ngram_bonus);
         if !user.is_empty() {
             tiers.push(Box::new(crate::engine::gear::translation::VecTranslation::new(
                 user,

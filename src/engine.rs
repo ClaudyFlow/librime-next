@@ -20,6 +20,7 @@
 
 pub mod candidate;
 pub mod commit_history;
+pub mod user_ngram;
 pub mod composition;
 pub mod context;
 pub mod gear;

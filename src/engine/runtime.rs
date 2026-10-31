@@ -330,6 +330,22 @@ impl Engine {
         if elements.is_empty() {
             return;
         }
+        // 个人 n-gram 学习(青简):只吃选自菜单的提交(有词条 = 菜单选的;
+        // raw/ascii 提交没有词条,天然被过滤)。多段组合 = 逐段一个词;
+        // 整句提交暂按整条学,回切词(词典贪心)待补(1031日志)。
+        {
+            let words: Vec<String> = elements
+                .iter()
+                .map(|entry| entry.text.clone())
+                .filter(|text| text.chars().count() > 1)
+                .collect();
+            if words.len() >= 2
+                && let Ok(mut ngram) =
+                    crate::engine::user_ngram::global().lock()
+            {
+                ngram.learn_words(&words);
+            }
+        }
         // 同样的借用规避：`memorize` 要 `&mut self`，先把列表取到局部
         let mut translators = std::mem::take(&mut self.translators);
         // 提交历史按值拷一份（≤20 条）：`translators` 已经移出 `self`，
