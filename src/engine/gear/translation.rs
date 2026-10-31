@@ -126,32 +126,40 @@ pub struct ScriptWordsTranslation {
     initial_quality: f64,
     /// 变体词库缺失时的 opencc 兜底(候选文本转换)。
     convert: Option<Opencc>,
+    /// 预计算好的 preedit(`end_pos → 格式化后的串`)。懒流里拿不到
+    /// `Projection`(规则链非 Clone),由翻译器在装配期对**去重后的 end**
+    /// 各算一次(≤8 个),流内查表挂上。
+    preedit_by_end: std::collections::HashMap<usize, String>,
 }
 
 impl ScriptWordsTranslation {
+    /// `seg_start` 是段的**绝对**起点(候选跨度 = `seg_start + 桶键`);
+    /// 收集器键是**段内相对**的 end(词图 0 基,见 `ScriptTranslator::query`)。
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         collector: crate::dict::dictionary::DictEntryCollector,
-        start: usize,
+        seg_start: usize,
         full_len: usize,
         quality_stride: f64,
         initial_quality: f64,
         convert: Option<Opencc>,
+        preedit_by_end: std::collections::HashMap<usize, String>,
     ) -> Self {
-        // collector 键 = end_pos(字节);码长 = end - start。降序排。
+        // collector 键 = 段内相对 end(字节);直接当码长用。降序排。
         let mut groups: Vec<(usize, Vec<crate::dict::vocabulary::DictEntry>)> = collector
             .into_iter()
-            .map(|(end, bucket)| (end.saturating_sub(start), bucket))
             .collect();
         groups.sort_by(|a, b| b.0.cmp(&a.0));
         Self {
             groups,
             gi: 0,
             ii: 0,
-            start,
+            start: seg_start,
             full_len,
             quality_stride,
             initial_quality,
             convert,
+            preedit_by_end,
         }
     }
 }
@@ -179,7 +187,14 @@ impl Translation for ScriptWordsTranslation {
                 self.start + code_len,
                 entry.text.clone(),
                 quality,
-            );
+            )
+            // 词条挂到候选上:选中提交后靠它回写 userdb——code 就是学词键
+            // (`ni hao \t你好` 的左半边),懒化重写时丢了这一行,学词全断。
+            .with_entry(entry.clone());
+            // preedit 表按**绝对 end**键(与翻译器侧 build_preedit 的坐标一致)。
+            if let Some(preedit) = self.preedit_by_end.get(&(self.start + code_len)) {
+                c = c.with_preedit(preedit.clone());
+            }
             if !entry.comment.is_empty() {
                 c = c.with_comment(entry.comment.clone());
             }

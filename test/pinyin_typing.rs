@@ -24,7 +24,7 @@ fn candidates(session: &Session) -> Vec<String> {
                 .segments
                 .iter()
                 .filter_map(|s| s.menu.as_ref())
-                .flat_map(|m| m.candidates().iter().map(|c| c.text.clone()))
+                .flat_map(|m| m.all_candidates().into_iter().map(|c| c.text.clone()))
                 .collect()
         })
         .unwrap_or_default()
@@ -36,8 +36,8 @@ fn pinyin_nihao_produces_nihao() {
         eprintln!("跳过:没有真机 build 目录");
         return;
     };
-    let mut s = Session::create(&dir, "pinyin");
-    assert!(s.engine.is_some(), "pinyin 应能加载");
+    let mut s = Session::create(&dir, "pinyin.luna");
+    assert!(s.engine.is_some(), "pinyin.luna 应能加载");
 
     // ---- nihao → 候选里应有「你好」（essay 预置词汇已并入）----
     assert_eq!(type_str(&mut s, "nihao"), 5);

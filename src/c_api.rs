@@ -562,6 +562,8 @@ unsafe extern "C" fn rime_create_session() -> RimeSessionId {
     g.next_id += 1;
     let build_dir = g.build_dir();
     let roots = g.data_roots();
+    // 神经重排(进程级单例):数据根里有 safetensors 模型才启用。
+    crate::engine::gear::rescore::init_from_data_roots(&roots);
     let default_schema = default_schema_id(&g);
     let session = Session::create_with_roots(&build_dir, &default_schema, &roots);
     g.sessions.insert(id, session);

@@ -20,7 +20,7 @@ fn candidates(session: &Session) -> Vec<String> {
                 .segments
                 .iter()
                 .filter_map(|s| s.menu.as_ref())
-                .flat_map(|m| m.candidates().iter().map(|c| c.text.clone()))
+                .flat_map(|m| m.all_candidates().into_iter().map(|c| c.text.clone()))
                 .collect()
         })
         .unwrap_or_default()

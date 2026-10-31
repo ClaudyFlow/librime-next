@@ -81,7 +81,10 @@ fn workspace_update_writes_staging_per_schema() {
     // 清单里的每个方案都要有产物（写侧契约定死权）
     let mut missing = Vec::new();
     for id in &schema_ids {
-        let product = staging.join(id).join(format!("{id}.schema.yaml"));
+        // 系列布局:dotted id = 目录层级(`wubi.86` → `wubi/86/`)。
+        let product = staging
+            .join(id.replace('.', "/"))
+            .join(format!("{id}.schema.yaml"));
         if !product.is_file() {
             missing.push(id.clone());
         }

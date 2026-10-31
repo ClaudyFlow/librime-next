@@ -242,7 +242,7 @@ fn every_staged_schema_loads_types_and_yields_candidates() {
                 .segments
                 .iter()
                 .filter_map(|seg| seg.menu.as_ref())
-                .flat_map(|m| m.candidates().iter().map(|c| c.text.clone()))
+                .flat_map(|m| m.all_candidates().into_iter().map(|c| c.text.clone()))
                 .any(|t| t == "你好")
         });
         assert!(has_nihao, "luna_pinyin_simp: nihao 应出「你好」");
@@ -259,7 +259,7 @@ fn every_staged_schema_loads_types_and_yields_candidates() {
                 .segments
                 .iter()
                 .filter_map(|seg| seg.menu.as_ref())
-                .flat_map(|m| m.candidates().iter().map(|c| c.text.clone()))
+                .flat_map(|m| m.all_candidates().into_iter().map(|c| c.text.clone()))
                 .any(|t| t == "工")
         });
         assert!(has_gong, "wubi86: aaaa 应出「工」");

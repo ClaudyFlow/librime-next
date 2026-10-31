@@ -13,7 +13,7 @@ fn dump(s: &Session, label: &str) {
             let mut out: Vec<String> = Vec::new();
             for seg in &ctx.composition.segmentation.segments {
                 if let Some(m) = seg.menu.as_ref() {
-                    for c in m.candidates().iter().take(8) {
+                    for c in m.all_candidates().iter().take(8) {
                         out.push(c.text.clone());
                     }
                 }

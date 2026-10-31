@@ -574,10 +574,11 @@ impl Engine {
             }
             let mut menu = Menu::new();
             // 兜底候选（`echo_translator`）：**只在正经候选全空时**才进菜单。
-            // C++ 里这件事由 `EchoTranslation::Compare` 检查 `other->exhausted()`
-            // 完成，LRN 没有翻译器之间的协商通道，所以在这里延后合并。
-            let mut fallback: Vec<Candidate> = Vec::new();
-            let mut has_main = false;
+            // C++ 语义由 `EchoTranslation::Compare`（`other->exhausted()` 时 echo 优先）
+            // 实现；懒化下翻译器在查询时不知道自己会不会有产出，所以把兜底流
+            // 挂成 [`TieredTranslation`] 的**最底层**——上层全部穷尽了它才浮现，
+            // 与 C++ 的 Compare 行为逐条对齐。
+            let mut fallback: Option<Box<dyn crate::engine::gear::translation::Translation>> = None;
             // 段标签决定翻译器是否认领这段（C++ `segment.HasAnyTagIn(tags_)`）——
             // 标签现在由 translator 自己从 `segment.tags` 读，不再单独传。
             for entry in &mut translators {
@@ -589,27 +590,32 @@ impl Engine {
                     // echo_translator 至多一条候选,急切取(代价可忽略);
                     // 候选自带绝对偏移(echo 收 segment 自己算)。
                     if let Some(mut translation) = entry.component.query(text, seg, &history) {
-                        let mut pos = 0;
+                        let mut items = Vec::new();
                         while let Some(c) = translation.peek() {
-                            fallback.push(c);
+                            items.push(c);
                             translation.next();
-                            pos += 1;
-                            if pos > 4 { break; } // echo 至多几条,防御
+                            if items.len() > 4 { break; } // echo 至多几条,防御
+                        }
+                        if !items.is_empty() {
+                            fallback = Some(Box::new(
+                                crate::engine::gear::translation::VecTranslation::new(items),
+                            ));
                         }
                     }
                     continue;
                 }
                 // 懒化管线:翻译器直接交出流式 Translation(Menu 内部归并)。
-                match entry.component.query(text, seg, &history) {
-                    Some(translation) => {
-                        has_main = true;
-                        menu.add_translation(translation);
-                    }
-                    None => continue,
+                if let Some(translation) = entry.component.query(text, seg, &history) {
+                    menu.add_translation(translation);
                 }
             }
-            if !has_main && !fallback.is_empty() {
-                menu.add_translation(Box::new(crate::engine::gear::translation::VecTranslation::new(fallback)));
+            if let Some(fallback) = fallback {
+                // C++ `EchoTranslation::Compare`:别的翻译还活着 echo 就让位。
+                // 懒流在装配期探一口(menu.prepare(1))——有产出就不挂兜底;
+                // 全空才把兜底流挂成最底层。
+                if menu.prepare(1) == 0 {
+                    menu.add_tier(fallback);
+                }
             }
             seg.menu = Some(menu);
             seg.status = SegStatus::Guess;
@@ -621,9 +627,6 @@ impl Engine {
 
     /// C++ `TranslateSegments` 里 `menu->AddFilter(...)` 那段：逐段套用 filter 链。
     fn apply_filters(&mut self) {
-        if self.filters.is_empty() {
-            return;
-        }
         let n = self.context.composition.segmentation.segments.len();
         for i in 0..n {
             // 把该段的 `menu` 所有权先 `take` 出来：否则 `apply` 要借 `&self.context`
@@ -655,6 +658,16 @@ impl Engine {
                     continue;
                 }
                 menu.add_filter(context, entry.component.as_mut());
+            }
+            // 神经重排:最后一段、滤镜链最外层(见 neural/rescore_filter.rs)。
+            if i + 1 == n {
+                let mut neural_filter = crate::engine::gear::neural::NeuralRescoreFilter;
+                if neural_filter.applies_to_segment(
+                    context,
+                    &context.composition.segmentation.segments[i],
+                ) {
+                    menu.add_filter(context, &mut neural_filter);
+                }
             }
             self.context.composition.segmentation.segments[i].menu = Some(menu);
         }

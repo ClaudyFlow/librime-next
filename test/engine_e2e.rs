@@ -82,30 +82,32 @@ fn repro_real_luna_pinyin() {
     let appdata = std::env::var("APPDATA").unwrap_or_default();
     let real_build = PathBuf::from(format!("{appdata}/Rime-Next/build"));
     let user_dir = PathBuf::from(format!("{appdata}/Rime-Next"));
-    let shared_dir = PathBuf::from("C:/Program Files/Weasel-Next/Rime-Next");
+    let shared_dir = PathBuf::from("C:/Program Files/Rime-Next/Weasel-Next-0.18.5/data");
     if !real_build.exists() {
         eprintln!("skip: 真实 build 目录不存在");
         return;
     }
-    if !real_build_uses_dict_key(&real_build) {
-        eprintln!("skip: 真实产物还是旧键（dictionary:），重新部署后再跑");
+    // 2026-10-31 起真机清单（schema/schema.yaml）用系列 id：luna_pinyin_simp 的
+    // 出厂位置由双变体 pinyin.luna 接任（simp/trad 一套方案两份词库）。
+    if !real_build.join("pinyin/luna/pinyin.luna.schema.yaml").exists() {
+        eprintln!("skip: 真实产物还没有 pinyin.luna（重新部署后再跑）");
         return;
     }
     println!("REAL build dir: {}", real_build.display());
     println!("REAL roots: {:?}", [&user_dir, &shared_dir]);
     let mut session = Session::create_with_roots(
         &real_build,
-        "luna_pinyin_simp",
+        "pinyin.luna",
         &[user_dir, shared_dir],
     );
     assert!(
         session.engine.is_some(),
-        "luna_pinyin_simp 引擎应能从真实配置加载"
+        "pinyin.luna 引擎应能从真实配置加载"
     );
     type_ascii(&mut session, "nihao");
     let texts = candidate_texts(&mut session);
     println!(
-        "REAL luna_pinyin_simp candidates: {:?}",
+        "REAL pinyin.luna candidates: {:?}",
         &texts[..texts.len().min(10)]
     );
     assert!(!texts.is_empty(), "真实配置下应产出候选（之前因系列文件夹路径 bug 全空）");
@@ -242,7 +244,7 @@ fn engine_translates_nihao_to_candidates() {
         .first()
         .expect("应有组合段");
     let menu = seg.menu.as_ref().expect("应有候选菜单");
-    let texts: Vec<&str> = menu.candidates().iter().map(|c| c.text.as_str()).collect();
+    let texts: Vec<String> = menu.all_candidates().into_iter().map(|c| c.text).collect();
 
     assert!(
         texts.iter().any(|t| *t == "你好"),
@@ -271,7 +273,7 @@ fn engine_select_commit_nihao() {
             .menu
             .as_ref()
             .unwrap();
-        menu.candidates()
+        menu.all_candidates()
             .iter()
             .position(|c| c.text == "你好")
             .expect("候选里应有「你好」")
@@ -305,7 +307,7 @@ fn engine_per_syllable_confirmation() {
             .menu
             .as_ref()
             .unwrap();
-        menu.candidates()
+        menu.all_candidates()
             .iter()
             .position(|c| c.text == "你")
             .expect("候选里应有「你」")
@@ -333,7 +335,7 @@ fn engine_per_syllable_confirmation() {
             .menu
             .as_ref()
             .unwrap();
-        menu.candidates()
+        menu.all_candidates()
             .iter()
             .position(|c| c.text == "好")
             .expect("候选里应有「好」")
@@ -432,8 +434,8 @@ fn digit_separator_keeps_decimal_point_in_numbers() {
             seg.tags
         );
         assert_eq!(
-            seg.get_selected_candidate().map(|c| c.text.as_str()),
-            Some("."),
+            seg.get_selected_candidate().map(|c| c.text),
+            Some(".".to_string()),
             "数字里的分隔符候选应是字符本身"
         );
     }
@@ -534,8 +536,8 @@ fn digit_separator_respects_full_shape() {
         let ctx = session.context().unwrap();
         let seg = ctx.composition.segmentation.segments.first().unwrap();
         assert_eq!(
-            seg.get_selected_candidate().map(|c| c.text.as_str()),
-            Some("．"),
+            seg.get_selected_candidate().map(|c| c.text),
+            Some("．".to_string()),
             "候选应被 shape formatter 转成全角"
         );
     }
@@ -592,7 +594,7 @@ fn engine_translates_double_pinyin_ziranma() {
         .first()
         .expect("应有组合段");
     let menu = seg.menu.as_ref().expect("应有候选菜单");
-    let texts: Vec<&str> = menu.candidates().iter().map(|c| c.text.as_str()).collect();
+    let texts: Vec<String> = menu.all_candidates().into_iter().map(|c| c.text).collect();
 
     assert!(
         texts.iter().any(|t| *t == "你好"),
@@ -758,7 +760,7 @@ fn candidate_texts(session: &mut Session) -> Vec<String> {
                 .segments
                 .first()
                 .and_then(|seg| seg.menu.as_ref())
-                .map(|m| m.candidates().iter().map(|c| c.text.clone()).collect())
+                .map(|m| m.all_candidates().iter().map(|c| c.text.clone()).collect())
         })
         .unwrap_or_default()
 }
@@ -1009,8 +1011,7 @@ fn user_dict_learns_committed_phrase() {
         .and_then(|ctx| ctx.composition.segmentation.segments.first())
         .and_then(|seg| seg.menu.as_ref())
         .and_then(|menu| menu.candidate_at(0))
-        .and_then(|c| c.entry.as_ref())
-        .is_some_and(|e| !e.code.0.is_empty());
+        .is_some_and(|c| c.entry.as_ref().is_some_and(|e| !e.code.0.is_empty()));
     assert!(has_entry, "用户词典候选应挂着 code 非空的词条");
 }
 
@@ -1051,7 +1052,7 @@ fn candidate_list(session: &mut Session) -> Vec<librime_next::engine::Candidate>
                 .segments
                 .first()
                 .and_then(|seg| seg.menu.as_ref())
-                .map(|m| m.candidates().to_vec())
+                .map(|m| m.all_candidates().to_vec())
         })
         .unwrap_or_default()
 }
@@ -1247,19 +1248,31 @@ fn reverse_lookup_does_not_claim_plain_segments() {
 fn reverse_lookup_filter_fills_codes() {
     use librime_next::engine::gear::filter::Filter;
     use librime_next::engine::gear::reverse_lookup_filter::ReverseLookupFilter;
+    use librime_next::engine::gear::translation::{Translation, VecTranslation};
     use librime_next::engine::Candidate;
     use serde_json::json;
 
     let build = build_dir();
     let config = json!({ "reverse_lookup": { "dictionary": "luna_pinyin" } });
     let mut filter = ReverseLookupFilter::load(&config, "filter", &build);
-    let mut list = vec![
+    let list = vec![
         Candidate::new("script", 0, 3, "你".to_string(), 1.0),
         Candidate::new("script", 0, 3, "好".to_string(), 1.0).with_comment("已有的"),
     ];
-    filter.apply(&librime_next::engine::Context::new(), &mut list);
-    assert_eq!(list[0].comment, "ni", "没注释的候选应被补上反查码");
-    assert_eq!(list[1].comment, "已有的", "默认不覆盖别人的注释");
+    // 懒化后的 Filter::apply 包装流而不是改列表。
+    let mut out = Vec::new();
+    let mut wrapped = filter.apply(
+        &librime_next::engine::Context::new(),
+        Box::new(VecTranslation::new(list)),
+        &mut out,
+    );
+    let mut drained = Vec::new();
+    while let Some(c) = wrapped.peek() {
+        drained.push(c);
+        wrapped.next();
+    }
+    assert_eq!(drained[0].comment, "ni", "没注释的候选应被补上反查码");
+    assert_eq!(drained[1].comment, "已有的", "默认不覆盖别人的注释");
 }
 
 // ── 提交历史（history_translator）──────────────────────────────────────────
@@ -1381,7 +1394,7 @@ fn candidate_list_of_last_segment(session: &mut Session) -> Vec<librime_next::en
                 .segments
                 .last()
                 .and_then(|seg| seg.menu.as_ref())
-                .map(|m| m.candidates().to_vec())
+                .map(|m| m.all_candidates().to_vec())
         })
         .unwrap_or_default()
 }
@@ -2073,13 +2086,15 @@ fn wubi86_table_translator_end_to_end() {
     let mut deployer = Deployer::with_data_dirs(&shared, &sandbox_user);
     deployer.staging_dir = staging.clone();
     let ok = DeploymentTask::SchemaUpdate {
-        source_path: shared.join("schema").join("wubi86").join("wubi86.schema.yaml"),
+        // 2026-10-31 起方案源用系列布局:dotted id = 目录层级。
+        source_path: shared.join("schema").join("wubi").join("86").join("wubi.86.schema.yaml"),
         verbose: false,
     }
     .run(&mut deployer);
     assert!(ok, "wubi86 SchemaUpdate 应成功");
 
-    let mut session = Session::create(&staging, "wubi86");
+    // 方案源已是系列 id `wubi.86`(dotted id = 目录层级)。
+    let mut session = Session::create(&staging, "wubi.86");
     assert!(session.engine.is_some(), "wubi86 引擎应能加载（table_translator 链）");
 
     for ch in "aaaa".chars() {
@@ -2092,7 +2107,7 @@ fn wubi86_table_translator_end_to_end() {
         .segments
         .iter()
         .filter_map(|s| s.menu.as_ref())
-        .flat_map(|m| m.candidates().iter().map(|c| c.text.clone()).collect::<Vec<_>>())
+        .flat_map(|m| m.all_candidates().iter().map(|c| c.text.clone()).collect::<Vec<_>>())
         .collect();
     assert!(
         texts.iter().any(|t| t == "工"),

@@ -73,6 +73,20 @@ impl Menu {
         }
     }
 
+    /// 追加一个**保底层**:现有结果全部穷尽后才轮到它(C++ `EchoTranslation::Compare`
+    /// 的懒化等价物——兜底候选只在正经候选全空时浮现)。
+    pub fn add_tier(&self, tier: Box<dyn Translation>) {
+        let mut result = self.result.borrow_mut();
+        match result.take() {
+            None => *result = Some(tier),
+            Some(existing) => {
+                *result = Some(Box::new(crate::engine::gear::translation::TieredTranslation::new(
+                    vec![existing, tier],
+                )));
+            }
+        }
+    }
+
     /// `Menu::AddFilter`:把 `result` 换成滤镜包装(C++ 同名)。
     pub fn add_filter(&self, ctx: &Context, filter: &mut dyn Filter) {
         // 先把 result 取出来、**结束这次借用**，再调 filter。
@@ -155,5 +169,12 @@ impl Menu {
     /// 已物化前缀的只读快照。
     pub fn materialized(&self) -> Vec<Candidate> {
         self.candidates.borrow().clone()
+    }
+
+    /// 全量物化(排空流后返回全部候选)。测试/探针用——懒式菜单里
+    /// 这等价于旧急切实现的 `candidates()`。
+    pub fn all_candidates(&self) -> Vec<Candidate> {
+        self.prepare(usize::MAX);
+        self.materialized()
     }
 }

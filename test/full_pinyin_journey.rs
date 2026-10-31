@@ -1,4 +1,7 @@
-//! 全拼(luna_pinyin_simp)完整打字旅程:模拟真人一段输入的全流程。
+//! 全拼(pinyin.luna,真机当前方案)完整打字旅程:模拟真人一段输入的全流程。
+//!
+//! 2026-10-31:真机清单改用系列 id(pinyin.luna 接任 luna_pinyin_simp 的出厂位),
+//! 旧 id 的 build 产物是 `dictionary:` 旧键,当前引擎(只认 `dict:`)不再出候选。
 //!
 //! 对真实部署产物(%APPDATA%\Rime-Next\build,只读)跑:
 //! 词组上屏 / 数字选词 / 逐音节确认 / 翻页 / 退格修正 / Esc / 回车上屏原始串 /
@@ -25,7 +28,7 @@ fn candidates(session: &Session) -> Vec<String> {
                 .segments
                 .iter()
                 .filter_map(|s| s.menu.as_ref())
-                .flat_map(|m| m.candidates().iter().map(|c| c.text.clone()))
+                .flat_map(|m| m.all_candidates().into_iter().map(|c| c.text.clone()))
                 .collect()
         })
         .unwrap_or_default()
@@ -37,8 +40,8 @@ fn full_pinyin_typing_journey() {
         eprintln!("跳过:没有真机 build 目录");
         return;
     };
-    let mut s = Session::create(&dir, "luna_pinyin_simp");
-    assert!(s.engine.is_some(), "luna_pinyin_simp 应能加载");
+    let mut s = Session::create(&dir, "pinyin.luna");
+    assert!(s.engine.is_some(), "pinyin.luna 应能加载");
 
     // ---- ① 打词上屏:nihao → 空格 → 「你好」 ------------------------------
     assert_eq!(type_str(&mut s, "nihao"), 5);

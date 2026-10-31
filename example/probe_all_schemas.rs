@@ -59,7 +59,7 @@ fn main() {
                     for seg in &ctx.composition.segmentation.segments {
                         if let Some(m) = seg.menu.as_ref() {
                             n += m.candidate_count();
-                            if let Some(c) = m.candidates().first() {
+                            if let Some(c) = m.all_candidates().first() {
                                 firsts.push(c.text.clone());
                             }
                         }

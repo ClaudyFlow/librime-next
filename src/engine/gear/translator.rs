@@ -196,28 +196,10 @@ impl ScriptTranslator {
     /// [`crate::engine::menu`] 统一按 `quality` 降序排序，所以这里给整句叠一个
     /// 远大于词级量级（词级是 `音节数 * 1000 + weight`）的基数：
     /// 既保证整句排最前，又保留多条整句之间的相对顺序。
-    fn sentence_candidates(&mut self, input: &str) -> Vec<Candidate> {
-        let Some(sentence) = self.best_sentence(input) else {
-            return Vec::new();
-        };
-        let consumed = sentence.end_pos;
-        let preedit = self.build_preedit(input, consumed);
-        let mut candidate = Candidate::new(
-            "script",
-            0,
-            consumed,
-            sentence.text,
-            sentence.segments.len() as f64 * QUALITY_SYLLABLE_STRIDE
-                + QUALITY_TIER_SENTENCE
-                + sentence.weight
-                + self.options.initial_quality,
-        );
-        if !preedit.is_empty() {
-            candidate = candidate.with_preedit(preedit);
-        }
-        self.options.format_preedit(&mut candidate.preedit);
-        vec![candidate]
-    }
+    ///
+    /// 2026-10-31:去掉无人调用的 `sentence_candidates` 包装(query 内联构造),
+    /// 它的候选坐标还是段内相对系(起点写死 0),affix 段会错位 —— 留着是坑。
+    /// [`Self::best_sentence`] 保留(条件判定仍然用它)。
 
     /// 按 C++ 的前置条件算出一条最优整句；不满足条件时 `None`。
     fn best_sentence(&self, input: &str) -> Option<Sentence> {
@@ -300,7 +282,7 @@ impl ScriptTranslator {
     ///
     /// `predict_word_from_depth` 传 0（`script_translator` 出厂方案不开预测），
     /// 与 C++ 的 `user_dict_->Lookup(syllable_graph, start, 0, 0)` 一致。
-    fn user_dict_candidates(&mut self, input: &str) -> Vec<Candidate> {
+    fn user_dict_candidates(&mut self, input: &str, seg_start: usize) -> Vec<Candidate> {
         if self.user_dict.is_none() {
             return Vec::new();
         }
@@ -325,8 +307,15 @@ impl ScriptTranslator {
                 }
                 let quality =
                     entry.code.len() as f64 * QUALITY_SYLLABLE_STRIDE + QUALITY_TIER_USER + entry.weight;
-                let mut candidate =
-                    Candidate::new("script", 0, end, entry.text.clone(), quality).with_entry(entry);
+                // 收集器键是段内相对 end;候选跨度补成绝对坐标。
+                let mut candidate = Candidate::new(
+                    "script",
+                    seg_start,
+                    seg_start + end,
+                    entry.text.clone(),
+                    quality,
+                )
+                .with_entry(entry);
                 let preedit = self.build_preedit(input, end);
                 if !preedit.is_empty() {
                     candidate = candidate.with_preedit(preedit);
@@ -356,8 +345,8 @@ impl Translator for ScriptTranslator {
             let preedit = self.build_preedit(input, consumed);
             let mut candidate = Candidate::new(
                 "script",
-                0,
-                consumed,
+                segment.start,
+                segment.start + consumed,
                 sentence.text.clone(),
                 sentence.segments.len() as f64 * QUALITY_SYLLABLE_STRIDE
                     + QUALITY_TIER_SENTENCE
@@ -377,7 +366,7 @@ impl Translator for ScriptTranslator {
         }
 
         // ---- 层 1:用户词典 ------------------------------------------------
-        let user = self.user_dict_candidates(input);
+        let user = self.user_dict_candidates(input, segment.start);
         if !user.is_empty() {
             tiers.push(Box::new(crate::engine::gear::translation::VecTranslation::new(
                 user,
@@ -386,22 +375,50 @@ impl Translator for ScriptTranslator {
 
         // ---- 层 2:词表懒迭代(C++ ScriptTranslation 的 kSysPhrase 分支) --
         let full_len = input.len();
-        let start = segment.start;
-        let collector = self.dict.lookup_from_graph(
-            &self.build_graph(input).map(|(g, _)| g).unwrap_or_default(),
-            segment.start,
-            None,
-            false,
-        );
+        // 词图/收集器都是**段内相对坐标**(0 基);候选的绝对跨度由
+        // `segment.start` 在流内补上。之前这里传绝对 start 给
+        // `lookup_from_graph`,段起点非 0(affix/内联段)时查空。
+        let graph = self.build_graph(input).map(|(g, _)| g).unwrap_or_default();
+        let collector = self.dict.lookup_from_graph(&graph, 0, None, false);
+        // preedit 预计算:懒流拿不到 Projection(非 Clone),对**去重后的 end**
+        // 各算一次格式化串(一屏候选 end 至多几个),流内查表。键 = 绝对 end。
+        let ends: Vec<usize> = collector.keys().copied().collect();
+        let mut preedit_by_end = std::collections::HashMap::with_capacity(ends.len());
+        for end in ends {
+            let mut preedit = self.build_preedit(input, end);
+            if !preedit.is_empty() {
+                self.options.format_preedit(&mut preedit);
+                preedit_by_end.insert(segment.start + end, preedit);
+            }
+        }
         tiers.push(Box::new(crate::engine::gear::translation::ScriptWordsTranslation::new(
             collector,
-            start,
+            segment.start,
             full_len,
             QUALITY_SYLLABLE_STRIDE,
             self.options.initial_quality,
             None,
+            preedit_by_end,
         )));
 
         Some(Box::new(crate::engine::gear::translation::TieredTranslation::new(tiers)))
+    }
+
+    /// `ScriptTranslator::Memorize`：把这次提交里选中的词条逐条
+    /// `UpdateEntry(entry, 1)` 写进用户词典(懒化重构时曾随 stash 丢失,2026-10-31 恢复)。
+    fn memorize(&mut self, elements: &[DictEntry], _history: &CommitHistory) -> bool {
+        let Some(user_dict) = self.user_dict.as_mut() else {
+            return false;
+        };
+        if !user_dict.loaded() || user_dict.readonly() {
+            return false;
+        }
+        let mut written = false;
+        for entry in elements {
+            if user_dict.update_entry(&self.dict, entry, 1) {
+                written = true;
+            }
+        }
+        written
     }
 }

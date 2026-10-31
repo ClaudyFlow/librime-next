@@ -162,7 +162,7 @@ fn uniquifier_removes_duplicate_candidates_real_dict() {
         .first()
         .and_then(|s| s.menu.as_ref())
         .map(|m| {
-            m.candidates()
+            m.all_candidates()
                 .iter()
                 .map(|c| c.text.clone())
                 .collect()

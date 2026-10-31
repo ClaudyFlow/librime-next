@@ -32,7 +32,7 @@ fn main() {
             let menu = seg.menu.as_ref().map_or(0, |m| m.candidate_count());
             println!("seg[{i}] [{},{}) tags={:?} menu={menu}", seg.start, seg.end, seg.tags);
             if let Some(m) = seg.menu.as_ref() {
-                for (j, c) in m.candidates().iter().enumerate().take(6) {
+                for (j, c) in m.all_candidates().iter().enumerate().take(6) {
                     println!("  cand[{j}] [{},{}) q={:.0} {}", c.start, c.end, c.quality, c.text);
                 }
             }

@@ -45,7 +45,7 @@ fn main() {
         for seg in &ctx.composition.segmentation.segments {
             if let Some(m) = seg.menu.as_ref() {
                 println!("menu candidates={}", m.candidate_count());
-                for (i, c) in m.candidates().iter().enumerate().take(40) {
+                for (i, c) in m.all_candidates().iter().enumerate().take(40) {
                     println!("  [{i}] {:?}", c.text);
                 }
             }

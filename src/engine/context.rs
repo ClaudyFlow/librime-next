@@ -59,7 +59,10 @@ impl Context {
     }
 
     pub fn is_composing(&self) -> bool {
-        !self.input.is_empty()
+        // C++ `Context::IsComposing()`:`!input_.empty() || !composition_.empty()`。
+        // switcher 展开菜单时输入是空的、但挂着一个 (0,0) 空段 —— 只看 input
+        // 会把菜单判成"没在组合",宿主就不画候选窗了(2026-10-31 实测)。
+        !self.input.is_empty() || !self.composition.segmentation.segments.is_empty()
     }
 
     pub fn has_menu(&self) -> bool {
@@ -195,6 +198,15 @@ impl Context {
             .highlight_index()
             .min(self.menu_candidate_count().saturating_sub(1));
         matches!(self.select(idx), Some(SelectResult::Committed(_)))
+    }
+
+    /// 把末段菜单物化到至少 `n` 条,返回物化后的条数(C++ `Menu::Prepare` 直通)。
+    /// 懒菜单下"当前有多少候选"必须先问这个——空物化前缀会让翻页/导航以为没候选。
+    pub fn menu_prepare(&self, n: usize) -> usize {
+        self.composition
+            .back()
+            .and_then(|s| s.menu.as_ref())
+            .map_or(0, |m| m.prepare(n))
     }
 
     /// 当前段菜单里的候选数。

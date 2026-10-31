@@ -119,14 +119,14 @@ impl Selector {
         true
     }
 
-    /// `Selector::NextCandidate`。
+    /// `Selector::NextCandidate`(C++ `menu->Prepare(index + 2)` 的返回值当 count)。
     fn next_candidate(engine: &mut Engine, linear: bool) -> bool {
         if linear && engine.context.caret_pos < engine.context.input.len() {
             return false;
         }
         let index = engine.context.highlight_index();
-        let count = engine.context.menu_candidate_count();
-        if count == 0 || index + 1 >= count {
+        let count = engine.context.menu_prepare(index + 2);
+        if count <= index + 1 {
             // 已到末尾：消费按键但不移动（C++ `candidate_count <= index → true`）
             return true;
         }
@@ -147,16 +147,12 @@ impl Selector {
         true
     }
 
-    /// `Selector::NextPage`。
+    /// `Selector::NextPage`(C++ `menu->Prepare(page_start + page_size)`)。
     fn next_page(engine: &mut Engine) -> bool {
         let page_size = engine.schema.page_size.max(1) as usize;
-        let index = engine.context.highlight_index();
-        let count = engine.context.menu_candidate_count();
-        if count == 0 {
-            return false;
-        }
-        let target = index + page_size;
-        let page_start = (target / page_size) * page_size;
+        let index = engine.context.highlight_index() + page_size;
+        let page_start = (index / page_size) * page_size;
+        let count = engine.context.menu_prepare(page_start + page_size);
         if count <= page_start {
             // 超过最后一页：`page_down_cycle` 开着就回第一页，否则消费但不动
             if !engine.context.get_option("_page_down_cycle") {
@@ -167,8 +163,8 @@ impl Selector {
             }
             return true;
         }
-        let target = target.min(count - 1);
-        if engine.context.highlight(target) {
+        let index = if index >= count { count - 1 } else { index };
+        if engine.context.highlight(index) {
             Self::tag_paging(engine);
         }
         true
