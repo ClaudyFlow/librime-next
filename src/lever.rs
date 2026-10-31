@@ -30,6 +30,7 @@
 #![allow(dead_code)]
 
 pub mod admit;
+pub mod compile_graph;
 pub mod deployer;
 pub mod deployment_tasks;
 pub mod paths;
