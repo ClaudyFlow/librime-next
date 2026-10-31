@@ -237,7 +237,16 @@ mod tests {
     use super::*;
     use crate::engine::candidate::Candidate;
     use crate::engine::composition::Composition;
+    use crate::engine::gear::translation::VecTranslation;
+    use crate::engine::menu::Menu;
     use crate::engine::segmentation::Segment;
+
+    /// 懒化后没有 `Menu::add`,候选只能经"翻译流"装进菜单(测试用的最小流)。
+    fn menu_with(candidate: Candidate) -> Menu {
+        let menu = Menu::new();
+        menu.add_translation(Box::new(VecTranslation::new(vec![candidate])));
+        menu
+    }
 
     /// 造一个"一段、已选中某候选"的组合。
     fn composition_with_selection(kind: &str, text: &str, input: &str) -> Composition {
@@ -245,9 +254,7 @@ mod tests {
         comp.segmentation.input = input.to_string();
         let mut seg = Segment::new(0, input.len());
         seg.status = SegStatus::Selected;
-        let mut menu = crate::engine::menu::Menu::new();
-        menu.add(Candidate::new(kind, 0, input.len(), text, 1.0));
-        seg.menu = Some(menu);
+        seg.menu = Some(menu_with(Candidate::new(kind, 0, input.len(), text, 1.0)));
         seg.selected_index = 0;
         comp.segmentation.segments.push(seg);
         comp
@@ -303,9 +310,7 @@ mod tests {
         for (start, end, text) in [(0usize, 2usize, "你"), (2, 5, "好")] {
             let mut seg = Segment::new(start, end);
             seg.status = SegStatus::Selected;
-            let mut menu = crate::engine::menu::Menu::new();
-            menu.add(Candidate::new("script", start, end, text, 1.0));
-            seg.menu = Some(menu);
+            seg.menu = Some(menu_with(Candidate::new("script", start, end, text, 1.0)));
             comp.segmentation.segments.push(seg);
         }
         let mut h = CommitHistory::new();
@@ -320,15 +325,11 @@ mod tests {
         comp.segmentation.input = "nihao".to_string();
         let mut first = Segment::new(0, 2);
         first.status = SegStatus::Confirmed;
-        let mut menu = crate::engine::menu::Menu::new();
-        menu.add(Candidate::new("script", 0, 2, "你", 1.0));
-        first.menu = Some(menu);
+        first.menu = Some(menu_with(Candidate::new("script", 0, 2, "你", 1.0)));
         comp.segmentation.segments.push(first);
         let mut second = Segment::new(2, 5);
         second.status = SegStatus::Selected;
-        let mut menu2 = crate::engine::menu::Menu::new();
-        menu2.add(Candidate::new("script", 2, 5, "好", 1.0));
-        second.menu = Some(menu2);
+        second.menu = Some(menu_with(Candidate::new("script", 2, 5, "好", 1.0)));
         comp.segmentation.segments.push(second);
 
         let mut h = CommitHistory::new();

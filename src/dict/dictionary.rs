@@ -60,6 +60,41 @@ pub(crate) fn bin_resource_path(build_dir: &Path, id: &str, ext: &str) -> PathBu
     build_dir.join(&file)
 }
 
+/// 词图里每个 `[start, end)` 桶最多留几条同码词（[`Dictionary::lookup_from_graph`]）。
+///
+/// # 为什么要有这个上限
+///
+/// 2026-10-30 实测（自然码双拼，`tianqibucuo` 11 键，release，语法模型开着）：
+///
+/// | 上限 | 最坏键耗时 | 平均 | 与"不限"的输出差异 |
+/// |---|---|---|---|
+/// | 不限 | 43.75 ms | 1.58 ms | —（每桶 130~190 条，全图 1928~5312 条） |
+/// | 4    |  4.74 ms | 0.27 ms | 87 项里 1 项不同 |
+/// | 8    |  6.80 ms | 0.32 ms | 87 项里 1 项不同 |
+/// | **32** | **10.90 ms** | **0.50 ms** | **完全一致** |
+///
+/// 不限时 [`Poet`] 的束搜索每键要 `evaluate` 九千到三万三千次（`run_beam`
+/// 对每个 `start_pos` 取 top-7，再 × 每个 `end_pos` × 桶里**每一条**）。
+/// 而束搜索每步最终只留 top-7，桶里第 33 条以后根本不会被看到 ——
+/// 取 32 是"输出与不限时逐字一致 + 快 4 倍"的稳妥点。
+///
+/// [`Poet`]: crate::engine::gear::poet::Poet
+const K_BUCKET_CAP: usize = 32;
+
+/// 桶上限。`WEASEL_BUCKET_CAP=N` 可临时覆盖（调参/排查用）；进程内只读一次环境。
+///
+/// * `N > 0`：每桶最多留 N 条。
+/// * `0` / `off` / `none`：**关掉截断**（回到补丁前的行为，用来做 A/B 对照）。
+/// * 没设 / 解析失败：用 [`K_BUCKET_CAP`]。
+fn bucket_cap() -> Option<usize> {
+    static CAP: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| match std::env::var("WEASEL_BUCKET_CAP").ok().as_deref() {
+        Some("0") | Some("off") | Some("none") => None,
+        Some(v) => v.parse::<usize>().ok().filter(|n| *n > 0).or(Some(K_BUCKET_CAP)),
+        None => Some(K_BUCKET_CAP),
+    })
+}
+
 impl Dictionary {
     /// 在 rime 的 `build/` 下打开词典：
     /// `<dict_name>.table.bin` / `<dict_name>.reverse.bin` + `<prism_name>.prism.bin`
@@ -181,6 +216,7 @@ impl Dictionary {
         /// `log(1e8)`（`dictionary.cc:166`）：table weight → 对数概率的偏移量。
         const K_WEIGHT_OFFSET: f64 = 18.420_680_743_952_367;
 
+        let cap_opt = bucket_cap();
         let mut collector = DictEntryCollector::new();
         for (end_pos, pages) in self.table.query(graph, start_pos) {
             for page in pages {
@@ -192,6 +228,22 @@ impl Dictionary {
                     let Some(entry) = accessor.entry() else {
                         break;
                     };
+                    // 桶已满且这条进不了前 N：直接跳过，**别去取文本** ——
+                    // `entry_text` 要解字符串再分配一份 String，是采集阶段的大头。
+                    // 权重是取文本前就能拿到的，所以这个判断是安全的。
+                    if let Some(cap) = cap_opt {
+                        if collector.get(&end_pos).is_some_and(|b| b.len() >= cap) {
+                            let w = entry.weight as f64 - K_WEIGHT_OFFSET + credibility;
+                            let worst = collector[&end_pos]
+                                .iter()
+                                .map(|e| e.weight)
+                                .fold(f64::INFINITY, f64::min);
+                            if w <= worst {
+                                accessor.next();
+                                continue;
+                            }
+                        }
+                    }
                     let text = self.table.entry_text(&entry);
                     let excluded = blacklist.is_some_and(|b| b.contains(&text));
                     if text.is_empty() || excluded {
@@ -208,16 +260,20 @@ impl Dictionary {
                         }
                     };
                     if let Some(target_end) = target_end {
-                        collector
-                            .entry(target_end)
-                            .or_default()
-                            .push(VocabularyEntry {
-                                text,
-                                weight: entry.weight as f64 - K_WEIGHT_OFFSET + credibility,
-                                code: index_code.clone(),
-                                quality_len,
-                                ..Default::default()
-                            });
+                        let bucket = collector.entry(target_end).or_default();
+                        bucket.push(VocabularyEntry {
+                            text,
+                            weight: entry.weight as f64 - K_WEIGHT_OFFSET + credibility,
+                            code: index_code.clone(),
+                            quality_len,
+                            ..Default::default()
+                        });
+                        if let Some(cap) = cap_opt {
+                            if bucket.len() > cap {
+                                bucket.sort_by(|a, b| a.cmp_weight_desc(b));
+                                bucket.truncate(cap);
+                            }
+                        }
                     }
                     accessor.next();
                 }

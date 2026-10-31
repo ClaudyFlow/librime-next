@@ -24,6 +24,7 @@
 //! 判"上一条是数字"读的是 [`CommitHistory`]（`cr.text` 末位是数字，且
 //! `cr.kind` 是 `thru` 或 `raw`），所以 `3.` 之后打 `1`、`2` 才会连着走。
 
+use crate::engine::gear::translation::{Translation as TranslationTrait, VecTranslation};
 use serde_json::Value;
 
 use crate::engine::candidate::Candidate;
@@ -285,52 +286,48 @@ impl Translator for PunctTranslator {
         input: &str,
         segment: &mut Segment,
         _history: &CommitHistory,
-    ) -> Vec<Candidate> {
+    ) -> Option<Box<dyn TranslationTrait>> {
         // ① 数字里的分隔符：候选就是"这个字符本身"（按 full_shape 转形状）。
         //    C++ 分支在 tag 检查之前，且**不看映射表**。
         if segment.has_tag(TAG_PUNCT_NUMBER) {
             if input.is_empty() {
-                return Vec::new();
+                return None;
             }
             let punct = ShapeFormatter::formatted(input, self.full_shape);
-            return vec![punct_candidate(&punct, segment)];
+            return Some(Box::new(crate::engine::gear::translation::VecTranslation::new(vec![punct_candidate(&punct, segment)])));
         }
         // ② 普通标点段
         if !segment.has_tag(TAG_PUNCT) {
-            return Vec::new();
+            return None;
         }
         let Some(definition) = self.config.get_punct_definition(input, self.full_shape) else {
-            return Vec::new();
+            return None;
         };
         // ②-a 唯一映射（`'` : '、'）
         if let Some(text) = definition.as_str() {
-            return vec![punct_candidate(text, segment)];
+            return Some(Box::new(crate::engine::gear::translation::VecTranslation::new(vec![punct_candidate(text, segment)])));
         }
         // ②-b 轮换列表（连按同一个键依次取用）
         if let Some(list) = definition.as_array() {
-            return list
-                .iter()
-                .filter_map(Value::as_str)
-                .map(|text| punct_candidate(text, segment))
-                .collect();
+            return Some(Box::new(crate::engine::gear::translation::VecTranslation::new(
+                list.iter().filter_map(Value::as_str).map(|text| punct_candidate(text, segment)).collect(),
+            )));
         }
         // ②-c `{ commit: "…" }` 直接上屏
         if let Some(map) = definition.as_object() {
             if let Some(text) = map.get("commit").and_then(Value::as_str) {
-                return vec![punct_candidate(text, segment)];
+                return Some(Box::new(crate::engine::gear::translation::VecTranslation::new(vec![punct_candidate(text, segment)])));
             }
             // ②-d `{ pair: ["「", "」"] }` 成对，交替左右
             if let Some(pair) = map.get("pair").and_then(Value::as_array) {
                 if pair.len() == 2 {
-                    return pair
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(|text| punct_candidate(text, segment))
-                        .collect();
+                    return Some(Box::new(crate::engine::gear::translation::VecTranslation::new(
+                        pair.iter().filter_map(Value::as_str).map(|text| punct_candidate(text, segment)).collect(),
+                    )));
                 }
             }
         }
-        Vec::new()
+        None
     }
 }
 
@@ -615,6 +612,7 @@ impl Processor for Punctuator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::gear::translation::drain_opt;
 
     fn config() -> Value {
         serde_json::json!({
@@ -647,7 +645,7 @@ mod tests {
         let mut t = PunctTranslator::new(&config());
         let mut seg = Segment::new(0, 1);
         seg.tags.push(TAG_PUNCT.to_string());
-        let cands = t.query("'", &mut seg, &CommitHistory::new());
+        let cands = drain_opt(t.query("'", &mut seg, &CommitHistory::new()));
         let texts: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(texts, vec!["、", "‘", "’"]);
     }
@@ -657,26 +655,25 @@ mod tests {
         let mut t = PunctTranslator::new(&config());
         let mut seg = Segment::new(0, 1);
         seg.tags.push(TAG_PUNCT.to_string());
-        assert_eq!(t.query(",", &mut seg, &CommitHistory::new())[0].text, "，");
-        let pair: Vec<String> = t
-            .query("\"", &mut seg, &CommitHistory::new())
+        assert_eq!(drain_opt(t.query(",", &mut seg, &CommitHistory::new()))[0].text, "，");
+        let pair: Vec<String> = drain_opt(t.query("\"", &mut seg, &CommitHistory::new()))
             .into_iter()
             .map(|c| c.text.clone())
             .collect();
         assert_eq!(pair, vec!["“".to_string(), "”".to_string()]);
         // `{ commit: … }`
-        assert_eq!(t.query("`", &mut seg, &CommitHistory::new())[0].text, "`");
+        assert_eq!(drain_opt(t.query("`", &mut seg, &CommitHistory::new()))[0].text, "`");
     }
 
     #[test]
     fn translator_ignores_segments_without_punct_tags() {
         let mut t = PunctTranslator::new(&config());
         let mut seg = Segment::new(0, 1); // 无标签
-        assert!(t.query(",", &mut seg, &CommitHistory::new()).is_empty());
+        assert!(drain_opt(t.query(",", &mut seg, &CommitHistory::new())).is_empty());
         let mut seg = Segment::new(0, 2);
         seg.tags.push("punct_number".to_string());
         // punct_number 段不看映射表：输入什么就给什么
-        assert_eq!(t.query(",.", &mut seg, &CommitHistory::new())[0].text, ",.");
+        assert_eq!(drain_opt(t.query(",.", &mut seg, &CommitHistory::new()))[0].text, ",.");
     }
 
     #[test]
@@ -689,9 +686,9 @@ mod tests {
         let mut seg = Segment::new(0, 1);
         seg.tags.push(TAG_PUNCT.to_string());
         // 半角表里有 `'` 的多选，全角表里没有 → 全角时该键不出候选
-        assert_eq!(half.query("'", &mut seg, &CommitHistory::new()).len(), 3);
-        assert!(full.query("'", &mut seg, &CommitHistory::new()).is_empty());
-        assert_eq!(full.query(",", &mut seg, &CommitHistory::new())[0].text, "，");
+        assert_eq!(drain_opt(half.query("'", &mut seg, &CommitHistory::new())).len(), 3);
+        assert!(drain_opt(full.query("'", &mut seg, &CommitHistory::new())).is_empty());
+        assert_eq!(drain_opt(full.query(",", &mut seg, &CommitHistory::new()))[0].text, "，");
     }
 
     #[test]
@@ -699,7 +696,7 @@ mod tests {
         let mut t = PunctTranslator::new(&config());
         let mut seg = Segment::new(0, 1);
         seg.tags.push(TAG_PUNCT.to_string());
-        assert!(t.query("z", &mut seg, &CommitHistory::new()).is_empty());
+        assert!(drain_opt(t.query("z", &mut seg, &CommitHistory::new())).is_empty());
     }
 
     #[test]

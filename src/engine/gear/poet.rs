@@ -38,6 +38,17 @@ pub trait Grammar: Send + Sync {
     fn query(&self, context: &str, word: &str, is_rear: bool) -> f64;
 }
 
+/// 语法分系数（`WEASEL_GRAMMAR_SCALE`，默认 1.0）。进程内只读一次环境。
+fn grammar_scale() -> f64 {
+    static SCALE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| {
+        std::env::var("WEASEL_GRAMMAR_SCALE")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(1.0)
+    })
+}
+
 /// `Grammar::Evaluate`（`gear/grammar.h:23-36`）：词条权重 + 语法分。
 pub fn evaluate(
     context: &str,
@@ -46,11 +57,21 @@ pub fn evaluate(
     is_rear: bool,
     grammar: Option<&dyn Grammar>,
 ) -> f64 {
-    entry_weight
-        + match grammar {
-            Some(g) => g.query(context, word, is_rear),
-            None => K_PENALTY,
-        }
+    let grammar_score = match grammar {
+        Some(g) => g.query(context, word, is_rear),
+        None => K_PENALTY,
+    };
+    // 临时实验：语法分的权重系数（`WEASEL_GRAMMAR_SCALE`，默认 1.0）。
+    // 用来验证「模型语料偏古/偏专业时，语法分压过词频」这个假设。
+    let grammar_score = grammar_score * grammar_scale();
+    // 排障开关：打印每一次词格打分的三段（词频 / 语法 / 合计），排查「明明该选 A 却选 B」。
+    if std::env::var_os("WEASEL_POET_TRACE").is_some() {
+        eprintln!(
+            "[poet] ctx={context:?} word={word:?} rear={is_rear} entry={entry_weight:.4} grammar={grammar_score:.4} total={:.4}",
+            entry_weight + grammar_score
+        );
+    }
+    entry_weight + grammar_score
 }
 
 /// 一条路径（`struct Line`，`poet.cc:21-70`）。

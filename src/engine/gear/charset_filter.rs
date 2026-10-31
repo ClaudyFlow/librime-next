@@ -39,6 +39,7 @@
 use crate::engine::candidate::Candidate;
 use crate::engine::context::Context;
 use crate::engine::gear::filter::Filter;
+use crate::engine::gear::translation::{FilteredTranslation, Translation};
 use crate::engine::segmentation::Segment;
 
 /// `is_extended_cjk`（`charset_filter.cc:19-45`）。
@@ -107,20 +108,28 @@ impl Filter for CharsetFilter {
         self.tags.is_empty() || segment.tags.iter().any(|tag| self.tags.contains(tag))
     }
 
-    fn apply(&mut self, ctx: &Context, candidates: &mut Vec<Candidate>) {
+    fn apply(
+        &mut self,
+        ctx: &Context,
+        translation: Box<dyn Translation>,
+        _candidates: &mut Vec<Candidate>,
+    ) -> Box<dyn Translation> {
         // 主命名空间 + 用户开了 `extended_charset` ⇒ 整个过滤器失效。
         // 非默认命名空间的用法 C++ 直接报错（"charset parameter is unsupported
         // by basic charset_filter"），这里按"不生效"处理。
         if ctx.get_option("extended_charset") {
-            return;
+            return translation;
         }
-        candidates.retain(|candidate| filter_text(&candidate.text));
+        Box::new(FilteredTranslation::new(translation, |candidate| {
+            filter_text(&candidate.text)
+        }))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::gear::translation::{drain, VecTranslation};
 
     #[test]
     fn extended_blocks_are_detected() {
@@ -149,20 +158,33 @@ mod tests {
         Candidate::new("table", 0, text.len(), text.to_string(), 1.0)
     }
 
+    /// 懒化后滤镜是"包装流"（不再原地删列表）⇒ 测试把包装后的流物化再断言。
+    fn filtered(filter: &mut dyn Filter, ctx: &Context, items: Vec<Candidate>) -> Vec<Candidate> {
+        let mut materialized = Vec::new();
+        let stream = filter.apply(ctx, Box::new(VecTranslation::new(items)), &mut materialized);
+        drain(stream)
+    }
+
     #[test]
     fn filter_drops_rare_candidates_unless_extended_charset() {
-        let mut candidates = vec![cand("你好"), cand("\u{206c8}"), cand("好")];
         let mut filter = CharsetFilter::new(Vec::new());
-        filter.apply(&Context::new(), &mut candidates);
-        let texts: Vec<&str> = candidates.iter().map(|c| c.text.as_str()).collect();
+        let out = filtered(
+            &mut filter,
+            &Context::new(),
+            vec![cand("你好"), cand("\u{206c8}"), cand("好")],
+        );
+        let texts: Vec<&str> = out.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(texts, vec!["你好", "好"]);
 
         // 打开 `extended_charset` ⇒ 一条都不丢
         let mut context = Context::new();
         context.set_option("extended_charset", true);
-        let mut candidates = vec![cand("你好"), cand("\u{206c8}")];
-        filter.apply(&context, &mut candidates);
-        assert_eq!(candidates.len(), 2, "开了开关就不过滤");
+        let out = filtered(
+            &mut filter,
+            &context,
+            vec![cand("你好"), cand("\u{206c8}")],
+        );
+        assert_eq!(out.len(), 2, "开了开关就不过滤");
     }
 
     #[test]

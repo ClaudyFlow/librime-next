@@ -30,6 +30,7 @@
 //! 单一 `quality` 排序做不到这件事：`-100` 只是"排最后"，候选仍然会出现，
 //! 而 C++ 的行为是"根本不出现"。
 
+use crate::engine::gear::translation::{Translation as TranslationTrait, VecTranslation};
 use crate::engine::candidate::Candidate;
 use crate::engine::commit_history::CommitHistory;
 use crate::engine::gear::translator::Translator;
@@ -62,25 +63,26 @@ impl Translator for EchoTranslator {
         input: &str,
         _segment: &mut Segment,
         _history: &CommitHistory,
-    ) -> Vec<Candidate> {
+    ) -> Option<Box<dyn TranslationTrait>> {
         if input.is_empty() {
-            return Vec::new();
+            return None;
         }
         // C++ 传 `segment.start / segment.end`（绝对坐标）；LRN 的候选是**相对本段**，
         // 由 runtime 统一加 `segment.start`，所以这里 0..input.len()。
-        vec![Candidate::new(
+        Some(Box::new(VecTranslation::new(vec![Candidate::new(
             KIND_RAW,
             0,
             input.len(),
             input.to_string(),
             LOWEST_PRIORITY,
-        )]
+        )])))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::gear::translation::drain_opt;
 
     fn segment() -> Segment {
         Segment::new(0, 3)
@@ -89,7 +91,7 @@ mod tests {
     #[test]
     fn echoes_the_input_as_a_raw_candidate() {
         let mut t = EchoTranslator::new();
-        let cands = t.query("abc", &mut segment(), &CommitHistory::new());
+        let cands = drain_opt(t.query("abc", &mut segment(), &CommitHistory::new()));
         assert_eq!(cands.len(), 1);
         assert_eq!(cands[0].text, "abc", "原样回显");
         assert_eq!(cands[0].kind, "raw");
@@ -101,7 +103,7 @@ mod tests {
     fn empty_input_yields_nothing() {
         let mut t = EchoTranslator::new();
         assert!(
-            t.query("", &mut segment(), &CommitHistory::new()).is_empty(),
+            drain_opt(t.query("", &mut segment(), &CommitHistory::new())).is_empty(),
             "空输入没东西可回显（C++ 同样 `if (input.empty()) return nullptr;`）"
         );
     }

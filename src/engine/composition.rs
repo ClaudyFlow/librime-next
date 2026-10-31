@@ -105,10 +105,11 @@ impl Composition {
                 preedit.sel_start = preedit.text.len();
                 preedit.sel_end = NPOS;
                 let cand_preedit = cand
+                    .as_ref()
                     .filter(|c| !c.preedit.is_empty())
                     .map(|c| c.preedit.clone());
                 if let Some(cp) = cand_preedit {
-                    end = cand.map_or(seg.end, |c| c.end);
+                    end = cand.as_ref().map_or(seg.end, |c| c.end);
                     if let Some(placeholder) = cp.find('\t') {
                         preedit.text.push_str(&cp[..placeholder]);
                         if caret_pos == end && end == full_input.len() {
@@ -190,14 +191,14 @@ impl Composition {
         for seg in &self.segmentation.segments {
             let start = end;
             let cand = seg.get_selected_candidate();
-            end = cand.map_or(seg.end, |c| c.end);
+            end = cand.as_ref().map_or(seg.end, |c| c.end);
             if keep_selection
-                && cand.map_or(false, |c| !c.text.is_empty())
+                && cand.as_ref().map_or(false, |c| !c.text.is_empty())
                 && seg.status >= SegStatus::Selected
             {
-                result.push_str(cand.map_or("", |c| &c.text));
-            } else if cand.map_or(false, |c| !c.preedit.is_empty()) {
-                let cp = cand.map_or(String::new(), |c| c.preedit.clone());
+                result.push_str(cand.as_ref().map_or("", |c| c.text.as_str()));
+            } else if cand.as_ref().map_or(false, |c| !c.preedit.is_empty()) {
+                let cp = cand.as_ref().map_or(String::new(), |c| c.preedit.clone());
                 if let Some(pos) = cp.find('\t') {
                     result.push_str(&cp[..pos]);
                     result.push_str(&cp[pos + 1..]);

@@ -425,7 +425,7 @@ impl Switcher {
         let mut menu = Menu::new();
         for item in &self.items {
             // 坐标 0..0：这是个"空段"，候选只是菜单条目，不覆盖任何输入
-            menu.add(item.candidate.clone());
+            menu.add_translation(Box::new(crate::engine::gear::translation::VecTranslation::new(vec![item.candidate.clone()])));
         }
         // ⚠️ 刻意**不**调 `Menu::prepare()`：它会按 quality 排序，而这里的顺序是
         // 建菜单时算好的（方案在前、开关在后，各自内部有序）。`quality` 只作为

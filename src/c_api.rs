@@ -724,8 +724,16 @@ unsafe extern "C" fn rime_get_context(id: RimeSessionId, ctx: *mut RimeContext) 
 
     // 菜单
     let menu = &comp.segmentation.segments.first().and_then(|s| s.menu.as_ref());
+    // 翻页：**必须按高亮所在的页号取页**，不能永远取第 0 页。
+    // 2026-10-31 修：以前写死 `m.page(page_size, 0)`，逗号/句号（
+    // `key_binder` 的 `send: Page_Up/Page_Down`）把高亮移到第 6 条后，
+    // 导出的仍是前 5 条 ⇒ 用户看到的就是"翻页没反应"。
+    let page_size_units = context.page_size.max(1) as usize;
+    let page_no = (context.highlight_index() / page_size_units) as usize;
+    let mut is_last_flag: i32 = 1;
     let (cands, page_size, highlight, num) = if let Some(m) = menu {
-        let page = m.page(context.page_size, 0);
+        let (page, is_last) = m.page(context.page_size, page_no);
+        is_last_flag = i32::from(is_last);
         let n = page.len();
         let mut buf: Vec<RimeCandidate> = Vec::with_capacity(n);
         for c in &page {
@@ -743,7 +751,8 @@ unsafe extern "C" fn rime_get_context(id: RimeSessionId, ctx: *mut RimeContext) 
         (
             raw,
             context.page_size as c_int,
-            context.highlight_index() as c_int,
+            // 页内下标（渲染器按"本页第几条"用）
+            (context.highlight_index() % page_size_units) as c_int,
             n as c_int,
         )
     } else {
@@ -752,8 +761,8 @@ unsafe extern "C" fn rime_get_context(id: RimeSessionId, ctx: *mut RimeContext) 
     (*ctx).menu.candidates = cands;
     (*ctx).menu.num_candidates = num;
     (*ctx).menu.page_size = page_size;
-    (*ctx).menu.page_no = 0;
-    (*ctx).menu.is_last_page = 1;
+    (*ctx).menu.page_no = page_no as c_int;
+    (*ctx).menu.is_last_page = is_last_flag as c_int;
     (*ctx).menu.highlighted_candidate_index = highlight;
     (*ctx).menu.select_keys = cstr_dup("123456789");
     (*ctx).commit_text_preview = std::ptr::null_mut();
@@ -1112,16 +1121,14 @@ unsafe extern "C" fn rime_candidate_list_begin(
     if iter.is_null() {
         return 0;
     }
-    let g = global().lock().unwrap();
-    let Some(s) = g.sessions.get(&id) else {
+    let mut g = global().lock().unwrap();
+    let Some(s) = g.sessions.get_mut(&id) else {
         return 0;
     };
     (*iter).index = 0;
     let count = s
-        .context()
-        .and_then(|c| c.composition.segmentation.segments.first())
-        .and_then(|seg| seg.menu.as_ref())
-        .map(|m| m.candidate_count())
+        .engine_mut()
+        .and_then(|e| e.context.composition.segmentation.segments.first().map(|seg| seg.menu.as_ref().map(|m| m.candidate_count()).unwrap_or(0)))
         .unwrap_or(0);
     if count == 0 {
         return 0;

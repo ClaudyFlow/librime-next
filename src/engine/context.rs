@@ -59,7 +59,7 @@ impl Context {
     }
 
     pub fn is_composing(&self) -> bool {
-        !self.input.is_empty() || !self.composition.empty()
+        !self.input.is_empty()
     }
 
     pub fn has_menu(&self) -> bool {
@@ -69,7 +69,7 @@ impl Context {
             .map_or(false, |m| !m.is_empty())
     }
 
-    pub fn get_selected_candidate(&self) -> Option<&crate::engine::candidate::Candidate> {
+    pub fn get_selected_candidate(&self) -> Option<crate::engine::candidate::Candidate> {
         self.composition.back().and_then(|s| s.get_selected_candidate())
     }
 

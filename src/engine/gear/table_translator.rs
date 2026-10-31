@@ -53,6 +53,7 @@
 //! 还没移植的 C++ 部分：`ContextualWeighted`（grammar 上下文加权；出厂方案没开
 //! `contextual_suggestions`）。
 
+use crate::engine::gear::translation::Translation;
 use std::collections::{BTreeMap, HashSet};
 
 use crate::dict::dict_entry_iterator::DictEntryIterator;
@@ -299,14 +300,14 @@ impl Translator for TableTranslator {
         input: &str,
         segment: &mut Segment,
         _history: &crate::engine::commit_history::CommitHistory,
-    ) -> Vec<Candidate> {
+    ) -> Option<Box<dyn Translation>> {
         if !self.options.has_any_tag(&segment.tags) {
-            return Vec::new();
+            return None;
         }
         // C++：`boost::trim_right_if(code, is_any_of(delimiters_))`
         let code = self.options.trim_delimiters(input).to_string();
         if code.is_empty() {
-            return Vec::new();
+            return None;
         }
         // 候选坐标一律**相对本段**：`Engine::translate_segment` 会统一加上
         // `segment.start` 还原成绝对偏移（见 `runtime.rs` 里那句 `c.start += seg.start`）。
@@ -339,7 +340,7 @@ impl Translator for TableTranslator {
         // ③ 交错合流
         let mut out: Vec<Candidate> = Vec::new();
         if !user_ready && iter.exhausted() {
-            return self.append_sentence(input, out);
+            return Some(Box::new(crate::engine::gear::translation::VecTranslation::new(self.append_sentence(input, out))));
         }
         loop {
             let take_user = Self::prefer_user_phrase(&mut iter, &uter);
@@ -374,7 +375,8 @@ impl Translator for TableTranslator {
                 }
             }
         }
-        self.append_sentence(input, out)
+        self.append_sentence(input, out.clone());
+        Some(Box::new(crate::engine::gear::translation::VecTranslation::new(out)))
     }
 
     /// `TableTranslator::Memorize`（`table_translator.cc:311-356`）。

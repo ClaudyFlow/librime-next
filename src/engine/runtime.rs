@@ -577,6 +577,7 @@ impl Engine {
             // C++ 里这件事由 `EchoTranslation::Compare` 检查 `other->exhausted()`
             // 完成，LRN 没有翻译器之间的协商通道，所以在这里延后合并。
             let mut fallback: Vec<Candidate> = Vec::new();
+            let mut has_main = false;
             // 段标签决定翻译器是否认领这段（C++ `segment.HasAnyTagIn(tags_)`）——
             // 标签现在由 translator 自己从 `segment.tags` 读，不再单独传。
             for entry in &mut translators {
@@ -584,21 +585,32 @@ impl Engine {
                     continue;
                 }
                 let is_fallback = entry.component.is_fallback();
-                for mut c in entry.component.query(text, seg, &history) {
-                    // translator 返回的是**相对本段**的位置，这里还原成绝对偏移
-                    c.start += seg.start;
-                    c.end += seg.start;
-                    if is_fallback {
-                        fallback.push(c);
-                    } else {
-                        menu.add(c);
+                if is_fallback {
+                    // echo_translator 至多一条候选,急切取(代价可忽略);
+                    // 候选自带绝对偏移(echo 收 segment 自己算)。
+                    if let Some(mut translation) = entry.component.query(text, seg, &history) {
+                        let mut pos = 0;
+                        while let Some(c) = translation.peek() {
+                            fallback.push(c);
+                            translation.next();
+                            pos += 1;
+                            if pos > 4 { break; } // echo 至多几条,防御
+                        }
                     }
+                    continue;
+                }
+                // 懒化管线:翻译器直接交出流式 Translation(Menu 内部归并)。
+                match entry.component.query(text, seg, &history) {
+                    Some(translation) => {
+                        has_main = true;
+                        menu.add_translation(translation);
+                    }
+                    None => continue,
                 }
             }
-            if menu.is_empty() {
-                menu.add_all(fallback);
+            if !has_main && !fallback.is_empty() {
+                menu.add_translation(Box::new(crate::engine::gear::translation::VecTranslation::new(fallback)));
             }
-            menu.prepare();
             seg.menu = Some(menu);
             seg.status = SegStatus::Guess;
             seg.selected_index = 0;
@@ -642,7 +654,7 @@ impl Engine {
                 if !applies {
                     continue;
                 }
-                entry.component.apply(context, menu.candidates_mut());
+                menu.add_filter(context, entry.component.as_mut());
             }
             self.context.composition.segmentation.segments[i].menu = Some(menu);
         }

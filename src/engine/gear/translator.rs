@@ -7,6 +7,7 @@ use crate::dict::vocabulary::DictEntry;
 use crate::engine::candidate::Candidate;
 use crate::engine::commit_history::CommitHistory;
 use crate::engine::gear::poet::{Poet, Sentence, WordGraph};
+use crate::engine::gear::translation::Translation as TranslationTrait;
 use crate::engine::gear::translator_options::TranslatorOptions;
 use crate::engine::segmentation::Segment;
 
@@ -61,7 +62,7 @@ pub trait Translator {
         input: &str,
         segment: &mut Segment,
         history: &CommitHistory,
-    ) -> Vec<Candidate>;
+    ) -> Option<Box<dyn TranslationTrait>>;
 
     /// `Translator::Memorize(commit_entry)`：一次提交里选中的词条交回来学。
     ///
@@ -342,71 +343,65 @@ impl Translator for ScriptTranslator {
         &mut self,
         input: &str,
         segment: &mut Segment,
-        _history: &CommitHistory,
-    ) -> Vec<Candidate> {
+        history: &CommitHistory,
+    ) -> Option<Box<dyn TranslationTrait>> {
         if !self.options.has_any_tag(&segment.tags) {
-            return Vec::new();
+            return None;
         }
-        let mut out: Vec<Candidate> = self.sentence_candidates(input);
-        let mut words: Vec<Candidate> = self
-            .dict
-            .translate(input)
-            .into_iter()
-            .filter(|e| !self.options.blacklist.contains(&e.text))
-            .map(|e| {
-                let quality = e.quality + self.options.initial_quality;
-                // 词条挂到候选上：用户选中后要靠它学词（`Translator::Memorize`）
-                let mut vocabulary_entry = crate::dict::vocabulary::DictEntry::default();
-                vocabulary_entry.text = e.text.clone();
-                vocabulary_entry.code = e.code.clone();
-                vocabulary_entry.weight = e.weight;
-                let mut c = Candidate::new("script", 0, e.end, e.text, quality)
-                    .with_entry(vocabulary_entry);
-                if !e.comment.is_empty() {
-                    c = c.with_comment(e.comment);
-                }
-                // 构造 preedit 串并套 preedit_formatter。
-                let preedit = self.build_preedit(input, e.end);
-                if !preedit.is_empty() {
-                    c = c.with_preedit(preedit);
-                }
-                c
-            })
-            .collect();
 
-        // 用户词典：学过的词优先。同文本去重时**保留用户词条**，
-        // 这样再选一次还会累加到同一条 userdb 记录上。
+        // ---- 层 0:整句(poet 组句,最多一条) ------------------------------
+        let mut tiers: Vec<Box<dyn TranslationTrait>> = Vec::new();
+        if let Some(sentence) = self.best_sentence(input) {
+            let consumed = sentence.end_pos;
+            let preedit = self.build_preedit(input, consumed);
+            let mut candidate = Candidate::new(
+                "script",
+                0,
+                consumed,
+                sentence.text.clone(),
+                sentence.segments.len() as f64 * QUALITY_SYLLABLE_STRIDE
+                    + QUALITY_TIER_SENTENCE
+                    + sentence.weight
+                    + self.options.initial_quality,
+            )
+            .with_entry(crate::dict::vocabulary::DictEntry {
+                text: sentence.text.clone(),
+                ..Default::default()
+            });
+            if !preedit.is_empty() {
+                candidate = candidate.with_preedit(preedit);
+            }
+            tiers.push(Box::new(crate::engine::gear::translation::VecTranslation::new(
+                vec![candidate],
+            )));
+        }
+
+        // ---- 层 1:用户词典 ------------------------------------------------
         let user = self.user_dict_candidates(input);
         if !user.is_empty() {
-            let user_texts: std::collections::HashSet<&str> =
-                user.iter().map(|c| c.text.as_str()).collect();
-            words.retain(|c| !user_texts.contains(c.text.as_str()));
-            out.extend(user);
+            tiers.push(Box::new(crate::engine::gear::translation::VecTranslation::new(
+                user,
+            )));
         }
-        out.append(&mut words);
 
-        for c in &mut out {
-            self.options.format_comment(&mut c.comment);
-            self.options.format_preedit(&mut c.preedit);
-        }
-        out
-    }
+        // ---- 层 2:词表懒迭代(C++ ScriptTranslation 的 kSysPhrase 分支) --
+        let full_len = input.len();
+        let start = segment.start;
+        let collector = self.dict.lookup_from_graph(
+            &self.build_graph(input).map(|(g, _)| g).unwrap_or_default(),
+            segment.start,
+            None,
+            false,
+        );
+        tiers.push(Box::new(crate::engine::gear::translation::ScriptWordsTranslation::new(
+            collector,
+            start,
+            full_len,
+            QUALITY_SYLLABLE_STRIDE,
+            self.options.initial_quality,
+            None,
+        )));
 
-    /// `TableTranslator::Memorize` / `ScriptTranslator::Memorize`：
-    /// 把这次提交里选中的词条逐条 `UpdateEntry(entry, 1)`。
-    fn memorize(&mut self, elements: &[DictEntry], _history: &CommitHistory) -> bool {
-        let Some(user_dict) = self.user_dict.as_mut() else {
-            return false;
-        };
-        if !user_dict.loaded() || user_dict.readonly() {
-            return false;
-        }
-        let mut written = false;
-        for entry in elements {
-            if user_dict.update_entry(&self.dict, entry, 1) {
-                written = true;
-            }
-        }
-        written
+        Some(Box::new(crate::engine::gear::translation::TieredTranslation::new(tiers)))
     }
 }

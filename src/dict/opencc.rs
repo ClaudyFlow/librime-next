@@ -198,8 +198,9 @@ impl<R: io::Read> io::Read for CountingReader<R> {
 }
 
 /// 一条转换链（`*.json` 的 `conversion_chain`，可含 `group`）。
+#[derive(Clone)]
 pub struct Opencc {
-    dicts: Vec<Ocd2>,
+    dicts: Vec<std::sync::Arc<Ocd2>>,
 }
 
 impl Opencc {
@@ -213,7 +214,7 @@ impl Opencc {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        let mut dicts = Vec::new();
+        let mut dicts: Vec<std::sync::Arc<Ocd2>> = Vec::new();
         if let Some(chain) = json.get("conversion_chain").and_then(|v| v.as_array()) {
             for item in chain {
                 if let Some(dict) = item.get("dict") {
@@ -235,7 +236,7 @@ impl Opencc {
 }
 
 /// 递归展开 `conversion_chain` 里的 `dict`（单个 `ocd2` 或 `group` 嵌套）。
-fn collect_dicts(dict: &Json, dir: &Path, out: &mut Vec<Ocd2>) -> io::Result<()> {
+fn collect_dicts(dict: &Json, dir: &Path, out: &mut Vec<std::sync::Arc<Ocd2>>) -> io::Result<()> {
     match dict.get("type").and_then(|v| v.as_str()) {
         Some("group") => {
             if let Some(dicts) = dict.get("dicts").and_then(|v| v.as_array()) {
@@ -248,7 +249,7 @@ fn collect_dicts(dict: &Json, dir: &Path, out: &mut Vec<Ocd2>) -> io::Result<()>
         }
         Some("ocd2") => {
             if let Some(file) = dict.get("file").and_then(|v| v.as_str()) {
-                out.push(Ocd2::load(dir.join(file))?);
+                out.push(std::sync::Arc::new(Ocd2::load(dir.join(file))?));
             }
         }
         _ => {}

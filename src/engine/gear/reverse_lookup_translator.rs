@@ -30,6 +30,7 @@
 //!   急切模型，只能用一个常数 `quality` 表达。实际方案里反查段由 recognizer 单独切出、
 //!   段内只有本翻译器认领，所以这个近似不会改变可见行为。
 
+use crate::engine::gear::translation::{Translation as TranslationTrait, VecTranslation};
 use std::path::Path;
 
 use serde_json::Value;
@@ -224,9 +225,9 @@ impl Translator for ReverseLookupTranslator {
         input: &str,
         segment: &mut Segment,
         _history: &crate::engine::commit_history::CommitHistory,
-    ) -> Vec<Candidate> {
+    ) -> Option<Box<dyn TranslationTrait>> {
         if !segment.tags.iter().any(|t| *t == self.tag) {
-            return Vec::new();
+            return None;
         }
 
         // C++ 的 `preedit` 是**完整 input**（含前缀），然后套 preedit_format
@@ -253,12 +254,12 @@ impl Translator for ReverseLookupTranslator {
 
         // `start < input.length()`：只打了前缀（`` ` ``）时不出候选。
         if start >= input.len() {
-            return Vec::new();
+            return None;
         }
 
         let entries = self.lookup_entries(code);
         if entries.is_empty() {
-            return Vec::new();
+            return None;
         }
 
         let end = input.len();
@@ -289,13 +290,14 @@ impl Translator for ReverseLookupTranslator {
                     .with_preedit(preedit.clone()),
             );
         }
-        out
+        Some(Box::new(crate::engine::gear::translation::VecTranslation::new(out)))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::gear::translation::drain_opt;
     use serde_json::json;
 
     fn build_dir() -> std::path::PathBuf {
@@ -349,7 +351,7 @@ mod tests {
         let mut t = ReverseLookupTranslator::load(&luna_config(), "translator", &build_dir())
             .expect("应能加载");
         let mut seg = segment_with("abc");
-        assert!(t.query("`hspnz", &mut seg, &crate::engine::commit_history::CommitHistory::new()).is_empty(), "没反查标签就不认领");
+        assert!(drain_opt(t.query("`hspnz", &mut seg, &crate::engine::commit_history::CommitHistory::new())).is_empty(), "没反查标签就不认领");
     }
 
     /// 端到端核心断言：`` `h' `` → 笔画「一」（`h` = 橫），注释是它的拼音 `yi`。
@@ -358,7 +360,7 @@ mod tests {
         let mut t = ReverseLookupTranslator::load(&luna_config(), "translator", &build_dir())
             .expect("应能加载");
         let mut seg = segment_with("reverse_lookup");
-        let cands = t.query("`h'", &mut seg, &crate::engine::commit_history::CommitHistory::new());
+        let cands = drain_opt(t.query("`h'", &mut seg, &crate::engine::commit_history::CommitHistory::new()));
         assert!(!cands.is_empty(), "`h' 应出候选");
         let yi = cands.iter().find(|c| c.text == "一").unwrap_or_else(|| {
             panic!(
@@ -381,7 +383,7 @@ mod tests {
         let mut t = ReverseLookupTranslator::load(&luna_config(), "translator", &build_dir())
             .expect("应能加载");
         let mut seg = segment_with("reverse_lookup");
-        let cands = t.query("`h", &mut seg, &crate::engine::commit_history::CommitHistory::new());
+        let cands = drain_opt(t.query("`h", &mut seg, &crate::engine::commit_history::CommitHistory::new()));
         assert!(cands.iter().any(|c| c.text == "一"), "`h 不带后缀也要能出「一」");
     }
 
@@ -442,7 +444,7 @@ mod tests {
         let mut t = ReverseLookupTranslator::load(&luna_config(), "translator", &build_dir())
             .expect("应能加载");
         let mut seg = segment_with("reverse_lookup");
-        assert!(t.query("`", &mut seg, &crate::engine::commit_history::CommitHistory::new()).is_empty(), "只打前缀不该出候选");
+        assert!(drain_opt(t.query("`", &mut seg, &crate::engine::commit_history::CommitHistory::new())).is_empty(), "只打前缀不该出候选");
         assert_eq!(seg.prompt, "〔筆畫〕", "但提示照设");
     }
 }

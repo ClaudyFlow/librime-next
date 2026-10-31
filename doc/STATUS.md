@@ -58,7 +58,10 @@
 - `build/default.yaml` 同步写入
 - 对比 fixture 基线（2026-10-23 的 15 方案 30 文件），当前数据目录已增至 19 方案，产物数量随之增加
 
-测试基线：`cargo test` → lib 321 + lever 1 + config 2 + engine e2e 18 + key_order 3 + algebra 8 + doc 1（忽略），**全过 / 0 败**。
+测试基线（2026-10-31 懒菜单 v3 迁移后复核）：`cargo test --release -p librime-next --lib` →
+**530 passed / 0 failed**（6.33s）。此前测试仍按急切菜单写法，`--lib` 有 **57 个编译错**、
+闸门实际是哑的；已全部迁移到流式 `Translation` / 懒 `Menu` API（见 `PROGRESS.md` 六·二十七）。
+集成侧（lever / engine e2e / key_order / algebra）本轮**未重跑**，计数沿用旧记录。
 
 ---
 

@@ -140,7 +140,7 @@ impl Speller {
         if self.max_code_length <= 0 || !ctx.has_menu() {
             return false;
         }
-        let cand = ctx.get_selected_candidate().cloned();
+        let cand = ctx.get_selected_candidate();
         if reached_max_code_length(cand.as_ref(), self.max_code_length)
             && is_auto_selectable(cand.as_ref(), &ctx.input, &self.delimiters)
         {
@@ -164,7 +164,7 @@ impl Speller {
         if count != 1 {
             return false;
         }
-        let cand = seg.get_selected_candidate().cloned();
+        let cand = seg.get_selected_candidate();
         let matches_input_pattern = if self.auto_select_pattern.is_none() {
             self.max_code_length == 0
                 || reached_max_code_length(cand.as_ref(), self.max_code_length)
@@ -252,7 +252,7 @@ impl Processor for Speller {
                     let end = prev.end;
                     let converted = ctx.input[..end.min(ctx.input.len())].to_string();
                     if is_auto_selectable(
-                        prev.get_selected_candidate(),
+                        prev.get_selected_candidate().as_ref(),
                         &converted,
                         &self.delimiters,
                     ) {

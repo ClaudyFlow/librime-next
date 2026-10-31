@@ -23,6 +23,7 @@
 //! `size` 是**上限**，默认 1；`initial_quality` 决定它和同段其他候选的相对位置，
 //! 出厂普遍写成 1（很低），意思是"排在正常候选后面，只在没有别的候选时露头"。
 
+use crate::engine::gear::translation::{Translation as TranslationTrait, VecTranslation};
 use crate::engine::candidate::Candidate;
 use crate::engine::commit_history::{CommitHistory, KIND_THRU};
 use crate::engine::gear::translator::Translator;
@@ -100,19 +101,19 @@ impl Translator for HistoryTranslator {
         input: &str,
         segment: &mut Segment,
         history: &CommitHistory,
-    ) -> Vec<Candidate> {
+    ) -> Option<Box<dyn TranslationTrait>> {
         if !segment.has_tag(&self.tag) {
-            return Vec::new();
+            return None;
         }
         // `input_` 为空说明方案没配触发键，这个组件就是摆设
         if self.input.is_empty() || self.input != input {
-            return Vec::new();
+            return None;
         }
         if history.is_empty() {
-            return Vec::new();
+            return None;
         }
         if self.size <= 0 {
-            return Vec::new();
+            return None;
         }
         let mut out = Vec::new();
         let mut count = 0i32;
@@ -121,8 +122,6 @@ impl Translator for HistoryTranslator {
             if record.kind == KIND_THRU {
                 continue;
             }
-            // C++ 的 candidate 用 `segment.start/end`（绝对坐标）；
-            // LRN 的候选是**相对本段**，所以 0..input.len()。
             out.push(
                 Candidate::new(
                     &record.kind,
@@ -137,7 +136,7 @@ impl Translator for HistoryTranslator {
                 break;
             }
         }
-        out
+        Some(Box::new(crate::engine::gear::translation::VecTranslation::new(out)))
     }
 }
 
@@ -145,6 +144,7 @@ impl Translator for HistoryTranslator {
 mod tests {
     use super::*;
     use crate::engine::commit_history::CommitRecord;
+    use crate::engine::gear::translation::drain_opt;
     use serde_json::json;
 
     fn segment_with(tag: &str) -> Segment {
@@ -193,12 +193,12 @@ mod tests {
     fn requires_exact_input_match() {
         let mut t = HistoryTranslator::load(&json!({ "history": { "input": "z", "size": 9 } }), "translator");
         let h = history_of(&[("table", "你好")]);
-        assert!(t.query("z", &mut segment_with("abc"), &h).len() == 1);
+        assert!(drain_opt(t.query("z", &mut segment_with("abc"), &h)).len() == 1);
         assert!(
-            t.query("zh", &mut segment_with("abc"), &h).is_empty(),
+            drain_opt(t.query("zh", &mut segment_with("abc"), &h)).is_empty(),
             "打 z 之后再多打 h 就不该再出历史"
         );
-        assert!(t.query("", &mut segment_with("abc"), &h).is_empty());
+        assert!(drain_opt(t.query("", &mut segment_with("abc"), &h)).is_empty());
     }
 
     #[test]
@@ -206,7 +206,7 @@ mod tests {
         let mut t = HistoryTranslator::load(&json!({ "history": { "input": "z" } }), "translator");
         let h = history_of(&[("table", "你好")]);
         assert!(
-            t.query("z", &mut segment_with("reverse_lookup"), &h).is_empty(),
+            drain_opt(t.query("z", &mut segment_with("reverse_lookup"), &h)).is_empty(),
             "没有 abc 标签的段不认领"
         );
     }
@@ -218,7 +218,7 @@ mod tests {
             "translator",
         );
         let h = history_of(&[("table", "第一"), ("script", "第二"), ("table", "第三")]);
-        let cands = t.query("z", &mut segment_with("abc"), &h);
+        let cands = drain_opt(t.query("z", &mut segment_with("abc"), &h));
         assert_eq!(cands.len(), 2, "size=2 只给两条");
         assert_eq!(cands[0].text, "第三", "最新的排前面");
         assert_eq!(cands[1].text, "第二");
@@ -231,7 +231,7 @@ mod tests {
     fn skips_thru_records() {
         let mut t = HistoryTranslator::load(&json!({ "history": { "input": "z", "size": 9 } }), "translator");
         let h = history_of(&[("table", "词"), ("thru", "3"), ("thru", "4")]);
-        let cands = t.query("z", &mut segment_with("abc"), &h);
+        let cands = drain_opt(t.query("z", &mut segment_with("abc"), &h));
         assert_eq!(cands.len(), 1, "thru 不算候选");
         assert_eq!(cands[0].text, "词");
     }
@@ -239,6 +239,6 @@ mod tests {
     #[test]
     fn empty_history_yields_nothing() {
         let mut t = HistoryTranslator::load(&json!({ "history": { "input": "z" } }), "translator");
-        assert!(t.query("z", &mut segment_with("abc"), &CommitHistory::new()).is_empty());
+        assert!(drain_opt(t.query("z", &mut segment_with("abc"), &CommitHistory::new())).is_empty());
     }
 }

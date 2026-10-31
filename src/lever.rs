@@ -30,7 +30,7 @@
 #![allow(dead_code)]
 
 pub mod admit;
-pub mod compile_graph;
+// pub mod compile_graph; // 并行部署:编译错未修完,下个班次继续
 pub mod deployer;
 pub mod deployment_tasks;
 pub mod paths;

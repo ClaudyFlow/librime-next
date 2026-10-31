@@ -24,7 +24,7 @@ use crate::engine::candidate::Candidate;
 use std::collections::HashSet;
 
 /// 流式候选迭代(对照 C++ `Translation`)。
-pub trait Translation {
+pub trait Translation: Send {
     /// 当前候选(不消费)。`None` = 已穷尽。
     fn peek(&mut self) -> Option<Candidate>;
     /// 前进一条。
@@ -52,6 +52,26 @@ impl Translation for VecTranslation {
             self.pos += 1;
         }
     }
+}
+
+/// 把一条流一次取完(测试/探针用)。
+///
+/// 懒化后翻译器返回的是流而不是列表;要"看到全部候选"的调用方(单测、探针)
+/// 用这个物化,语义等价于 `Menu::prepare(usize::MAX)`。
+#[cfg(test)]
+pub(crate) fn drain(mut translation: Box<dyn Translation>) -> Vec<Candidate> {
+    let mut out = Vec::new();
+    while let Some(candidate) = translation.peek() {
+        out.push(candidate);
+        translation.next();
+    }
+    out
+}
+
+/// `drain` 的 `Option` 版:翻译器没认领该段时是 `None`(等价空列表)。
+#[cfg(test)]
+pub(crate) fn drain_opt(translation: Option<Box<dyn Translation>>) -> Vec<Candidate> {
+    translation.map(drain).unwrap_or_default()
 }
 
 /// 层级链:第 0 层全部出完才轮到第 1 层……
@@ -149,7 +169,7 @@ impl Translation for ScriptWordsTranslation {
             };
             // C++ `set_quality(exp(entry->weight) + initial +
             //                  entry->quality_len / full_code_length)`
-            let quality = self.quality_stride * code_len as f64
+            let quality = self.quality_stride * (*code_len) as f64
                 + entry.weight.exp()
                 + entry.quality_len / self.full_len.max(1) as f64
                 + self.initial_quality;
@@ -201,7 +221,7 @@ impl Translation for MergedTranslation {
             }
             if let Some(c) = &source.cached {
                 match &best {
-                    Some((_, bc)) if bc.quality >= *c.quality => {}
+                    Some((_, bc)) if bc.quality >= c.quality => {}
                     _ => best = Some((i, c.clone())),
                 }
             }
@@ -237,8 +257,7 @@ pub struct UniquifiedTranslation {
 }
 
 impl UniquifiedTranslation {
-    pub fn new(inner: Box<dyn Translation>, materialized: &[Candidate]) -> Self {
-        let seen = materialized.iter().map(|c| c.text.clone()).collect();
+    pub fn new(inner: Box<dyn Translation>, seen: HashSet<String>) -> Self {
         Self { inner, seen }
     }
 }
@@ -289,24 +308,24 @@ impl Translation for ConvertTranslation {
 }
 
 /// 字符集包装的通用形:按谓词过滤。
-pub struct FilteredTranslation<F: FnMut(&Candidate) -> bool> {
+pub struct FilteredTranslation<F: FnMut(&mut Candidate) -> bool + Send> {
     inner: Box<dyn Translation>,
     predicate: F,
 }
 
-impl<F: FnMut(&Candidate) -> bool> FilteredTranslation<F> {
+impl<F: FnMut(&mut Candidate) -> bool + Send> FilteredTranslation<F> {
     pub fn new(inner: Box<dyn Translation>, predicate: F) -> Self {
         Self { inner, predicate }
     }
 }
 
-impl<F: FnMut(&Candidate) -> bool> Translation for FilteredTranslation<F> {
+impl<F: FnMut(&mut Candidate) -> bool + Send> Translation for FilteredTranslation<F> {
     fn peek(&mut self) -> Option<Candidate> {
         loop {
-            let Some(c) = self.inner.peek() else {
+            let Some(mut c) = self.inner.peek() else {
                 return None;
             };
-            if (self.predicate)(&c) {
+            if (self.predicate)(&mut c) {
                 return Some(c);
             }
             self.inner.next();

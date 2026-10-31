@@ -28,11 +28,12 @@ use crate::dict::reverse_lookup_dictionary::ReverseDb;
 use crate::engine::candidate::Candidate;
 use crate::engine::context::Context;
 use crate::engine::gear::filter::Filter;
+use crate::engine::gear::translation::{FilteredTranslation, Translation};
 use crate::engine::segmentation::Segment;
 
 pub struct ReverseLookupFilter {
     /// 反查表：字 → 码。文件缺失时整个过滤器退化为空操作。
-    rev_dict: Option<ReverseDb>,
+    rev_dict: Option<std::sync::Arc<ReverseDb>>,
     overwrite_comment: bool,
     append_comment: bool,
     comment_formatter: Projection,
@@ -66,8 +67,9 @@ impl ReverseLookupFilter {
                     name,
                     ".reverse",
                 ))
-                    .ok()
-                    .and_then(|mut db| db.load().then_some(db))
+                .ok()
+                .and_then(|mut db| db.load().then_some(db))
+                .map(std::sync::Arc::new)
             });
         let get_bool = |key: &str| {
             config
@@ -109,34 +111,47 @@ impl Filter for ReverseLookupFilter {
         self.tags.iter().any(|tag| segment.tags.contains(tag))
     }
 
-    fn apply(&mut self, _ctx: &Context, candidates: &mut Vec<Candidate>) {
-        let Some(rev_dict) = self.rev_dict.as_ref() else {
-            return;
+    fn apply(
+        &mut self,
+        _ctx: &Context,
+        translation: Box<dyn Translation>,
+        _candidates: &mut Vec<Candidate>,
+    ) -> Box<dyn Translation> {
+        let Some(rev_dict) = self.rev_dict.clone() else {
+            return translation;
         };
-        for cand in candidates.iter_mut() {
-            // 有注释且两个开关都没开 → 不动别人的注释
-            if !cand.comment.is_empty() && !(self.overwrite_comment || self.append_comment) {
-                continue;
+        let overwrite = self.overwrite_comment;
+        let append = self.append_comment;
+        let mut formatter = std::mem::replace(
+            &mut self.comment_formatter,
+            Default::default(),
+        );
+        Box::new(FilteredTranslation::new(translation, move |cand: &mut crate::engine::candidate::Candidate| {
+            // 有注释且两个开关都没开 → 不动别人的注释;返回 false = 跳过该候选
+            if !cand.comment.is_empty() && !(overwrite || append) {
+                return true;
             }
             let Some(mut codes) = rev_dict.lookup(&cand.text) else {
-                continue;
+                return true;
             };
-            self.comment_formatter.apply_str(&mut codes);
+            formatter.apply_str(&mut codes);
             if codes.is_empty() {
-                continue;
+                return true;
             }
-            if self.overwrite_comment || cand.comment.is_empty() {
+            if overwrite || cand.comment.is_empty() {
                 cand.comment = codes;
             } else {
                 cand.comment = format!("{} {}", cand.comment, codes);
             }
-        }
+            true
+        }))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::gear::translation::{drain, VecTranslation};
     use serde_json::json;
     use std::path::{Path, PathBuf};
 
@@ -160,22 +175,27 @@ mod tests {
         seg
     }
 
+    /// 懒化后滤镜是"包装流"（不再原地改注释）⇒ 测试把包装后的流物化再断言。
+    fn applied(f: &mut ReverseLookupFilter, ctx: &Context, items: Vec<Candidate>) -> Vec<Candidate> {
+        let mut materialized = Vec::new();
+        let stream = f.apply(ctx, Box::new(VecTranslation::new(items)), &mut materialized);
+        drain(stream)
+    }
+
     #[test]
     fn fills_comment_for_candidates_without_one() {
         let mut f = ReverseLookupFilter::load(&luna_config(), "filter", &build_dir());
         assert!(f.rev_dict.is_some(), "应读到 luna_pinyin.reverse.bin");
-        let mut list = vec![cand("你", "")];
-        f.apply(&Context::new(), &mut list);
-        assert_eq!(list[0].comment, "ni", "「你」的注释应是拼音");
+        let out = applied(&mut f, &Context::new(), vec![cand("你", "")]);
+        assert_eq!(out[0].comment, "ni", "「你」的注释应是拼音");
     }
 
     /// 默认两个开关都关 → 已有注释的候选原样保留。
     #[test]
     fn keeps_existing_comment_by_default() {
         let mut f = ReverseLookupFilter::load(&luna_config(), "filter", &build_dir());
-        let mut list = vec![cand("你", "ni")];
-        f.apply(&Context::new(), &mut list);
-        assert_eq!(list[0].comment, "ni");
+        let out = applied(&mut f, &Context::new(), vec![cand("你", "ni")]);
+        assert_eq!(out[0].comment, "ni");
     }
 
     #[test]
@@ -183,9 +203,8 @@ mod tests {
         let mut config = luna_config();
         config["reverse_lookup"]["append_comment"] = json!(true);
         let mut f = ReverseLookupFilter::load(&config, "filter", &build_dir());
-        let mut list = vec![cand("你", "xx")];
-        f.apply(&Context::new(), &mut list);
-        assert_eq!(list[0].comment, "xx ni", "应追加、空格分隔，实际 {:?}", list[0].comment);
+        let out = applied(&mut f, &Context::new(), vec![cand("你", "xx")]);
+        assert_eq!(out[0].comment, "xx ni", "应追加、空格分隔，实际 {:?}", out[0].comment);
     }
 
     #[test]
@@ -193,9 +212,8 @@ mod tests {
         let mut config = luna_config();
         config["reverse_lookup"]["overwrite_comment"] = json!(true);
         let mut f = ReverseLookupFilter::load(&config, "filter", &build_dir());
-        let mut list = vec![cand("你", "xx")];
-        f.apply(&Context::new(), &mut list);
-        assert_eq!(list[0].comment, "ni", "应覆盖掉原来的注释");
+        let out = applied(&mut f, &Context::new(), vec![cand("你", "xx")]);
+        assert_eq!(out[0].comment, "ni", "应覆盖掉原来的注释");
     }
 
     #[test]
@@ -214,8 +232,7 @@ mod tests {
     fn missing_reverse_table_degrades_to_noop() {
         let config = json!({ "reverse_lookup": { "dictionary": "no_such_dict" } });
         let mut f = ReverseLookupFilter::load(&config, "filter", &build_dir());
-        let mut list = vec![cand("你", "")];
-        f.apply(&Context::new(), &mut list);
-        assert_eq!(list[0].comment, "", "没有反查表就不该动注释");
+        let out = applied(&mut f, &Context::new(), vec![cand("你", "")]);
+        assert_eq!(out[0].comment, "", "没有反查表就不该动注释");
     }
 }

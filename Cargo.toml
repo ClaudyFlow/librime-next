@@ -184,3 +184,13 @@ path = "test/reverse_lookup_scheme.rs"
 [[example]]
 name = "probe_schema"
 path = "example/probe_schema.rs"
+
+[[example]]
+name = "probe_fanjian"
+path = "example/probe_fanjian.rs"
+
+# 候选/切分探针（2026-10-31）：同一组输入打印「切分 + 每段候选 + 空格提交」，
+# 用于「原版 librime vs 自研」与「改前 vs 改后」的对照。
+[[example]]
+name = "probe_candidates"
+path = "example/probe_candidates.rs"

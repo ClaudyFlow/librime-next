@@ -21,7 +21,6 @@ pub enum SegStatus {
 
 /// 一段输入（对照 C++ `Segment`）。`[start, end)` 是组合串（composition 持有的
 /// 那份 input）中的字节区间。
-#[derive(Clone, Debug)]
 pub struct Segment {
     pub status: SegStatus,
     pub start: usize,
@@ -97,11 +96,11 @@ impl Segment {
         self.end.saturating_sub(self.start)
     }
 
-    pub fn get_candidate_at(&self, index: usize) -> Option<&Candidate> {
+    pub fn get_candidate_at(&self, index: usize) -> Option<Candidate> {
         self.menu.as_ref()?.candidate_at(index)
     }
 
-    pub fn get_selected_candidate(&self) -> Option<&Candidate> {
+    pub fn get_selected_candidate(&self) -> Option<Candidate> {
         self.get_candidate_at(self.selected_index)
     }
 }
@@ -245,5 +244,38 @@ impl Segmentation {
             }
         }
         pos
+    }
+}
+
+// 手动 Clone/Debug:Segment 含 Menu(懒流不可复制/格式化)。
+// Clone 只复制已物化前缀(懒流丢弃——备份场景够用);Debug 只报状态摘要。
+impl Clone for Segment {
+    fn clone(&self) -> Self {
+        Self {
+            status: self.status,
+            start: self.start,
+            end: self.end,
+            tags: self.tags.clone(),
+            menu: self.menu.clone(),
+            selected_index: self.selected_index,
+            prompt: self.prompt.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for Segment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Segment")
+            .field("status", &self.status)
+            .field("range", &(self.start, self.end))
+            .field("tags", &self.tags)
+            .field("prepared", &self.menu.as_ref().map_or(0, |m| m.candidate_count()))
+            .finish()
+    }
+}
+
+impl Default for Segment {
+    fn default() -> Self {
+        Self::new(0, 0)
     }
 }
