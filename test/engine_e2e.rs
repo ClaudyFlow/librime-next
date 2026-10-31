@@ -2170,3 +2170,33 @@ fn neural_rescore_lands_and_recomposes() {
         "nihao 的神经重排不该把「你好」排没,实得 {texts1:?}"
     );
 }
+
+/// 空格只上屏当前高亮候选:部分候选(「你」)提交后,剩余编码 hao 留在组字区。
+///
+/// ⚠️ WIP(2026-10-31 侦查结论,下一棒从这里接):
+/// 1. 空格路径 = editor "confirm"(editor.rs:131)→ confirm_current_selection + Context::commit;
+/// 2. 元凶 = composition.get_commit_text 的尾巴追加(input[end..] 当原文进提交);
+/// 3. 首修 Context::commit 只提交已选候选+未选间隙原文(游标版),空格场景过了,
+///    但**数字分隔路径不走 Context::commit**(punct 另有提交道),三例 digit_separator
+///    回归 ⇒ 先读 punct 的提交道再落刀;本测先 ignore。
+#[test]
+#[ignore = "空格部分提交修复待 punct 提交道侦查(1031日志移交)"]
+fn space_commits_highlighted_prefix_and_keeps_rest_composing() {
+    let mut session = new_session(&build_dir(), "luna_pinyin_simp");
+    type_ascii(&mut session, "nihao");
+    // 高亮移到「你」(部分覆盖候选, end=2)
+    let ni_idx = {
+        let texts = candidate_texts(&mut session);
+        texts.iter().position(|t| t == "你").expect("应有「你」候选")
+    };
+    for _ in 0..ni_idx {
+        assert!(session.process_key(0xff54, 0), "Down 应被消费"); // XK_Down
+    }
+    // 空格确认
+    assert!(session.process_key(0x0020, 0), "空格应被消费");
+    assert_eq!(session.take_commit().as_deref(), Some("你"), "空格只提交高亮候选「你」");
+    // 剩余编码 hao 必须还在组字区
+    let ctx = session.context().expect("引擎可读");
+    assert_eq!(ctx.input, "hao", "剩余编码应留在组字区,实际 {:?}", ctx.input);
+    assert!(ctx.is_composing(), "应仍在组字");
+}
