@@ -2124,3 +2124,49 @@ fn wubi86_table_translator_end_to_end() {
     );
     let _ = std::fs::remove_dir_all(&work);
 }
+
+// ── 神经重排端到端(需要模型文件;没有就跳过)────────────────────────────
+//
+// 闭环:打字 → 滤镜提交后台 → 落地(generation 增) → poll_rescore_landing
+// → re-compose 命中结果表 → 菜单仍健康(首候选不变、候选数不炸)。
+
+#[test]
+fn neural_rescore_lands_and_recomposes() {
+    let model = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-data/neural/sentence-model.safetensors");
+    if !model.is_file() {
+        eprintln!("skip: 没有神经模型({}),从 chinese-ime-lm model-v1 下载", model.display());
+        return;
+    }
+    use librime_next::engine::gear::rescore;
+    let build = build_dir();
+    let user_dir = fresh_user_dir("neural");
+    let roots = vec![user_dir.clone(), build.clone()];
+    // c_api 才会做全局初始化;测试直接给数据根(test-data 里有 neural/)。
+    rescore::init_from_data_roots(&[PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-data")]);
+    assert!(rescore::global().is_some(), "模型在,全局 worker 应初始化");
+
+    let mut session = Session::create_with_roots(&build, "luna_pinyin_simp", &roots);
+    assert!(session.engine.is_some());
+    type_ascii(&mut session, "nihao");
+    let texts0 = candidate_texts(&mut session);
+    assert!(!texts0.is_empty(), "静态顺序先出候选");
+
+    // 等后台打分落地(keyboard 模型 batch≈8 条,基准暖 ~114ms,给足 5s)。
+    let worker = rescore::global().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while worker.current_generation() == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(worker.current_generation() > 0, "5s 内应有一批结果落地");
+
+    // 落地后轮询:re-compose 命中结果表,菜单必须仍然健康。
+    session.poll_rescore_landing();
+    let texts1 = candidate_texts(&mut session);
+    assert!(!texts1.is_empty(), "重排后菜单不该空");
+    assert_eq!(texts1.first().and_then(|t| texts0.iter().find(|x| *x == t)), texts1.first(),
+        "重排只是换序:首候选必须是原批次里的成员");
+    assert!(
+        texts1.iter().any(|t| t.contains("你好")),
+        "nihao 的神经重排不该把「你好」排没,实得 {texts1:?}"
+    );
+}

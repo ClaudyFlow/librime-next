@@ -12,6 +12,7 @@
 //! "正在算的那一批不再排第二份":结果表按 (模型, 前文, 候选列表) 做键。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use super::neural::{rerank_order, LazySentenceModel, RerankOptions};
@@ -51,6 +52,10 @@ pub struct RescoreWorker {
     handle: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// 线程的存活句柄(构造后立即填入)。
     me: std::sync::OnceLock<std::sync::Weak<RescoreWorker>>,
+    /// 结果落地代数:后台线程每写一条结果自增一次。调用方(引擎线程)记着
+    /// 上次见过的代数,代数变了就 re-compose 一次——这就是"后台分算完,
+    /// 候选列表当场跳到神经顺序"的信号通道(线程不能直接摸引擎)。
+    generation: std::sync::atomic::AtomicU64,
 }
 
 /// 神经打分器:模型 + 重排选项。`SentenceModel` 自身线程安全
@@ -97,36 +102,48 @@ pub fn make_key(model_tag: &str, context: &str, sentences: &[String]) -> String 
     key
 }
 
-/// 进程级单例。None = 尚未初始化(数据根里没有模型文件)。
-static GLOBAL: OnceLock<Option<Arc<RescoreWorker>>> = OnceLock::new();
+/// 进程级单例。`None` = 尚未找到模型。
+///
+/// 用 RwLock 而不是 OnceLock:OnceLock 会把"第一次没找到"永久缓存,
+/// 后续会话换了数据根(或测试给了正确根)也没机会补上。运行期实际
+/// 只写一次(有 worker 后直接短路),无争用。
+static GLOBAL: std::sync::RwLock<Option<Arc<RescoreWorker>>> = std::sync::RwLock::new(None);
 
-/// 在数据根里找模型文件并初始化全局 worker(只在第一次生效)。
+/// 在数据根里找模型文件并初始化全局 worker(已有 worker 时直接短路)。
 ///
 /// **keyboard(6层) 优先**——2026-10-31 基准(`example/neural_bench`):
 /// 重排一轮暖缓存 60~170ms;desktop(8层) 293~858ms,质量更好但一轮要吃掉
 /// 半个打字停顿,只适合显式放置它的用户。都没有就保持 `None`
 /// ——整个神经重排层静默关闭,输入法照常工作。
 pub fn init_from_data_roots(roots: &[std::path::PathBuf]) {
-    GLOBAL.get_or_init(|| {
-        const CANDIDATES: &[&str] = &[
-            "neural/sentence-model.safetensors",
-            "neural/sentence-model-desktop.safetensors",
-        ];
-        for root in roots {
-            for name in CANDIDATES {
-                let path = root.join(name);
-                if path.is_file() {
-                    return Some(RescoreWorker::new_singleton(NeuralScorer::new(path)));
-                }
+    if global().is_some() {
+        return;
+    }
+    const CANDIDATES: &[&str] = &[
+        "neural/sentence-model.safetensors",
+        "neural/sentence-model-desktop.safetensors",
+    ];
+    let mut slot = GLOBAL.write().expect("rescore 全局表毒化不可恢复");
+    if slot.is_some() {
+        return;
+    }
+    for root in roots {
+        for name in CANDIDATES {
+            let path = root.join(name);
+            if path.is_file() {
+                *slot = Some(RescoreWorker::new_singleton(NeuralScorer::new(path)));
+                return;
             }
         }
-        None
-    });
+    }
 }
 
-/// 全局 worker;未初始化(没有模型)时返回 `None`。
-pub fn global() -> Option<&'static Arc<RescoreWorker>> {
-    GLOBAL.get_or_init(|| None).as_ref()
+/// 全局 worker 的共享句柄;未初始化(没有模型)时返回 `None`。
+pub fn global() -> Option<Arc<RescoreWorker>> {
+    GLOBAL
+        .read()
+        .expect("rescore 全局表毒化不可恢复")
+        .clone()
 }
 
 /// 上屏/换方案后调用:待办里的旧请求作废,结果表留着(同输入重打还能命中)。
@@ -148,6 +165,7 @@ impl RescoreWorker {
             scorer: Arc::new(scorer),
             handle: Mutex::new(None),
             me: std::sync::OnceLock::new(),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -201,6 +219,11 @@ impl RescoreWorker {
         let key = make_key(self.model_tag(), context, sentences);
         let state = self.state.lock().unwrap();
         state.done.get(&key).cloned()
+    }
+
+    /// 当前结果代数(引擎线程用来发现"有新结果落地了")。
+    pub fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     /// 上屏、换方案、换前文:存着的顺序对新语境没有意义了。
@@ -270,6 +293,8 @@ impl RescoreWorker {
             }
             state.done.insert(job.key, order);
             drop(state);
+            // 落地信号:引擎线程在 get_context 时轮询代数,变了就 re-compose。
+            owner.generation.fetch_add(1, Ordering::Release);
             // 回到外圈前降级;worker 若已被丢弃(测试场景),下轮 upgrade 失败退出。
         }
     }

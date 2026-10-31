@@ -60,6 +60,14 @@ impl Session {
         ok
     }
 
+    /// 神经重排结果落地检查(见 `Engine::poll_rescore_landing`):宿主每次
+    /// 读上下文前调一次,后台分算完就把当前列表换成神经顺序。
+    pub fn poll_rescore_landing(&mut self) {
+        if let Some(engine) = &mut self.engine {
+            engine.poll_rescore_landing();
+        }
+    }
+
     pub fn clear_composition(&mut self) {
         if let Some(engine) = &mut self.engine {
             engine.context.clear();

@@ -709,7 +709,11 @@ unsafe extern "C" fn rime_get_context(id: RimeSessionId, ctx: *mut RimeContext) 
     if ctx.is_null() {
         return 0;
     }
-    let g = global().lock().unwrap();
+    let mut g = global().lock().unwrap();
+    // 神经重排结果落地检查在快照之前:后台算完一批,这次读到的就是重排后的列表。
+    g.sessions
+        .get_mut(&id)
+        .map(|s| s.poll_rescore_landing());
     let Some(session) = g.sessions.get(&id) else {
         return 0;
     };

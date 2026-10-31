@@ -70,6 +70,8 @@ pub struct Engine {
     /// `self.processors = processors` 覆盖掉 —— 所以只登记，由
     /// [`Engine::process_key`] 在列表归位后执行。
     pending_schema: Option<String>,
+    /// 上次见过的神经重排结果代数(见 [`Self::poll_rescore_landing`])。
+    rescore_seen_generation: u64,
 }
 
 impl Engine {
@@ -118,6 +120,7 @@ impl Engine {
             default_config,
             user_dir,
             pending_schema: None,
+            rescore_seen_generation: 0,
         };
         engine.initialize_components();
         Some(engine)
@@ -338,6 +341,27 @@ impl Engine {
             }
         }
         self.translators = translators;
+    }
+
+    /// 神经重排结果落地检查:后台线程算完一批(代数变了)且当前正在组字,
+    /// 就 re-compose 一次——重排滤镜这次能在结果表里命中,候选列表当场
+    /// 跳到神经顺序。线程不能直接摸引擎(非 Send),这是轮询侧的信号通道。
+    ///
+    /// 由 C API 的 `rime_get_context` 在每次快照前调用:宿主每键/每次重绘
+    /// 都会读上下文,落地的分最多迟一个读周期就能上屏。
+    pub fn poll_rescore_landing(&mut self) {
+        let Some(worker) = crate::engine::gear::rescore::global() else {
+            return;
+        };
+        let generation = worker.current_generation();
+        if generation == self.rescore_seen_generation {
+            return;
+        }
+        self.rescore_seen_generation = generation;
+        // 正在组字才值得重算;空输入重 compose 无害但浪费。
+        if self.context.is_composing() && !self.context.input.is_empty() {
+            self.compose();
+        }
     }
 
     /// C++ `ConcreteEngine::ProcessSyntheticKey`：由组件（如 key_binder 的 `send:`）
@@ -721,6 +745,7 @@ impl Engine {
             default_config: serde_json::Value::Object(serde_json::Map::new()),
             user_dir: None,
             pending_schema: None,
+            rescore_seen_generation: 0,
         }
     }
 }
