@@ -205,3 +205,4 @@ path = "example/neural_smoke.rs"
 [[example]]
 name = "neural_bench"
 path = "example/neural_bench.rs"
+
