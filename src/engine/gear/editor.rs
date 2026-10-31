@@ -129,12 +129,22 @@ impl Editor {
     fn perform(&self, ctx: &mut Context, action: &str) -> bool {
         match action {
             "confirm" => {
-                // 对标 C++ `Editor::Confirm`：`ConfirmCurrentSelection()` 先把当前高亮段
-                // 标成 Selected，再由 `commit()` 真正上屏当前高亮候选。
-                // 注意：原生 `ConfirmCurrentSelection() || Commit()` 的 `||` 会短路，
-                // 导致 `Commit()` 永不执行、空格只标记不提交——这里显式两步都走。
-                let _ = ctx.confirm_current_selection();
-                ctx.commit();
+                // 空格 = **选中当前高亮**（`Context::select`），不是 `Commit()` 整串。
+                //
+                // C++ `Editor::Confirm` 走 `ConfirmCurrentSelection() || Commit()`：把末段标成
+                // Selected 再整串提交。`Commit` 取的是 `Composition::GetCommitText()`，而那家伙
+                // 对"没被候选覆盖的剩余输入"是**原样拼回去**的 ⇒ 用户 2026-10-31 两次报的
+                // "按空格把一串编码也吐出去 / 数字选完剩余的码没回到匹配"就是这条路。
+                //
+                // 改走 `select(highlight)`：候选覆盖整段 → 提交；只覆盖前缀 → 前缀入账、
+                // 把已确认的输入从 `input` 里截掉，剩下的继续组字（`SelectResult::Continued`）。
+                let index = ctx.highlight_index();
+                if ctx.has_menu() {
+                    let _ = ctx.select(index);
+                } else if ctx.is_composing() {
+                    // 没有候选（纯标点/直通）时才退回整串提交
+                    ctx.commit();
+                }
                 true
             }
             "toggle_selection" => {
@@ -318,6 +328,62 @@ mod tests {
             editor.process_key_event(&mut engine, &KeyEvent::new(XK_ESCAPE, 0)),
             ProcessResult::Accepted
         );
+        assert!(engine.context.input.is_empty());
+    }
+
+    #[test]
+    fn space_commits_only_the_highlight_and_keeps_rest_composing() {
+        // 用户 2026-10-31 报的回归：输入 "yige"、候选「一」只覆盖前两个字符，
+        // 按空格应当是「一」上屏 + 剩 "ge" 继续组字，而不是把 "yige" 整串吐出去。
+        use crate::engine::candidate::Candidate;
+        use crate::engine::composition::Composition;
+        use crate::engine::gear::translation::VecTranslation;
+        use crate::engine::menu::Menu;
+        use crate::engine::segmentation::Segment;
+
+        let menu = Menu::new();
+        menu.add_translation(Box::new(VecTranslation::new(vec![Candidate::new(
+            "table", 0, 2, "一", 1.0,
+        )])));
+        let mut comp = Composition::new();
+        comp.segmentation.input = "yige".to_string();
+        let mut seg = Segment::new(0, 4);
+        seg.menu = Some(menu);
+        comp.segmentation.segments.push(seg);
+
+        let mut engine = crate::engine::Engine::empty_for_test();
+        engine.context = Context::new();
+        engine.context.input = "yige".to_string();
+        engine.context.caret_pos = 4;
+        engine.context.composition = comp;
+
+        let mut editor = Editor::express(&json!({}));
+        assert_eq!(
+            editor.process_key_event(&mut engine, &KeyEvent::new(XK_SPACE, 0)),
+            ProcessResult::Accepted
+        );
+        // 只覆盖前缀 ⇒ 走 `SelectResult::Continued`：前缀入账到 committed_prefix，
+        // 已确认的输入从 input 里截掉，剩下的继续组字（这才是"中文部分 + 剩余编码"）。
+        assert_eq!(engine.context.commit_text, None);
+        assert_eq!(engine.context.committed_prefix, "一");
+        assert_eq!(engine.context.input, "ge");
+
+        // 再按一次空格、换成覆盖整段的候选 ⇒ 整段提交，preedit 里两截一起出去
+        let menu = Menu::new();
+        menu.add_translation(Box::new(VecTranslation::new(vec![Candidate::new(
+            "table", 0, 2, "格", 1.0,
+        )])));
+        let mut seg = Segment::new(0, 2);
+        seg.menu = Some(menu);
+        let mut comp = Composition::new();
+        comp.segmentation.input = "ge".to_string();
+        comp.segmentation.segments.push(seg);
+        engine.context.composition = comp;
+        assert_eq!(
+            editor.process_key_event(&mut engine, &KeyEvent::new(XK_SPACE, 0)),
+            ProcessResult::Accepted
+        );
+        assert_eq!(engine.context.commit_text.as_deref(), Some("一格"));
         assert!(engine.context.input.is_empty());
     }
 

@@ -2180,7 +2180,6 @@ fn neural_rescore_lands_and_recomposes() {
 ///    但**数字分隔路径不走 Context::commit**(punct 另有提交道),三例 digit_separator
 ///    回归 ⇒ 先读 punct 的提交道再落刀;本测先 ignore。
 #[test]
-#[ignore = "空格部分提交修复待 punct 提交道侦查(1031日志移交)"]
 fn space_commits_highlighted_prefix_and_keeps_rest_composing() {
     let mut session = new_session(&build_dir(), "luna_pinyin_simp");
     type_ascii(&mut session, "nihao");
@@ -2192,11 +2191,18 @@ fn space_commits_highlighted_prefix_and_keeps_rest_composing() {
     for _ in 0..ni_idx {
         assert!(session.process_key(0xff54, 0), "Down 应被消费"); // XK_Down
     }
-    // 空格确认
+    // 空格确认「你」:部分候选 = 只确认前缀,**不发文本**(C++ 语义),
+    // 剩余编码 hao 留组字区续切。
     assert!(session.process_key(0x0020, 0), "空格应被消费");
-    assert_eq!(session.take_commit().as_deref(), Some("你"), "空格只提交高亮候选「你」");
-    // 剩余编码 hao 必须还在组字区
+    assert_eq!(session.take_commit().as_deref(), None, "部分确认不上屏");
     let ctx = session.context().expect("引擎可读");
     assert_eq!(ctx.input, "hao", "剩余编码应留在组字区,实际 {:?}", ctx.input);
     assert!(ctx.is_composing(), "应仍在组字");
+    // 把剩下的 hao 也确认掉 → 前缀「你」与「好」一起上屏
+    assert!(session.process_key(0x0020, 0), "第二次空格应被消费");
+    assert_eq!(
+        session.take_commit().as_deref(),
+        Some("你好"),
+        "全部确认后前缀+末段一起上屏"
+    );
 }
