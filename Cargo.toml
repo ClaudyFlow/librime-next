@@ -194,3 +194,14 @@ path = "example/probe_fanjian.rs"
 [[example]]
 name = "probe_candidates"
 path = "example/probe_candidates.rs"
+
+# 神经模型冒烟测试(2026-10-31):加载 safetensors、打分、重排、计时。
+[[example]]
+name = "neural_smoke"
+path = "example/neural_smoke.rs"
+
+
+# 神经重排打字速度基准(2026-10-31):6层/8层模型各一份。
+[[example]]
+name = "neural_bench"
+path = "example/neural_bench.rs"

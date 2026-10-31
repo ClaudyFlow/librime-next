@@ -23,3 +23,5 @@
 *.bak
 *~
 .DS_Store
+test-data/neural/
+test/e2e/build/userdb/

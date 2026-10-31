@@ -2,189 +2,275 @@
 //!
 //! # 设计(与 C++ 逐条对齐)
 //!
-//! 给 N 条候选打一次神经分要几十毫秒——比一次按键的预算大一个数量级，
-//! 所以它**不能长在按键路径上**。查询照旧同步返回 n-gram 静态顺序，
-//! 同时把这一批候选交给后台线程；线程算完把顺序存进结果表；
-//! 调用方下次查询时从结果表取到重排后的顺序。
+//! 给 N 条候选打一次神经分要几十毫秒——比一次按键的预算大一个数量级,
+//! 所以它**不能长在按键路径上**。查询照旧同步返回静态顺序,同时把这一批
+//! 候选交给后台线程;线程算完把顺序存进结果表;调用方下次查询时取。
 //!
-//! "每个模型最新的赢"：用户还在打字时，同一模型前几次请求的结果已经
-//! 没人要，新请求直接盖掉旧待办。
+//! "最新的赢":用户还在打字时,前几次请求的结果已经没人要,新请求直接
+//! 盖掉旧待办(待办只有一个槽)。
 //!
-//! "正在算的那一批不再排第二份"：结果表按 (模型, 前文, 候选列表) 做键。
+//! "正在算的那一批不再排第二份":结果表按 (模型, 前文, 候选列表) 做键。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
-/// 句子评分器 trait——不同后端(n-gram 插值 / 神经模型)实现这个接口。
-pub trait SentenceScorer: Send + Sync {
-    /// 给一组候选句子打分，返回重排后的下标序列(按分数降序)。
-    ///
-    /// * `context` —— 前文(最近上屏的文本，用于条件打分)
-    /// * `sentences` —— 候选句子列表
-    /// * `static_scores` —— 静态分数(n-gram，已算好)
-    ///
-    /// 返回 `indices`，其中 `indices[0]` 是最佳句子的下标。
-    fn score(&self, context: &str, sentences: &[String], static_scores: &[f64]) -> Vec<usize>;
-}
+use super::neural::{rerank_order, LazySentenceModel, RerankOptions};
+
+/// 结果表只是给「同一次输入被重查一遍」兜底的,不是长期缓存:装满就整张丢掉,
+/// 比维护 LRU 简单,代价也只是重算一次。
+const MAX_RESULTS: usize = 128;
 
 /// 一批待重排的任务。
 struct Job {
+    key: String,
     context: String,
     sentences: Vec<String>,
     static_scores: Vec<f64>,
+    options: RerankOptions,
 }
 
-/// 异步重排结果缓存。
-struct RescoreState {
+struct WorkerState {
     /// 已完成的结果:`key → 重排后的下标序列`。
-    done: Mutex<HashMap<String, Vec<usize>>>,
-    /// 待办(每个模型只有一个槽，新的盖旧的)。
-    pending: Mutex<Option<Job>>,
+    done: HashMap<String, Vec<usize>>,
+    /// 待办(单槽,新的盖旧的)。
+    pending: Option<Job>,
     /// 停工标志。
-    stopping: AtomicBool,
+    stopping: bool,
 }
 
-/// 异步重排后台线程。
+/// 异步重排后台线程。进程级单例——见 [`global`] / [`init_from_data_roots`]。
+///
+/// 通过 [`RescoreWorker::new_singleton`] 构造成 `Arc`:线程持有 `Weak`
+/// 句柄,每轮升级——单例常驻时升级恒成功;测试里 worker 被丢弃后线程自行退出。
 pub struct RescoreWorker {
-    state: Arc<RescoreState>,
-    scorer: Arc<dyn SentenceScorer>,
-    monitor: Arc<Mutex<()>>,
-    handle: Option<std::thread::JoinHandle<()>>,
+    state: Mutex<WorkerState>,
+    /// 无活时睡在这里;`submit`/`shutdown` 唤醒。
+    wake: Condvar,
+    scorer: Arc<NeuralScorer>,
+    /// 惰性起线程:没开神经重排的用户不会平白多线程。
+    handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// 线程的存活句柄(构造后立即填入)。
+    me: std::sync::OnceLock<std::sync::Weak<RescoreWorker>>,
 }
 
-impl RescoreWorker {
-    /// 创建并启动后台线程。
-    pub fn new(scorer: Arc<dyn SentenceScorer>) -> Self {
-        let state = Arc::new(RescoreState {
-            done: Mutex::new(HashMap::new()),
-            pending: Mutex::new(None),
-            stopping: AtomicBool::new(false),
-        });
-        let monitor = Arc::new(Mutex::new(()));
+/// 神经打分器:模型 + 重排选项。`SentenceModel` 自身线程安全
+/// (内部 prefix 缓存有锁),所以一个打分器跨线程共享。
+pub struct NeuralScorer {
+    model: LazySentenceModel,
+    pub options: RerankOptions,
+}
 
-        let st = state.clone();
-        let scorer_clone = scorer.clone();
-        let handle = std::thread::Builder::new()
-            .name("rescore-worker".into())
-            .spawn(move || {
-                loop {
-                    if st.stopping.load(Ordering::Acquire) {
-                        break;
-                    }
-                    // 取待办
-                    let job = {
-                        let mut pending = st.pending.lock().unwrap();
-                        pending.take()
-                    };
-                    match job {
-                        Some(job) => {
-                            // 后台打分(不阻塞按键路径)
-                            let key = format!("{}|{}", job.context, job.sentences.join("\x1f"));
-                            let indices = scorer_clone.score(
-                                &job.context,
-                                &job.sentences,
-                                &job.static_scores,
-                            );
-                            let mut done = st.done.lock().unwrap();
-                            done.insert(key, indices);
-                            drop(done);
-                            // 结果已写入 done 表,下次查询时取
-                        }
-                        None => {
-                            // 没活，等一会儿再查
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                            if st.stopping.load(Ordering::Acquire) {
-                                break;
-                            }
-                        }
-                    }
-                }
-            })
-            .unwrap();
-
+impl NeuralScorer {
+    pub fn new(model_path: impl Into<std::path::PathBuf>) -> Self {
         Self {
-            state,
-            scorer: scorer.clone(),
-            monitor,
-            handle: Some(handle),
+            model: LazySentenceModel::new(model_path),
+            options: RerankOptions::default(),
         }
     }
 
-    /// 提交一批候选给后台重排。**不阻塞**——立即返回。
-    ///
-    /// 调用方下次查询时用 [`order_for`] 取重排结果。
-    pub fn submit(
+    /// 模型可用时跑一次重排;模型缺失/句子不足两条时返回空表
+    /// (调用方保持静态顺序——半份重排比不排更糟)。
+    fn rerank(
         &self,
-        model_id: &str,
-        context: &str,
-        sentences: Vec<String>,
-        static_scores: Vec<f64>,
-    ) {
-        let key = format!("{}|{}|{}", model_id, context, sentences.join("\x1f"));
-        let mut pending = self.state.pending.lock().unwrap();
-        // "每个模型最新的赢"：直接覆盖
-        *pending = Some(Job {
-            context: context.to_string(),
-            sentences,
-            static_scores,
-        });
-        drop(pending);
-
-        let _ = key;
-    }
-
-    /// 有现成结果就返回重排后的下标序列；没有就返回 None(调用方按静态顺序走)。
-    pub fn order_for(
-        &self,
-        model_id: &str,
         context: &str,
         sentences: &[String],
         static_scores: &[f64],
+    ) -> Vec<usize> {
+        let Some(model) = self.model.get() else {
+            return Vec::new();
+        };
+        rerank_order(model, context, sentences, static_scores, &self.options)
+    }
+}
+
+/// 结果键:`\x01` 不会出现在 UTF-8 文本里,拿它当分隔符不会把两批不同的
+/// 候选拼成同一个键。
+pub fn make_key(model_tag: &str, context: &str, sentences: &[String]) -> String {
+    let mut key = String::with_capacity(64 + context.len() + sentences.iter().map(|s| s.len() + 1).sum::<usize>());
+    key.push_str(model_tag);
+    key.push('\x01');
+    key.push_str(context);
+    for sentence in sentences {
+        key.push('\x01');
+        key.push_str(sentence);
+    }
+    key
+}
+
+/// 进程级单例。None = 尚未初始化(数据根里没有模型文件)。
+static GLOBAL: OnceLock<Option<Arc<RescoreWorker>>> = OnceLock::new();
+
+/// 在数据根里找模型文件并初始化全局 worker(只在第一次生效)。
+///
+/// **keyboard(6层) 优先**——2026-10-31 基准(`example/neural_bench`):
+/// 重排一轮暖缓存 60~170ms;desktop(8层) 293~858ms,质量更好但一轮要吃掉
+/// 半个打字停顿,只适合显式放置它的用户。都没有就保持 `None`
+/// ——整个神经重排层静默关闭,输入法照常工作。
+pub fn init_from_data_roots(roots: &[std::path::PathBuf]) {
+    GLOBAL.get_or_init(|| {
+        const CANDIDATES: &[&str] = &[
+            "neural/sentence-model.safetensors",
+            "neural/sentence-model-desktop.safetensors",
+        ];
+        for root in roots {
+            for name in CANDIDATES {
+                let path = root.join(name);
+                if path.is_file() {
+                    return Some(RescoreWorker::new_singleton(NeuralScorer::new(path)));
+                }
+            }
+        }
+        None
+    });
+}
+
+/// 全局 worker;未初始化(没有模型)时返回 `None`。
+pub fn global() -> Option<&'static Arc<RescoreWorker>> {
+    GLOBAL.get_or_init(|| None).as_ref()
+}
+
+/// 上屏/换方案后调用:待办里的旧请求作废,结果表留着(同输入重打还能命中)。
+pub fn clear_pending() {
+    if let Some(worker) = global() {
+        worker.clear();
+    }
+}
+
+impl RescoreWorker {
+    pub fn new(scorer: NeuralScorer) -> Self {
+        Self {
+            state: Mutex::new(WorkerState {
+                done: HashMap::new(),
+                pending: None,
+                stopping: false,
+            }),
+            wake: Condvar::new(),
+            scorer: Arc::new(scorer),
+            handle: Mutex::new(None),
+            me: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// 单例构造:`Arc` + 线程存活句柄一次配好。
+    pub fn new_singleton(scorer: NeuralScorer) -> Arc<Self> {
+        let me = Arc::new(Self::new(scorer));
+        let _ = me.me.set(Arc::downgrade(&me));
+        me
+    }
+
+    fn model_tag(&self) -> &'static str {
+        "neural"
+    }
+
+    /// 提交一批候选给后台重排。**不阻塞**——立即返回 `None`;
+    /// 结果落在 [`RescoreWorker::order_for`]。
+    pub fn submit(
+        &self,
+        context: &str,
+        sentences: Vec<String>,
+        static_scores: Vec<f64>,
+        options: RerankOptions,
+    ) {
+        let key = make_key(self.model_tag(), context, &sentences);
+        let mut state = self.state.lock().unwrap();
+        if state.stopping {
+            return;
+        }
+        // 正在算的就是这一批,算完自会进表,不必再排一份。
+        if state.done.contains_key(&key) {
+            return;
+        }
+        state.pending = Some(Job {
+            key,
+            context: context.to_string(),
+            sentences,
+            static_scores,
+            options,
+        });
+        self.ensure_thread(&mut state);
+        drop(state);
+        self.wake.notify_one();
+    }
+
+    /// 有现成结果就返回重排后的下标序列;没有就 `None`(调用方按静态顺序走)。
+    pub fn order_for(
+        &self,
+        context: &str,
+        sentences: &[String],
     ) -> Option<Vec<usize>> {
-        let key = format!("{}|{}|{}", model_id, context, sentences.join("\x1f"));
-        self.state.done.lock().unwrap().get(&key).cloned()
+        let key = make_key(self.model_tag(), context, sentences);
+        let state = self.state.lock().unwrap();
+        state.done.get(&key).cloned()
     }
 
-    /// 上屏、换方案、换前文：存着的顺序对新语境没有意义了。
+    /// 上屏、换方案、换前文:存着的顺序对新语境没有意义了。
+    /// (结果表整体作废——键里有 context,留着也只是占内存。)
     pub fn clear(&self) {
-        self.state.done.lock().unwrap().clear();
-        *self.state.pending.lock().unwrap() = None;
+        let mut state = self.state.lock().unwrap();
+        state.done.clear();
+        if state.pending.is_some() {
+            state.pending = None;
+            self.wake.notify_one();
+        }
     }
 
-    /// 停工，等当前一批算完。
-    pub fn shutdown(&mut self) {
-        self.state.stopping.store(true, Ordering::Release);
-
-        if let Some(handle) = self.handle.take() {
+    /// 停工,等当前一批算完。单例故意不析构(C++ 同款注释:退出时操作系统收走),
+    /// 这个方法只给测试用。
+    pub fn shutdown_for_test(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.stopping = true;
+        state.pending = None;
+        self.wake.notify_all();
+        let handle = self.handle.lock().unwrap().take();
+        drop(state);
+        if let Some(handle) = handle {
             let _ = handle.join();
         }
     }
-}
 
-impl Drop for RescoreWorker {
-    fn drop(&mut self) {
-        self.shutdown();
+    /// 线程只在第一次真有活干时才起(调用方持有 state 锁)。
+    fn ensure_thread(&self, state: &mut WorkerState) {
+        let mut slot = self.handle.lock().unwrap();
+        if slot.is_some() || state.stopping {
+            return;
+        }
+        let weak = self.me.get().cloned();
+        *slot = Some(
+            std::thread::Builder::new()
+                .name("rescore-worker".into())
+                .spawn(move || Self::run(weak))
+                .expect("rescore worker 线程创建失败"),
+        );
     }
-}
 
-/// 简单的 n-gram 插值评分器(v1 占位，后续替换为神经模型)。
-pub struct NgramScorer {
-    /// 神经分权重 λ(0 = 纯 n-gram,1 = 纯神经)。
-    pub lambda: f64,
-}
-
-impl SentenceScorer for NgramScorer {
-    fn score(&self, _context: &str, sentences: &[String], static_scores: &[f64]) -> Vec<usize> {
-        // v1: 按 static_scores 降序排列(恒等重排——真正的神经打分后加)
-        let mut indices: Vec<usize> = (0..sentences.len()).collect();
-        indices.sort_by(|&a, &b| {
-            static_scores
-                .get(b)
-                .unwrap_or(&f64::NEG_INFINITY)
-                .partial_cmp(static_scores.get(a).unwrap_or(&f64::NEG_INFINITY))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        indices
+    fn run(me: Option<std::sync::Weak<RescoreWorker>>) {
+        loop {
+            // 取活:锁内只拿数据,打分在锁外做——它是最慢的一步,
+            // 占着锁会让按键路径上的 order_for 跟着等。
+            let job = {
+                let Some(weak) = me.as_ref() else { return };
+                let Some(owner) = weak.upgrade() else { return };
+                let mut state = owner.state.lock().unwrap();
+                loop {
+                    if state.stopping {
+                        return;
+                    }
+                    if let Some(job) = state.pending.take() {
+                        break job;
+                    }
+                    state = owner.wake.wait(state).unwrap();
+                }
+            };
+            let owner = me.as_ref().and_then(|w| w.upgrade());
+            let Some(owner) = owner else { return };
+            let order = owner.scorer.rerank(&job.context, &job.sentences, &job.static_scores);
+            let mut state = owner.state.lock().unwrap();
+            if state.done.len() >= MAX_RESULTS {
+                state.done.clear();
+            }
+            state.done.insert(job.key, order);
+            drop(state);
+            // 回到外圈前降级;worker 若已被丢弃(测试场景),下轮 upgrade 失败退出。
+        }
     }
 }
