@@ -130,11 +130,16 @@ pub struct ScriptWordsTranslation {
     /// `Projection`(规则链非 Clone),由翻译器在装配期对**去重后的 end**
     /// 各算一次(≤8 个),流内查表挂上。
     preedit_by_end: std::collections::HashMap<usize, String>,
+    /// 个人 n-gram 上下文(青简回传进神经体系的一环):`(上上个, 上一个)`
+    /// 词样记录。流内给系统词层候选加 bonus——个人历史影响 n-best 排序,
+    /// 从而影响神经重排看到的候选批次。
+    ngram_context: Option<(Option<String>, Option<String>)>,
 }
 
 impl ScriptWordsTranslation {
     /// `seg_start` 是段的**绝对**起点(候选跨度 = `seg_start + 桶键`);
     /// 收集器键是**段内相对**的 end(词图 0 基,见 `ScriptTranslator::query`)。
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         collector: crate::dict::dictionary::DictEntryCollector,
@@ -144,6 +149,7 @@ impl ScriptWordsTranslation {
         initial_quality: f64,
         convert: Option<Opencc>,
         preedit_by_end: std::collections::HashMap<usize, String>,
+        ngram_context: Option<(Option<String>, Option<String>)>,
     ) -> Self {
         // collector 键 = 段内相对 end(字节);直接当码长用。降序排。
         let mut groups: Vec<(usize, Vec<crate::dict::vocabulary::DictEntry>)> = collector
@@ -160,6 +166,7 @@ impl ScriptWordsTranslation {
             initial_quality,
             convert,
             preedit_by_end,
+            ngram_context,
         }
     }
 }
@@ -177,10 +184,22 @@ impl Translation for ScriptWordsTranslation {
             };
             // C++ `set_quality(exp(entry->weight) + initial +
             //                  entry->quality_len / full_code_length)`
-            let quality = self.quality_stride * (*code_len) as f64
+            let mut quality = self.quality_stride * (*code_len) as f64
                 + entry.weight.exp()
                 + entry.quality_len / self.full_len.max(1) as f64
                 + self.initial_quality;
+            // 个人 n-gram 加成(只加不减,没学过=0):系统词层也吃个人历史,
+            // 惯用搭配抬进 n-best 前排,神经重排据此裁决。
+            if let Some((before, prev)) = &self.ngram_context {
+                if let Ok(ngram) = crate::engine::user_ngram::global().lock() {
+                    quality += ngram.bonus(
+                        before.as_deref(),
+                        prev.as_deref(),
+                        &entry.text,
+                        crate::engine::user_ngram::DEFAULT_WEIGHT,
+                    );
+                }
+            }
             let mut c = Candidate::new(
                 "script",
                 self.start,

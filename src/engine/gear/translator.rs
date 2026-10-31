@@ -414,6 +414,7 @@ impl Translator for ScriptTranslator {
             self.options.initial_quality,
             None,
             preedit_by_end,
+            Some((ngram_before.clone(), ngram_prev.clone())),
         )));
 
         Some(Box::new(crate::engine::gear::translation::TieredTranslation::new(tiers)))
