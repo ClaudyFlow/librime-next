@@ -244,13 +244,21 @@ impl Engine {
     /// `Highlight` 虽也发 update，但高亮导航不改变输入串，因此这里只在**输入串真的变了**
     /// 时重算 —— 与 C++ 行为一致。
     pub fn process_key(&mut self, key: &KeyEvent) -> bool {
+        // CapsLock / NumLock / ScrollLock：**不能拦在处理器链之前**。
+        // 2026-11-01 早先为治"CapsLock 按一下吐一串 `yinamiao.........,......`"，
+        // 这里直接 `return false` —— 结果 `ascii_composer` 再也看不到 CapsLock，
+        // `ascii_composer/switch_key/Caps_Lock: clear` 形同虚设，大写锁定切不了中英
+        // （用户 2026-11-01 18:5x：「你的 shift 和大写锁定怎么不能切换中英」）。
+        // 正确做法：**照常过处理器链**（让 ascii_composer 切中英），只在"没被任何人吃掉"
+        // 时**不记历史、不上屏**，那串乱码就没了。
+        let is_lock_key = matches!(key.keycode, 0x14 | 0x90 | 0x91 | 0xFFE5);
         let input_before = self.context.input.clone();
         let mut result = self.run_processor_chain(key);
         // `ConcreteEngine::ProcessKey`（`engine.cc:180-182`）：**没被任何 processor
         // 吃掉**的按键记进提交历史 —— 空格、数字、退格这些"物理穿过"的键靠它，
         // 打完 `3` 再打 `.` 时 punctuator 才知道上一条是数字。合成键（key_binder
         // 代转的）不上屏，所以不记；C++ 同样用 `synthetic` 参数跳过。
-        if !result {
+        if !result && !is_lock_key {
             self.context.commit_history.push_key(key);
             // `engine.cc:193`：`unhandled_key_notifier` 是**无条件**发的（只在
             // `commit_history` 那里看 `synthetic`），所以合成键同样通知。
@@ -281,7 +289,10 @@ impl Engine {
             }
             self.refresh_component_conditions();
         }
-        if self.context.input != input_before {
+        // 删词这类操作输入没变、但末段已被 reopen，同样要重算（21:xx）。
+        let recompose = self.context.needs_recompose;
+        self.context.needs_recompose = false;
+        if self.context.input != input_before || recompose {
             // `Context::PushInput` 等发 `update_notifier` ⇒ `ConcreteEngine::OnContextUpdate`
             // ⇒ `Compose`。两条都在这里补：先通知组件，再重算。
             self.notify_context_update();
@@ -334,16 +345,23 @@ impl Engine {
         // raw/ascii 提交没有词条,天然被过滤)。多段组合 = 逐段一个词;
         // 整句提交暂按整条学,回切词(词典贪心)待补(1031日志)。
         {
-            let words: Vec<String> = elements
-                .iter()
-                .map(|entry| entry.text.clone())
-                .filter(|text| text.chars().count() > 1)
+            // ⚠️ 2026-11-01 第二次修：原来从 `elements`（词条）取 text，实测拿到的是
+            // **原始编码**（`user_ngram.tsv` 里出现 `u yinamiao 1`、`u ， 6`），
+            // 中文候选根本没学进去。改成从**提交历史**取文本（那才是真正上屏的中文），
+            // 并过滤标点/单字。
+            let words: Vec<String> = self
+                .context
+                .commit_history
+                .iter_rev()
+                .take(1)
+                .map(|record| record.text.clone())
+                .filter(|text| {
+                    let has_cjk = text.chars().any(|c| (0x4E00u32..=0x9FFFu32).contains(&(c as u32)));
+                    has_cjk && text.chars().count() > 1
+                })
                 .collect();
-            if words.len() >= 2
-                && let Ok(mut ngram) =
-                    crate::engine::user_ngram::global().lock()
-            {
-                ngram.learn_words(&words);
+            if !words.is_empty() {
+                crate::engine::user_ngram::learn_and_maybe_flush(&words);
             }
         }
         // 同样的借用规避：`memorize` 要 `&mut self`，先把列表取到局部
