@@ -18,6 +18,9 @@ pub struct Candidate {
     pub comment: String,
     /// 在 preedit 区替换输入串显示的文本，可选。
     pub preedit: String,
+    /// 整句候选的**分词成分**(poet 的 components,按序)。
+    /// 提交时逐词喂 n-gram(整句本身是一个词条,学习需要词级粒度)。
+    pub components: Vec<String>,
     /// 产出这条候选的词典词条（`DictEntry`）。
     ///
     /// C++ 的 `CommitEntry::elements` 是 `vector<const DictEntry*>`，
@@ -38,6 +41,7 @@ impl Candidate {
             text: text.into(),
             comment: String::new(),
             preedit: String::new(),
+            components: Vec::new(),
             entry: None,
         }
     }
@@ -53,6 +57,12 @@ impl Candidate {
     }
 
     /// 挂上产出这条候选的词典词条（学词要用）。
+    /// 挂整句分词成分(链式)。
+    pub fn with_components(mut self, components: Vec<String>) -> Self {
+        self.components = components;
+        self
+    }
+
     pub fn with_entry(mut self, entry: DictEntry) -> Self {
         self.entry = Some(entry);
         self

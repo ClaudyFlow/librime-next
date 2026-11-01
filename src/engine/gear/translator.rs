@@ -343,9 +343,18 @@ impl Translator for ScriptTranslator {
             return None;
         }
 
+        // ---- 层 1(先算):用户词典——命中整段就不出整句 ------------------
+        // C++ `IsExactMatch` 的判据含用户词典词条:打过十几遍的词组再打,
+        // 整句必须让位,否则学的永远上不了首选(用户实机报告的根因)。
+        let full_len = input.len();
+        let user = self.user_dict_candidates(input, segment.start, &|_| 0.0);
+        let user_covers_all = user.iter().any(|c| c.end - c.start == full_len);
+
         // ---- 层 0:整句(poet 组句,最多一条) ------------------------------
         let mut tiers: Vec<Box<dyn TranslationTrait>> = Vec::new();
-        if let Some(sentence) = self.best_sentence(input) {
+        if !user_covers_all
+            && let Some(sentence) = self.best_sentence(input)
+        {
             let consumed = sentence.end_pos;
             let preedit = self.build_preedit(input, consumed);
             let mut candidate = Candidate::new(
@@ -361,7 +370,14 @@ impl Translator for ScriptTranslator {
             .with_entry(crate::dict::vocabulary::DictEntry {
                 text: sentence.text.clone(),
                 ..Default::default()
-            });
+            })
+            .with_components(
+                sentence
+                    .components()
+                    .iter()
+                    .map(|(_, text, _)| text.clone())
+                    .collect(),
+            );
             if !preedit.is_empty() {
                 candidate = candidate.with_preedit(preedit);
             }

@@ -390,6 +390,18 @@ impl Context {
                 .as_ref()
                 .and_then(|menu| menu.candidate_at(segment.selected_index))
             {
+                // 整句候选:分词成分逐词进学习管道(n-gram 需要词粒度;
+                // 整句作为一个词条只会学出垃圾长词)。成分没有 code,
+                // 用户词典的 update_entry 会跳过它,不受影响。
+                if !candidate.components.is_empty() {
+                    for text in &candidate.components {
+                        elements.push(crate::dict::vocabulary::DictEntry {
+                            text: text.clone(),
+                            ..Default::default()
+                        });
+                    }
+                    continue;
+                }
                 if let Some(entry) = &candidate.entry {
                     elements.push(entry.clone());
                 }
