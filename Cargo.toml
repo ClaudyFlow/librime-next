@@ -197,6 +197,10 @@ windows = { version = "0.62", features = [
 fancy-regex = "0.20.0"
 
 [[example]]
+name = "gram_ab_test"
+path = "example/gram_ab_test.rs"
+
+[[example]]
 name = "lua_host_test"
 path = "example/lua_host_test.rs"
 

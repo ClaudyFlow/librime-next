@@ -449,6 +449,12 @@ pub fn create(
     config: &Value,
     roots: &[&Path],
 ) -> Option<Octagram> {
+    // 实验开关(2026-11-03):WEASEL_GRAM=off 时完全不加载语法模型——
+    // 验证"神经重排能否顶掉 453MB octagram"(组句靠词典权重+个人
+    // n-gram,终审靠字符级 transformer)。默认开启。
+    if std::env::var("WEASEL_GRAM").ok().as_deref() == Some("off") {
+        return None;
+    }
     let (grammar_config, language) = GrammarConfig::from_config(config)?;
     Octagram::load(grammar_config, &language, roots)
 }
