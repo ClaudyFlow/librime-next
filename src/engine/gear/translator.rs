@@ -241,7 +241,7 @@ impl ScriptTranslator {
     /// [`Self::best_sentence`] 保留(条件判定仍然用它)。
 
     /// 按 C++ 的前置条件算出一条最优整句；不满足条件时 `None`。
-    fn best_sentence(&self, input: &str) -> Option<Sentence> {
+    fn best_sentence(&mut self, input: &str) -> Option<Sentence> {
         let (graph, consumed) = self.build_graph(input)?;
         // 条件 1：至少两个起点（`script_translator.cc:497`）
         if graph.edges.len() < 2 {
@@ -322,19 +322,39 @@ impl ScriptTranslator {
     /// `PrepareForMakingSentence`（`script_translator.cc:705-722`）：
     /// 图里**每个起点**都查一次词表，合成 `WordGraph`。
     fn prepare_word_graph(
-        &self,
+        &mut self,
         graph: &SyllableGraph,
         _consumed: usize,
     ) -> WordGraph {
         let starts: Vec<usize> = graph.edges.keys().copied().collect();
         let mut word_graph = WordGraph::new();
         for start in starts {
-            let collector = self.dict.lookup_from_graph(
+            let mut collector = self.dict.lookup_from_graph(
                 graph,
                 start,
                 Some(&self.options.blacklist),
                 self.options.enable_completion,
             );
+            // 用户词典词条并入词图(2026-11-01,"神经网络算用户词"):
+            // 学过的词参与整句组装——用户词典权重随提交次数增长,
+            // 包含它的整句得分随之上升,打的遍数多了整句自然登顶。
+            if let Some(user_dict) = self.user_dict.as_mut()
+                && user_dict.loaded()
+                && let Some(user_collector) =
+                    user_dict.lookup(&self.dict, graph, start, 0, 0, 0.0)
+            {
+                for (end, iterator) in user_collector {
+                    let entries = iterator.into_entries().0;
+                    let bucket = collector.entry(end).or_default();
+                    for entry in entries {
+                        if !self.options.blacklist.contains(&entry.text)
+                            && !bucket.iter().any(|e| e.text == entry.text)
+                        {
+                            bucket.push(entry);
+                        }
+                    }
+                }
+            }
             if !collector.is_empty() {
                 word_graph.insert(start, collector);
             }
@@ -353,7 +373,7 @@ impl ScriptTranslator {
     }
 
     /// 取组句结果（多条），给 e2e 断言与调试用。
-    pub fn make_sentences(&self, input: &str) -> Vec<Sentence> {
+    pub fn make_sentences(&mut self, input: &str) -> Vec<Sentence> {
         let Some((graph, consumed)) = self.build_graph(input) else {
             return Vec::new();
         };
