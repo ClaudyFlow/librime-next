@@ -46,6 +46,14 @@ use super::db::{Db, DbAccessor};
 /// 共享的用户词典镜像：`db key` → `db value`（`UserDbValue::pack()` 出来的串）。
 pub type CacheMap = Arc<BTreeMap<String, String>>;
 
+/// 未提交写入的覆盖层（PR #1196 的 `pending_`）：`db key` → `db value`。
+///
+/// 学词时先写 db、再把新值记在这里；查询游标同时看 `map` 与 `pending`，
+/// `pending` 同键覆盖 `map`。下次查询（`ensure_cache`）会把 `pending` 折叠回 `map`
+/// 并清空——**永不出现"写不进去被迫丢弃整份镜像"** 的情况（这正是原 PR 用
+/// `pending_` 而非直接改共享镜像的原因）。
+pub type PendingMap = Arc<BTreeMap<String, String>>;
+
 /// 元数据键（`/tick` 之类）。元数据仍由 `Db` 自己管，不进缓存。
 fn is_metadata_key(key: &str) -> bool {
     key.is_empty() || key.starts_with('/')
@@ -98,72 +106,124 @@ pub fn build_cache(db: &dyn Db) -> Option<CacheMap> {
 /// 游标不持有 `&BTreeMap`（那样会把生命周期带进 `DfsState`），而是持有一份
 /// `Arc` + 一个"下一个键"的游标串，每次 `range` 定位：`O(log n)`，不分配迭代器。
 pub struct CacheScan {
+    /// 已提交镜像：`db key` → `db value`。
     map: CacheMap,
+    /// 未提交写入覆盖层（PR #1196 的 `pending_`）。
+    pending: PendingMap,
     /// 构造时给定的前缀（对应 `LevelDbAccessor::prefix`）。
     prefix: String,
-    /// 游标：`range(cursor..)` 的第一个键就是"当前记录"。
-    cursor: String,
-    /// `false` = 已经走到头（对应 LevelDB 迭代器失效），`next_record` 一律 `None`。
-    live: bool,
+    /// `map` 流游标：`range(map_cursor..)` 的第一个键即"当前记录"。
+    map_cursor: String,
+    map_live: bool,
+    /// `pending` 流游标：`range(pend_cursor..)` 的第一个键。
+    pend_cursor: String,
+    pend_live: bool,
 }
 
 impl CacheScan {
-    /// `LevelDbAccessor::new(..., prefix)`。
-    pub fn new(map: CacheMap, prefix: &str) -> Self {
+    /// `LevelDbAccessor::new(..., prefix)` + 注入 `pending_` 覆盖层。
+    pub fn new(map: CacheMap, pending: PendingMap, prefix: &str) -> Self {
         Self {
             map,
+            pending,
             prefix: prefix.to_string(),
-            cursor: prefix.to_string(),
-            live: true,
+            map_cursor: prefix.to_string(),
+            map_live: true,
+            pend_cursor: prefix.to_string(),
+            pend_live: true,
         }
     }
 
-    fn locate(&self) -> Option<(&String, &String)> {
-        if !self.live {
-            return None;
-        }
-        self.map
-            .range::<str, _>((Bound::Included(self.cursor.as_str()), Bound::Unbounded))
-            .next()
+    /// 严格大于 `key` 的最小键：`key + "\0"`（db key 不含 NUL，`\0` 比任何可打印字符都小，
+    /// 恰好落在 `key` 与任何以 `key` 为前缀的更长键之间）。
+    fn advance(cursor: &mut String, key: &str) {
+        cursor.clear();
+        cursor.push_str(key);
+        cursor.push('\0');
     }
 
-    /// `DbAccessor::Jump(key)`：只 seek，前缀不变。
+    /// `DbAccessor::Jump(key)`：只 seek，前缀不变；两流同时定位。
     pub fn jump(&mut self, key: &str) -> bool {
-        self.cursor.clear();
-        self.cursor.push_str(key);
-        self.live = true;
+        self.map_cursor.clear();
+        self.map_cursor.push_str(key);
+        self.map_live = true;
+        self.pend_cursor.clear();
+        self.pend_cursor.push_str(key);
+        self.pend_live = true;
         true
     }
 
-    /// `DbAccessor::GetNextRecord`。
+    /// `DbAccessor::GetNextRecord`：合并两流，按字节序取最小键；
+    /// pending 同键覆盖 map（两流都前进）；越过前缀则到头（不前进）。
     pub fn next_record(&mut self) -> Option<(String, String)> {
-        // `locate()` 借的是 `self.map`，先把要用的内容拷出来再动游标
-        // （`Arc` 里的内容不会动，但借用检查器看的是整个 `self`）。
-        let (key, value) = {
-            let (key, value) = self.locate()?;
-            (key.clone(), value.clone())
+        let m = if self.map_live {
+            self.map
+                .range::<str, _>((Bound::Included(self.map_cursor.as_str()), Bound::Unbounded))
+                .next()
+                .map(|(k, v)| (k.clone(), v.clone()))
+        } else {
+            None
+        };
+        let p = if self.pend_live {
+            self.pending
+                .range::<str, _>((Bound::Included(self.pend_cursor.as_str()), Bound::Unbounded))
+                .next()
+                .map(|(k, v)| (k.clone(), v.clone()))
+        } else {
+            None
+        };
+        let (key, value, from_pending, both_same) = match (m, p) {
+            (None, None) => {
+                self.map_live = false;
+                self.pend_live = false;
+                return None;
+            }
+            (Some((mk, mv)), None) => (mk, mv, false, false),
+            (None, Some((pk, pv))) => (pk, pv, true, false),
+            (Some((mk, mv)), Some((pk, pv))) => {
+                if pk.as_str() <= mk.as_str() {
+                    let both_same = pk == mk;
+                    (pk, pv, true, both_same)
+                } else {
+                    (mk, mv, false, false)
+                }
+            }
         };
         if !key.starts_with(&self.prefix) {
-            // 越过前缀：`live` 置否 = 到头（LevelDB 侧是迭代器走到尾）
-            self.live = false;
+            self.map_live = false;
+            self.pend_live = false;
             return None;
         }
-        let out = (key.clone(), value);
-        // 前进到"严格大于 key 的最小键"：追加 `\0` 即可 —— db key 里不含 NUL，
-        // 且 `\0` 比任何可打印字符都小，所以 `key + "\0"` 恰好落在 key 与
-        // 任何以 key 为前缀的更长键之间。
-        self.cursor.clear();
-        self.cursor.push_str(&key);
-        self.cursor.push('\0');
-        Some(out)
+        if from_pending {
+            Self::advance(&mut self.pend_cursor, &key);
+            if both_same {
+                Self::advance(&mut self.map_cursor, &key);
+            }
+        } else {
+            Self::advance(&mut self.map_cursor, &key);
+        }
+        Some((key, value))
     }
 
-    /// `DbAccessor::exhausted()`：当前位置还在前缀里吗？
+    /// `DbAccessor::exhausted()`：两流都越过前缀才到头。
     pub fn exhausted(&mut self) -> bool {
-        match self.locate() {
-            Some((key, _)) => !key.starts_with(&self.prefix),
+        let map_done = match self
+            .map
+            .range::<str, _>((Bound::Included(self.map_cursor.as_str()), Bound::Unbounded))
+            .next()
+        {
+            Some((k, _)) => !k.starts_with(&self.prefix),
             None => true,
-        }
+        };
+        let pend_done = match self
+            .pending
+            .range::<str, _>((Bound::Included(self.pend_cursor.as_str()), Bound::Unbounded))
+            .next()
+        {
+            Some((k, _)) => !k.starts_with(&self.prefix),
+            None => true,
+        };
+        map_done && pend_done
     }
 
     pub fn len(&self) -> usize {
@@ -230,7 +290,7 @@ mod tests {
             ("zhong \t中", "c=4"),
         ]);
         // prefix = "ni hao"：只能看到两条，第三条是 zhong，越界
-        let mut scan = CacheScan::new(map, "ni hao");
+        let mut scan = CacheScan::new(map, Arc::new(BTreeMap::new()), "ni hao");
         let mut seen = Vec::new();
         while let Some((key, _)) = scan.next_record() {
             seen.push(key);
@@ -251,11 +311,11 @@ mod tests {
         // 对齐 `LevelDbAccessor::Jump`：只 seek，**不换前缀**。
         // 所以从 "a" 出发 jump 到 "b" 之后，第一条记录不以 "a" 开头 → 立刻到头。
         let map = map_of(&[("a \t阿", "c=1"), ("b \t八", "c=2")]);
-        let mut scan = CacheScan::new(map.clone(), "a");
+        let mut scan = CacheScan::new(map.clone(), Arc::new(BTreeMap::new()), "a");
         assert!(scan.jump("b"));
         assert!(scan.next_record().is_none());
         // 但游标真的挪过去了：换成匹配的前缀再从同一位置继续就能扫到
-        let mut scan = CacheScan::new(map, "");
+        let mut scan = CacheScan::new(map, Arc::new(BTreeMap::new()), "");
         assert!(scan.jump("b"));
         assert_eq!(scan.next_record().map(|(k, _)| k), Some("b \t八".to_string()));
         assert!(scan.next_record().is_none(), "b 之后没有别的键了");
@@ -264,7 +324,7 @@ mod tests {
     #[test]
     fn empty_prefix_scans_everything() {
         let map = map_of(&[("a \t阿", "c=1"), ("b \t八", "c=2"), ("/tick", "9")]);
-        let mut scan = CacheScan::new(map.clone(), "");
+        let mut scan = CacheScan::new(map.clone(), Arc::new(BTreeMap::new()), "");
         let mut seen = Vec::new();
         while let Some((key, _)) = scan.next_record() {
             seen.push(key);
@@ -275,7 +335,7 @@ mod tests {
     #[test]
     fn exhausted_matches_leveldb_semantics() {
         let map = map_of(&[("a \t阿", "c=1")]);
-        let mut scan = CacheScan::new(map, "a");
+        let mut scan = CacheScan::new(map, Arc::new(BTreeMap::new()), "a");
         assert!(!scan.exhausted());
         scan.next_record();
         assert!(scan.exhausted());

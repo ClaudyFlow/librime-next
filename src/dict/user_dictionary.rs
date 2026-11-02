@@ -31,11 +31,12 @@
 //!   —— `DBL_EPSILON` 取 `f64::EPSILON`（2.220446049250313e-16）。
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use super::db::Db;
 use super::dictionary::Dictionary;
 use super::user_db::UserDbValue;
-use super::user_dict_cache::{build_cache, cache_enabled, CacheMap, EntryCursor};
+use super::user_dict_cache::{build_cache, cache_enabled, CacheMap, EntryCursor, PendingMap};
 use super::vocabulary::{
     Code, DictEntry, DictEntryFilterBinder, DictEntryList, Syllabary, SyllableId,
 };
@@ -295,6 +296,10 @@ pub struct UserDictionary {
     cache_gen: u64,
     /// 缓存建过但被判失效（有活跃游标时写不进去）的次数，仅用于诊断。
     cache_drops: u32,
+    /// #1196：未提交写入覆盖层（PR #1196 的 `pending_`）。
+    /// 学词先写 db、再记这里；查询游标同时看 `cache` 与 `pending`，下次查询折叠回 `cache`。
+    /// 用 `Arc` 共享：写覆盖层时若拿不到唯一引用（被某处借着）就 clone 一份，绝不丢词条。
+    pending: PendingMap,
 }
 
 impl UserDictionary {
@@ -308,6 +313,7 @@ impl UserDictionary {
             cache: None,
             cache_gen: 0,
             cache_drops: 0,
+            pending: Arc::new(BTreeMap::new()),
         }
     }
 
@@ -320,7 +326,13 @@ impl UserDictionary {
 
     /// 已镜像的条目数（0 = 缓存没建）。
     pub fn cache_len(&self) -> usize {
-        self.cache.as_ref().map(|map| map.len()).unwrap_or(0)
+        let base = self.cache.as_ref().map(|m| m.len()).unwrap_or(0);
+        let extra = self
+            .pending
+            .keys()
+            .filter(|k| !self.cache.as_ref().is_some_and(|m| m.contains_key(*k)))
+            .count();
+        base + extra
     }
 
     /// 缓存被丢弃过几次（诊断用；正常情况下应为 0）。
@@ -337,6 +349,17 @@ impl UserDictionary {
         }
         let generation = self.db.write_generation();
         if self.cache.is_some() && self.cache_gen == generation {
+            // 镜像仍有效：把 pending_ 折叠进来（内存里刚学的词立刻可见），无需重建。
+            // 镜像正被别的游标借着（极少触发）时不强求折叠：pending_ 保留，
+            // 下次查询（走 CacheScan 时带着 pending_ 覆盖层）照样可见。
+            if !self.pending.is_empty() {
+                if let Some(map) = self.cache.as_mut().and_then(|c| std::sync::Arc::get_mut(c)) {
+                    for (k, v) in &*self.pending {
+                        map.insert(k.clone(), v.clone());
+                    }
+                    self.pending = Arc::new(BTreeMap::new());
+                }
+            }
             return;
         }
         // 首次建镜像；或共享同一 db 的另一个实例写过 → 镜像和 tick 都过期了。
@@ -347,7 +370,13 @@ impl UserDictionary {
 
     pub fn warm_cache(&mut self) {
         self.cache = build_cache(self.db.as_ref());
+        if let Some(map) = self.cache.as_mut().and_then(|c| std::sync::Arc::get_mut(c)) {
+            for (k, v) in &*self.pending {
+                map.insert(k.clone(), v.clone());
+            }
+        }
         self.cache_gen = self.db.write_generation();
+        self.pending = Arc::new(BTreeMap::new());
     }
 
     /// 丢弃镜像，下次查询（或下次 [`Self::load`]）重建。
@@ -358,10 +387,15 @@ impl UserDictionary {
     pub fn invalidate_cache(&mut self) {
         self.cache = None;
         self.cache_gen = 0;
+        self.pending = Arc::new(BTreeMap::new());
     }
 
     /// 取一条记录的原始值：优先缓存，没有再打 db。
+    /// 取一条记录的原始值：优先 `pending_`（最新未提交写入），其次镜像，最后打 db。
     fn fetch_raw(&self, key: &str) -> Option<String> {
+        if let Some(v) = self.pending.get(key) {
+            return Some(v.clone());
+        }
         match self.cache.as_ref() {
             Some(map) => map.get(key).cloned(),
             None => self.db.fetch(key),
@@ -373,19 +407,23 @@ impl UserDictionary {
     /// `Arc::get_mut` 失败 = 此刻还有别的游标借着这份镜像（同一次查询里持有
     /// [`EntryCursor::Cache`]）。这时**整份丢弃**、下次查询重建，绝不留下写不进去的
     /// 脏镜像 —— 宁可多扫一遍 db，也不能让"学过的词查不到"。
+    /// #1196 写路径：db 写成功后把新值记进 `pending_` 覆盖层。
+    ///
+    /// 不立即改 `cache` 镜像，而是等下次查询 [`Self::ensure_cache`] 折叠进来——
+    /// 这样**永不出现"写不进去被迫丢弃整份镜像"** 的情况（这正是原 PR 用 `pending_`
+    /// 而非直接改共享镜像的原因）。`pending_` 与 db 同一键空间，绝不分叉。
+    ///
+    /// `pending_` 是共享 `Arc`：能拿到唯一引用就原地插；被别处借着就 clone 一份新的
+    /// 再插，绝不丢内存里的词条。
     fn cache_update(&mut self, key: &str, value: &str) {
-        let Some(cache) = self.cache.as_mut() else {
-            return;
-        };
-        match std::sync::Arc::get_mut(cache) {
+        match std::sync::Arc::get_mut(&mut self.pending) {
             Some(map) => {
                 map.insert(key.to_string(), value.to_string());
-                // 这次写已经反映在镜像里，把代次对齐，免得下次查询白重建一遍。
-                self.cache_gen = self.db.write_generation();
             }
             None => {
-                self.cache = None;
-                self.cache_drops += 1;
+                let mut map = (*self.pending).clone();
+                map.insert(key.to_string(), value.to_string());
+                self.pending = Arc::new(map);
             }
         }
     }
@@ -506,7 +544,7 @@ impl UserDictionary {
             Some(map) => {
                 // 与 IO 路径同款：`query("")` 的 prefix 是空串，靠调用方自己判断边界
                 let mut scan =
-                    super::user_dict_cache::CacheScan::new(map, "");
+                    super::user_dict_cache::CacheScan::new(map, self.pending.clone(), "");
                 scan.jump(" ");
                 EntryCursor::Cache(scan)
             }
@@ -690,7 +728,11 @@ impl UserDictionary {
 
         // #1196：有镜像就走内存前缀扫，否则照旧开 LevelDB 游标
         let mut cursor = match self.cache.clone() {
-            Some(map) => EntryCursor::Cache(super::user_dict_cache::CacheScan::new(map, input)),
+            Some(map) => EntryCursor::Cache(super::user_dict_cache::CacheScan::new(
+                map,
+                self.pending.clone(),
+                input,
+            )),
             None => match self.db.query(input) {
                 Some(accessor) => EntryCursor::Db(accessor),
                 None => return (0, Some(K_END.to_string())),

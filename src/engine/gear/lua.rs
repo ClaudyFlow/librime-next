@@ -4,11 +4,12 @@
 //! 布局:`<数据根>/lua/<插件名>/`——每个插件独立文件夹,主脚本 `rime.lua`
 //! 在文件夹内(与 rime-lua 社区习惯对齐,又满足"套文件夹")。
 //!
-//! 第二增量(下棒):mlua(lua54 vendored)嵌 VM,三类组件
-//! (LuaProcessor/LuaTranslator/LuaFilter)实现我们的 trait,按目标脚本
-//! 最小集做 rime-lua API 兼容面(巧码:*enter_code_space + 6 translator)。
-//! 本模块只做:**发现**与**登记**——谁在哪个文件夹、暴露哪些组件名,
-//! VM 接入后由同一张注册表实例化。
+//! 第二增量(2026-11-03 本提交):mlua VM 基座 + **translator 兼容**。
+//! rime-lua 翻译器约定:`function translator(input, seg, env)` 返回
+//! Candidate 表(数组)。Candidate 用 5 参构造(type,start,end,text,comment)。
+//! env = { engine = { context = { input, commit_text, clear }, schema = {} },
+//!         name_space = 组件名, first_time = true }。
+//! processor/filter 兼容面(第三增量)按巧码脚本逐个补。
 
 use std::path::{Path, PathBuf};
 
@@ -153,3 +154,233 @@ mod tests {
         assert!(collect_required_components(&none).is_empty());
     }
 }
+
+
+// ── 第二增量:VM 基座 ─────────────────────────────────────────────
+
+use mlua::{Lua, Table};
+
+/// 进程级 Lua VM 单例(一个 VM 服务所有插件的组件)。
+pub struct LuaHost {
+    pub lua: Lua,
+    /// 已登记的翻译器组件:`组件名 → 脚本路径`(rime.lua 或同名 .lua)。
+    pub translators: std::collections::HashMap<String, PathBuf>,
+}
+
+impl LuaHost {
+    /// 启动 VM:package.path 指向各插件文件夹,扫描组件。
+    pub fn boot(data_roots: &[PathBuf]) -> mlua::Result<Self> {
+        let lua = Lua::new();
+        let plugins = discover_plugins(data_roots);
+        // package.path:每个插件文件夹都能 require
+        let mut paths: Vec<String> = Vec::new();
+        let mut translators = HashMap::new();
+        for plugin in &plugins {
+            let folder_str = plugin.folder.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+            paths.push(format!("{folder_str}/?.lua"));
+            for script in &plugin.scripts {
+                // 约定:脚本名 = 组件名(rime-lua 的 `*名字` = 同名 .lua)
+                let stem = script.strip_suffix(".lua").unwrap_or(script);
+                let path = plugin.folder.join(script);
+                translators
+                    .entry(stem.to_string())
+                    .or_insert_with(|| path.clone());
+                if script == "rime.lua" {
+                    // rime.lua 里的组件按需注册(第三增量解析)
+                }
+            }
+        }
+        let globals = lua.globals();
+        let package: Table = globals.get("package")?;
+        let existing: String = package.get("path")?;
+        package.set("path", format!("{};{}", paths.join(";"), existing))?;
+        Ok(Self { lua, translators })
+    }
+
+    /// 加载脚本并取回翻译器函数:脚本文件 **return 一个函数**
+    /// (`local function foo(...) end; return foo`),要先调用 chunk
+    /// 拿到那个返回的函数——直接把 chunk 包进协程会只跑一次就结束。
+    fn translator_fn(&self, component: &str) -> mlua::Result<mlua::Function> {
+        let Some(path) = self.translators.get(component) else {
+            return Err(mlua::Error::external(format!("组件 {component} 未找到")));
+        };
+        let source = std::fs::read_to_string(path)?;
+        let chunk_name = format!("@{}", path.display());
+        let chunk_fn = self.lua.load(&source).set_name(chunk_name).into_function()?;
+        let returned: mlua::Value = chunk_fn.call(())?;
+        match returned {
+            mlua::Value::Function(f) => Ok(f),
+            _ => Ok(chunk_fn), // 脚本没 return(直接定义全局)——退回 chunk
+        }
+    }
+
+    /// 跑一个 lua 翻译器:input/seg 包装成 rime-lua 形态,收回候选表。
+    /// 返回 (text, comment) 列表——调用方转成 Candidate。
+    /// `config` = 方案配置树(env.engine.schema.config:get_string 的后端)。
+    pub fn run_translator(
+        &self,
+        component: &str,
+        input: &str,
+        seg_start: usize,
+        seg_end: usize,
+        context_input: &str,
+        config: &serde_json::Value,
+    ) -> Vec<(String, String)> {
+        let Ok(func) = self.translator_fn(component) else {
+            return Vec::new();
+        };
+        let lua = &self.lua;
+        // env.engine.context.input(只读);commit_text/clear 下一增量接回调
+        let (Some(env), Some(engine), Some(context), Some(seg), Some(collected)) = (
+            lua.create_table().ok(),
+            lua.create_table().ok(),
+            lua.create_table().ok(),
+            lua.create_table().ok(),
+            lua.create_table().ok(),
+        ) else {
+            return Vec::new();
+        };
+        let _ = context.set("input", context_input.to_string());
+        let _ = context.set("input", context_input.to_string());
+        let _ = engine.set("context", context);
+        // schema.config:get_string(path):配置树点路径查询
+        let schema = lua.create_table().ok();
+        if let Some(schema) = &schema {
+            let config_table = lua.create_table().ok();
+            if let Some(config_table) = &config_table {
+                let cfg = config.clone();
+                let get_string = lua
+                    .create_function(move |_, path: String| {
+                        let pointer = format!(
+                            "/{}",
+                            path.split('/').collect::<Vec<_>>().join("/")
+                        );
+                        Ok(cfg
+                            .pointer(&pointer)
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()))
+                    })
+                    .ok();
+                if let Some(get_string) = get_string {
+                    let _ = config_table.set("get_string", get_string);
+                }
+            }
+            if let Some(config_table) = &config_table {
+                let _ = schema.set("config", config_table.clone());
+            }
+            let _ = engine.set("schema", schema.clone());
+        }
+        let _ = env.set("engine", engine);
+        let _ = env.set("name_space", component.to_string());
+        let _ = env.set("first_time", false);
+        let _ = seg.set("start", seg_start);
+        let _ = seg.set("_end", seg_end);
+        let _ = seg.set("start_pos", seg_start);
+        let _ = seg.set("_end_pos", seg_end);
+        let collected_clone = collected.clone();
+        // 参数放宽为 Value:巧码脚本会传 number/nil(如 numberPart[i][1] 可能是数字)
+        let candidate_fn = lua
+            .create_function(
+                move |lua, (ctype, start, end, text, comment): (
+                    mlua::Value,
+                    usize,
+                    usize,
+                    mlua::Value,
+                    mlua::Value,
+                )| {
+                    let stringify = |value: &mlua::Value| -> String {
+                        match value {
+                            mlua::Value::String(str) => {
+                                str.to_string_lossy().to_string()
+                            }
+                            mlua::Value::Integer(i) => i.to_string(),
+                            mlua::Value::Number(n) => n.to_string(),
+                            _ => String::new(),
+                        }
+                    };
+                    let t = lua.create_table()?;
+                    t.set("type", stringify(&ctype))?;
+                    t.set("start", start)?;
+                    t.set("_end", end)?;
+                    t.set("text", stringify(&text))?;
+                    t.set("comment", stringify(&comment))?;
+                    collected_clone.set(collected_clone.raw_len() + 1, t.clone())?;
+                    Ok(t)
+                },
+            )
+            .ok();
+        let Some(candidate_fn) = candidate_fn else { return Vec::new() };
+        let _ = lua.globals().set("Candidate", candidate_fn);
+        // rime-lua 翻译器用 **yield(Candidate(...))** 协程语义(不是 return):
+        // 把脚本函数包进协程,resume 循环里收每一批 yield 出来的候选。
+        let Ok(thread) = lua.create_thread(func) else { return Vec::new() };
+        // 全局 yield = 协程让位(脚本里的裸 yield 调用)
+        if let Ok(coroutine) = lua.globals().get::<Table>("coroutine")
+            && let Ok(yield_fn) = coroutine.get::<mlua::Function>("yield")
+        {
+            let _ = lua.globals().set("yield", yield_fn);
+        }
+        let mut result = Vec::new();
+        // 首次 resume 必须带上 (input, seg, env)——协程体的三个参数
+        let lua_string_input = match lua.create_string(input) {
+            Ok(value) => value,
+            Err(_) => return Vec::new(),
+        };
+        let mut pending: Option<mlua::MultiValue> = Some(mlua::MultiValue::from_vec(vec![
+            mlua::Value::String(lua_string_input),
+            mlua::Value::Table(seg),
+            mlua::Value::Table(env),
+        ]));
+        loop {
+            let resume = match pending.take() {
+                Some(args) => thread.resume::<mlua::MultiValue>(args),
+                None => thread.resume::<mlua::MultiValue>(()),
+            };
+            match resume {
+                Ok(values) => {
+                    let mut finished = true;
+                    for value in values {
+                        match value {
+                            mlua::Value::Table(t) => {
+                                // yield 出来的候选表
+                                if let Ok(text) = t.get::<String>("text") {
+                                    let comment =
+                                        t.get::<String>("comment").unwrap_or_default();
+                                    result.push((text, comment));
+                                }
+                                finished = false;
+                            }
+                            _ => finished = false,
+                        }
+                    }
+                    if finished {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    // 协程错误:脚本异常(正常返回后 resume 会 dead coroutine,
+                    // 那是正常结束;其余是脚本错误,打出来)
+                    let text = error.to_string();
+                    if !text.contains("cannot resume dead coroutine") {
+                        // 带 traceback 定位脚本行号
+                        let trace = match lua.globals().raw_get::<Table>("debug") {
+                            Ok(debug) => match debug.raw_get::<mlua::Function>("traceback") {
+                                Ok(tb) => tb
+                                    .call::<String>((text.clone(),))
+                                    .unwrap_or_else(|_| text.clone()),
+                                Err(_) => String::new(),
+                            },
+                            Err(_) => String::new(),
+                        };
+                        eprintln!("[lua] {component} 协程错误:\n{trace}");
+                    }
+                    break;
+                }
+            }
+        }
+        let _ = collected;
+        result
+    }
+}
+
+use std::collections::HashMap;

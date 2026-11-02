@@ -80,6 +80,9 @@ pub fn filter_dict_entry(entry: &crate::dict::vocabulary::DictEntry) -> bool {
 pub struct CharsetFilter {
     /// `filter/tags`：空 = 对所有段生效（`TagMatching::TagsMatch`）。
     tags: Vec<String>,
+    /// 组件命名空间（`Ticket::name_space`）。端口里 `charset_filter` / `cjk_minifier`
+    /// 都挂在 `engine/filters` 下，这个值恒为 `"filter"`。
+    name_space: String,
 }
 
 impl CharsetFilter {
@@ -95,11 +98,17 @@ impl CharsetFilter {
                     .collect()
             })
             .unwrap_or_default();
-        Self { tags }
+        Self {
+            tags,
+            name_space: name_space.to_string(),
+        }
     }
 
     pub fn new(tags: Vec<String>) -> Self {
-        Self { tags }
+        Self {
+            tags,
+            name_space: String::new(),
+        }
     }
 }
 
@@ -114,15 +123,24 @@ impl Filter for CharsetFilter {
         translation: Box<dyn Translation>,
         _candidates: &mut Vec<Candidate>,
     ) -> Box<dyn Translation> {
-        // 主命名空间 + 用户开了 `extended_charset` ⇒ 整个过滤器失效。
-        // 非默认命名空间的用法 C++ 直接报错（"charset parameter is unsupported
-        // by basic charset_filter"），这里按"不生效"处理。
-        if ctx.get_option("extended_charset") {
-            return translation;
+        // 端口移植 PR #1217 / #13faefe：命名空间判定。
+        // 原版旧逻辑用 `name_space_.empty()`，导致挂在默认 `"filter"` 命名空间下的
+        // `charset_filter` 被误判为"非默认"而失效，还刷一堆 "unsupported" 报错。
+        // 修复后：空命名空间或 `"filter"` 都算默认命名空间，过滤器正常生效；
+        // 其它命名空间（自定义用法）C++ 直接报 "charset parameter is unsupported
+        // by basic charset_filter" 并原样放行。
+        let default_ns = self.name_space.is_empty() || self.name_space == "filter";
+        if default_ns && !ctx.get_option("extended_charset") {
+            return Box::new(FilteredTranslation::new(translation, |candidate| {
+                filter_text(&candidate.text)
+            }));
         }
-        Box::new(FilteredTranslation::new(translation, |candidate| {
-            filter_text(&candidate.text)
-        }))
+        if !default_ns {
+            eprintln!(
+                "[charset_filter] charset parameter is unsupported by basic charset_filter"
+            );
+        }
+        translation
     }
 }
 
@@ -185,6 +203,24 @@ mod tests {
             vec![cand("你好"), cand("\u{206c8}")],
         );
         assert_eq!(out.len(), 2, "开了开关就不过滤");
+    }
+
+    #[test]
+    fn non_default_namespace_passes_through_and_warns() {
+        // PR #1217 / #13faefe：非默认命名空间的用法 C++ 原样放行并报错，
+        // 这里按"不过滤"处理（端口用 eprintln 告警）。
+        let mut filter = CharsetFilter {
+            tags: Vec::new(),
+            name_space: "cjk_minifier_custom".to_string(),
+        };
+        let out = filtered(
+            &mut filter,
+            &Context::new(),
+            vec![cand("你好"), cand("\u{206c8}")],
+        );
+        // 不过滤：超纲候选也原样保留
+        let texts: Vec<&str> = out.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["你好", "\u{206c8}"]);
     }
 
     #[test]

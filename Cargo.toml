@@ -196,6 +196,10 @@ windows = { version = "0.62", features = [
 ] }
 fancy-regex = "0.20.0"
 
+[[example]]
+name = "lua_host_test"
+path = "example/lua_host_test.rs"
+
 [[test]]
 name = "mmap_verify"
 path = "test/mmap_verify.rs"
