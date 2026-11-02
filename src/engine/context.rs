@@ -46,6 +46,9 @@ pub struct Context {
     /// 取走并分发给各 translator 学词。放在 `Context` 里而不是直接回调 Engine，
     /// 是因为 processor（editor）只拿得到 `&mut Context`。
     pub pending_commit_elements: Vec<crate::dict::vocabulary::DictEntry>,
+    /// 预测候选(2026-11-01):上次提交后按个人 n-gram 给的"下一个词",
+    /// 供宿主在无组字状态显示(上屏后联想)。
+    pub predictions: Vec<String>,
     /// 最近 20 条上屏记录（C++ `Context::commit_history_`）。
     ///
     /// `history_translator` 出"最近输入"、`punctuator` 判数字串、

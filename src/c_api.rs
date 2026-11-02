@@ -147,6 +147,10 @@ pub struct RimeContext {
     pub menu: RimeMenu,
     pub commit_text_preview: *mut c_char,
     pub select_labels: *mut *mut c_char,
+    /// 预测候选(上屏后联想,2026-11-01):null 结尾的字符串数组;无组字时
+    /// 宿主可显示。数量 = predictions_len。
+    pub predictions: *mut *mut c_char,
+    pub predictions_len: c_int,
 }
 
 #[repr(C)]
@@ -773,6 +777,30 @@ unsafe extern "C" fn rime_get_context(id: RimeSessionId, ctx: *mut RimeContext) 
     (*ctx).menu.select_keys = cstr_dup("123456789");
     (*ctx).commit_text_preview = std::ptr::null_mut();
     (*ctx).select_labels = std::ptr::null_mut();
+    // 预测:无组字时才有意义(有组字时清空,避免和候选混淆)
+    if g.sessions
+        .get(&id)
+        .and_then(|session| session.context())
+        .map(|context| context.input.is_empty())
+        .unwrap_or(true)
+    {
+        let predictions = g
+            .sessions
+            .get(&id)
+            .and_then(|session| session.context())
+            .map(|context| context.predictions.clone())
+            .unwrap_or_default();
+        (*ctx).predictions_len = predictions.len() as c_int;
+        let mut arr: Vec<*mut c_char> = predictions
+            .iter()
+            .map(|text| cstr_dup(text))
+            .collect();
+        arr.push(std::ptr::null_mut());
+        (*ctx).predictions = Box::into_raw(arr.into_boxed_slice()) as *mut *mut c_char;
+    } else {
+        (*ctx).predictions_len = 0;
+        (*ctx).predictions = std::ptr::null_mut();
+    }
     1
 }
 
@@ -795,6 +823,15 @@ unsafe extern "C" fn rime_free_context(ctx: *mut RimeContext) {
         (*ctx).menu.candidates = std::ptr::null_mut();
     }
     cstr_free((*ctx).commit_text_preview);
+    if !(*ctx).predictions.is_null() {
+        let n = (*ctx).predictions_len.max(0) as usize;
+        let arr = std::slice::from_raw_parts_mut((*ctx).predictions, n + 1);
+        for p in arr.iter_mut() {
+            cstr_free(*p);
+        }
+        drop(Box::from_raw((*ctx).predictions as *mut *mut c_char));
+        (*ctx).predictions = std::ptr::null_mut();
+    }
 }
 
 unsafe extern "C" fn rime_get_status(id: RimeSessionId, status: *mut RimeStatus) -> Bool {

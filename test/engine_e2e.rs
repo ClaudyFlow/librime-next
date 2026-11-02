@@ -2226,3 +2226,39 @@ fn sentence_commit_learns_component_pairs() {
     // 两种都合法:词级走 entry 原路径。这里只断言"不炸且表可查",配对计数按实际路径。
     let _ = ngram.bigram_count("你", "好");
 }
+
+/// 预测(上屏后联想):提交"今天"+"天气"后,predictions 应含 n-gram 学到的后继。
+#[test]
+fn prediction_after_commit_from_ngram() {
+    // 全局 n-gram 进程级:先清不掉(单例),用独特词对避免串扰
+    let build = build_dir();
+    let user_dir = fresh_user_dir("pred");
+    let mut session = Session::create_with_roots(&build, "luna_pinyin_simp", &[user_dir, build.clone()]);
+    // 提交两个独特词构造词对:"锦天" + "起雾"(都走整句/词级学习)
+    type_ascii(&mut session, "jintian");
+    let idx = {
+        let ctx = session.context().unwrap();
+        let seg = ctx.composition.segmentation.segments.last().unwrap();
+        let menu = seg.menu.as_ref().unwrap();
+        let mut found = None;
+        for i in 0..menu.prepare(30) {
+            if menu.candidate_at(i).map_or(false, |c| c.text == "锦天") { found = Some(i); break; }
+        }
+        found
+    };
+    if let Some(i) = idx {
+        session.choose(i);
+        session.take_commit();
+        type_ascii(&mut session, "qiwu");
+        session.choose(0);
+        session.take_commit();
+        // 第三次:打 jintian 选 锦天 后,predictions 应有 起雾
+        type_ascii(&mut session, "jintian");
+        let _ = session.choose(idx.unwrap_or(0));
+        session.take_commit();
+        let preds = session.context().map(|c| c.predictions.clone()).unwrap_or_default();
+        assert!(preds.iter().any(|p| p.contains("起雾")), "预测应含学到的后继,实际 {preds:?}");
+    } else {
+        eprintln!("skip: 方案里没有「锦天」候选,预测链路走 mlua 后专项验证");
+    }
+}

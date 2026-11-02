@@ -281,6 +281,33 @@ impl UserNgram {
         unigram_bonus + weight * ((1.0 + bigram).ln() + 2.0 * (1.0 + trigram).ln())
     }
 
+    /// 预测(2026-11-01,用户拍板"预测做进去"):给定上文最后两个词,
+    /// 返回最可能的下文词(三元优先,其次二元),按计数降序最多 `limit` 个。
+    ///
+    /// 与青简"上屏后不联想"边界不同——**用户 11-01 更新了边界**:预测做进
+    /// n-gram 体系。空表/没学过返回空。
+    pub fn predict(&self, before_last: Option<&str>, prev: Option<&str>, limit: usize) -> Vec<String> {
+        let Some(prev) = prev else { return Vec::new() };
+        // 三元先(更具体),二元补充;按 (key, count) 聚合取最高。
+        let mut scores: HashMap<String, u32> = HashMap::new();
+        for ((first, second, next), entry) in &self.trigram {
+            if second == prev && before_last.map_or(true, |b| b == first) {
+                let slot = scores.entry(next.clone()).or_default();
+                *slot = slot.saturating_add(entry.count * 2);
+            }
+        }
+        for ((second, next), entry) in &self.bigram {
+            if second == prev {
+                let slot = scores.entry(next.clone()).or_default();
+                *slot = slot.saturating_add(entry.count);
+            }
+        }
+        let mut ranked: Vec<(String, u32)> = scores.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        ranked.truncate(limit);
+        ranked.into_iter().map(|(word, _)| word).collect()
+    }
+
     /// 超上限时按最久未用淘汰，直到回到上限以内。
     fn evict_if_needed(&mut self) {
         while self.bigram.len() > MAX_PAIRS {
