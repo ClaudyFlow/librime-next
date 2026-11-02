@@ -32,6 +32,7 @@ pub mod filter;
 pub mod grammar;
 pub mod history_translator;
 pub mod key_binder;
+pub mod lua;
 pub mod key_binding;
 pub mod matcher;
 pub mod navigator;
