@@ -31,6 +31,9 @@ pub struct Context {
     pub composition: Composition,
     /// 已确认的前缀文本（逐音节确认时累积，如「你」；整段提交时拼接）。
     pub committed_prefix: String,
+    /// 已确认前缀对应的**音节编码**。逐音节确认时 `committed_prefix` 只留文本，
+    /// 编码不留就永远拼不出整词（整词学不成 ⇒ 打几遍也不进首选）。
+    pub committed_code: Vec<crate::dict::vocabulary::SyllableId>,
     /// 待提交文本（`commit()` 产生，`Session` 取走）。
     pub commit_text: Option<String>,
     /// 每页候选数（来自 schema `menu/page_size`，供 c_api 读）。
@@ -48,6 +51,11 @@ pub struct Context {
     /// `history_translator` 出"最近输入"、`punctuator` 判数字串、
     /// `table_translator` 拼短语去编码，都读这一份。
     pub commit_history: crate::engine::commit_history::CommitHistory,
+    /// 删词等"输入没变但候选要重算"的操作置它（`Engine` 下一轮消费后清掉）。
+    ///
+    /// 背景：`Engine::process_key` 只在 `input` 变化时 `compose()`，而删词不改变
+    /// 输入 —— 用户按 Ctrl+Delete 后菜单纹丝不动，看着像没删掉（2026-11-01）。
+    pub needs_recompose: bool,
 }
 
 impl Context {
@@ -138,6 +146,7 @@ impl Context {
         self.input.clear();
         self.caret_pos = 0;
         self.committed_prefix.clear();
+        self.committed_code.clear();
         self.composition.segmentation.segments.clear();
         self.composition.segmentation.input.clear();
     }
@@ -173,13 +182,18 @@ impl Context {
             text.push_str(&cand.text);
             // 提交前收词条 / 记历史（`clear()` 会把 segmentation 清掉）
             self.collect_commit_elements();
+            self.push_whole_commit_phrase(&text);
             self.collect_commit_history();
             self.clear();
             self.commit_text = Some(text.clone());
             Some(SelectResult::Committed(text))
         } else {
-            // 部分覆盖：前缀入账，截掉已确认的输入，续组字
+            // 部分覆盖：前缀入账，截掉已确认的输入，续组字。
+            // 编码必须一起记：否则整段提交时拼不出整词编码，学不出词组。
             self.committed_prefix.push_str(&cand.text);
+            if let Some(entry) = &cand.entry {
+                self.committed_code.extend_from_slice(&entry.code);
+            }
             self.input.drain(..cand.end);
             self.caret_pos = self.input.len();
             Some(SelectResult::Continued)
@@ -259,10 +273,29 @@ impl Context {
     }
 
     pub fn delete_candidate(&mut self, index: usize) -> bool {
+        // 2026-11-01：**删词**。把该候选记进用户 n-gram 的黑名单（永不抬分 + 压后），
+        // 这样"打错一次"的词不会因为后来误选几次又冒到首选。
+        let text = self
+            .composition
+            .back()
+            .and_then(|seg| seg.menu.as_ref())
+            .and_then(|menu| menu.candidate_at(index))
+            .map(|candidate| candidate.text);
+        if let Some(text) = text {
+            if let Ok(mut ngram) = crate::engine::user_ngram::global().lock() {
+                ngram.penalize(&text);
+                let _ = ngram.save(&crate::engine::user_ngram::store_path());
+            }
+        }
         let Some(seg) = self.composition.back_mut() else {
             return false;
         };
         seg.selected_index = index;
+        // 把这段退回"待翻译"并丢掉旧菜单：下一轮 `compose` 会重新查一次，
+        // 被拉黑的词这次就不再出现（否则用户看不到任何变化）。
+        self.needs_recompose = true;
+        seg.reopen(self.caret_pos);
+        seg.menu = None;
         true
     }
 
@@ -360,11 +393,60 @@ impl Context {
             return false;
         }
         let text = self.get_commit_text();
+        // 2026-11-01：**上屏就学**（原来 learn_commit 从没被调用过 ⇒ 用户打十几遍也不进首选）。
+        // 一次提交常常只有一个词，交给 learn_commit 带上最近窗口凑二元组。
+        if !text.is_empty() {
+            crate::engine::user_ngram::learn_and_maybe_flush(&[text.clone()]);
+        }
         self.collect_commit_elements();
+        // 逐段拼出来的整段 → 额外把**整段**按整段音节学成一个词组。
+        //
+        // 场景（2026-11-02 用户报「只能一个个单字选，打几遍还是不进首选」）：
+        // 词典里没有这个词，候选里只有单字，用户只能 一个字一个字 选完上屏。
+        // 此时 `elements` 是 4 个单字词条（`yi 伊` / `bu 布` / …），各学各的，
+        // **整词 伊布替尼 永远不会出现在候选里** ⇒ 打多少遍都学不会。
+        // 这里把各段音标拼起来、文本拼起来，再学一条整段词条，下次就能直接出词。
+        //
+        // 只有 ≥2 段才补：单段提交本来就学的是那个词条，不必重复。
+        self.push_whole_commit_phrase(&text);
         self.collect_commit_history();
         self.clear();
         self.commit_text = Some(text);
         true
+    }
+
+    /// 把这次提交的**整段文本**按整段音节再学成一个词条（见 [`Self::commit`]）。
+    ///
+    /// 两种来源都要覆盖：
+    /// - 逐音节确认（`你` → 续组字 → `好`）：前缀编码在 `committed_code`，
+    ///   末段词条在 `pending_commit_elements`；
+    /// - 整段一次选（`以不踢你`）：`pending_commit_elements` 里已是完整词条，
+    ///   这种情况 `elements.len() == 1` 且没有前缀，**不重复学**。
+    fn push_whole_commit_phrase(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let has_prefix = !self.committed_code.is_empty();
+        if !has_prefix && self.pending_commit_elements.len() < 2 {
+            return;
+        }
+        let mut syllables = self.committed_code.clone();
+        for element in &self.pending_commit_elements {
+            if element.code.is_empty() {
+                // 有一段没音标（整句成分等），拼不出完整编码，放弃整段学习。
+                return;
+            }
+            syllables.extend_from_slice(&element.code);
+        }
+        if syllables.is_empty() {
+            return;
+        }
+        self.pending_commit_elements
+            .push(crate::dict::vocabulary::DictEntry {
+                text: text.to_string(),
+                code: crate::dict::vocabulary::Code::from_slice(&syllables),
+                ..Default::default()
+            });
     }
 
     /// C++ `ConcreteEngine::OnCommit(ctx)` 的第一件事
@@ -394,6 +476,14 @@ impl Context {
                 // 整句作为一个词条只会学出垃圾长词)。成分没有 code,
                 // 用户词典的 update_entry 会跳过它,不受影响。
                 if !candidate.components.is_empty() {
+                    // 整句：先学**整句本身**（`ScriptTranslator` 已给它填上音节 code，
+                    // 见 `code_for`），否则重复打同一串永远学不会、整句候选一直压在
+                    // 刚打过的词前面（2026-11-01 用户报"又回到后面"）。
+                    if let Some(entry) = &candidate.entry {
+                        if !entry.code.is_empty() {
+                            elements.push(entry.clone());
+                        }
+                    }
                     for text in &candidate.components {
                         elements.push(crate::dict::vocabulary::DictEntry {
                             text: text.clone(),

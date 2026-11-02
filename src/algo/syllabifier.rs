@@ -201,8 +201,10 @@ impl SyllableGraph {
 /// `Prism::Match`（`dict/prism.h:74`）：`value` = 拼写 id，`length` = 键长（**字节**）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrismMatch {
-    value: SyllableId,
-    length: usize,
+    /// 拼写 id（纠错器要按它回查属性，所以对 crate 外可见）
+    pub value: SyllableId,
+    /// 键长（字节）
+    pub length: usize,
 }
 
 /// 一次性拼写描述：对应 `prism::SpellingDescriptor` 解包后的东西
@@ -244,7 +246,7 @@ pub struct InMemoryPrism {
 
 impl InMemoryPrism {
     /// 对应 `Prism::Build(keyset)`：只建键，没有拼写表。
-    fn from_syllabary<'a, I>(syllabary: I) -> Self
+    pub fn from_syllabary<'a, I>(syllabary: I) -> Self
     where
         I: IntoIterator<Item = &'a String>,
     {
@@ -471,8 +473,12 @@ impl Syllabifier {
         self.canonicalizer = Some(canonicalizer);
     }
 
-    /// `syllabifier.cc:323-325`
-    fn enable_correction(&mut self, corrector: Box<dyn Corrector>) {
+    /// `syllabifier.cc:323-325`：挂上纠错器（`enable_correction: true` 时）。
+    ///
+    /// 挂上之后，凡是精确匹配之外的拼写都会走一次
+    /// [`Corrector::tolerance_search`]，命中的拼写带 `is_correction = true` 与
+    /// `credibility = log(0.01)`，于是纠出来的词天然排在真候选后面。
+    pub fn enable_correction(&mut self, corrector: Box<dyn Corrector>) {
         self.corrector = Some(corrector);
     }
 

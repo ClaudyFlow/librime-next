@@ -35,6 +35,7 @@ use std::collections::{BTreeMap, HashMap};
 use super::db::Db;
 use super::dictionary::Dictionary;
 use super::user_db::UserDbValue;
+use super::user_dict_cache::{build_cache, cache_enabled, CacheMap, EntryCursor};
 use super::vocabulary::{
     Code, DictEntry, DictEntryFilterBinder, DictEntryList, Syllabary, SyllableId,
 };
@@ -193,7 +194,7 @@ struct DfsState {
     credibility: Vec<f64>,
     quality_len: Vec<f64>,
     query_result: BTreeMap<usize, DictEntryList>,
-    accessor: Box<dyn super::db::DbAccessor>,
+    cursor: EntryCursor,
     key: String,
     value: String,
 }
@@ -214,7 +215,7 @@ impl DfsState {
     }
 
     fn next_entry(&mut self) -> bool {
-        match self.accessor.get_next_record() {
+        match self.cursor.next_record() {
             Some((key, value)) => {
                 self.key = key;
                 self.value = value;
@@ -229,7 +230,7 @@ impl DfsState {
     }
 
     fn forward_scan(&mut self, prefix: &str) -> bool {
-        if !self.accessor.jump(prefix) {
+        if !self.cursor.jump(prefix) {
             return false;
         }
         self.next_entry()
@@ -284,6 +285,16 @@ pub struct UserDictionary {
     /// 第一次需要时从 table 建，之后缓存。
     syllabary: HashMap<String, SyllableId>,
     tick: TickCount,
+    /// #1196：db 数据区的内存有序镜像。懒建（第一次查询时），写路径双写。
+    ///
+    /// `None` 有两种含义：开关关着（`cache_enabled() == false`）、或还没建。
+    /// 用 [`Self::ensure_cache`] 区分：开关关着时它不会去建。
+    cache: Option<CacheMap>,
+    /// 建镜像时的 db 写代次。别的实例（同方案另一个繁简变体）写过 db 后
+    /// 这个值就对不上，[`Self::ensure_cache`] 会重建镜像并重读 tick。
+    cache_gen: u64,
+    /// 缓存建过但被判失效（有活跃游标时写不进去）的次数，仅用于诊断。
+    cache_drops: u32,
 }
 
 impl UserDictionary {
@@ -294,6 +305,88 @@ impl UserDictionary {
             db,
             syllabary: HashMap::new(),
             tick: 0,
+            cache: None,
+            cache_gen: 0,
+            cache_drops: 0,
+        }
+    }
+
+    // ---- #1196：内存有序缓存 ----
+
+    /// 缓存开关（环境变量 `RIME_USER_DICT_CACHE_ENABLED`）。
+    pub fn cache_enabled(&self) -> bool {
+        cache_enabled()
+    }
+
+    /// 已镜像的条目数（0 = 缓存没建）。
+    pub fn cache_len(&self) -> usize {
+        self.cache.as_ref().map(|map| map.len()).unwrap_or(0)
+    }
+
+    /// 缓存被丢弃过几次（诊断用；正常情况下应为 0）。
+    pub fn cache_drops(&self) -> u32 {
+        self.cache_drops
+    }
+
+    /// 第一次查询时才全量扫描 db 建镜像。
+    ///
+    /// 关着开关、或 db 没打开时保持 `None`，查询自然退回 IO 路径。
+    fn ensure_cache(&mut self) {
+        if !cache_enabled() || !self.db.loaded() {
+            return;
+        }
+        let generation = self.db.write_generation();
+        if self.cache.is_some() && self.cache_gen == generation {
+            return;
+        }
+        // 首次建镜像；或共享同一 db 的另一个实例写过 → 镜像和 tick 都过期了。
+        self.cache = build_cache(self.db.as_ref());
+        self.cache_gen = generation;
+        let _ = self.fetch_tick_count();
+    }
+
+    pub fn warm_cache(&mut self) {
+        self.cache = build_cache(self.db.as_ref());
+        self.cache_gen = self.db.write_generation();
+    }
+
+    /// 丢弃镜像，下次查询（或下次 [`Self::load`]）重建。
+    ///
+    /// **绕过 `UserDictionary` 直接写 db 的人必须调这个**（导入词条、userdb 迁移、
+    /// `UserDb` 合并……）—— 否则内存里留的是旧数据，新导入的词查不到。
+    /// 运行时学词走 [`Self::update_entry_with_prefix`]，那条路自己会双写，不用管。
+    pub fn invalidate_cache(&mut self) {
+        self.cache = None;
+        self.cache_gen = 0;
+    }
+
+    /// 取一条记录的原始值：优先缓存，没有再打 db。
+    fn fetch_raw(&self, key: &str) -> Option<String> {
+        match self.cache.as_ref() {
+            Some(map) => map.get(key).cloned(),
+            None => self.db.fetch(key),
+        }
+    }
+
+    /// 写路径的双写：db 写成功后把新值塞进镜像。
+    ///
+    /// `Arc::get_mut` 失败 = 此刻还有别的游标借着这份镜像（同一次查询里持有
+    /// [`EntryCursor::Cache`]）。这时**整份丢弃**、下次查询重建，绝不留下写不进去的
+    /// 脏镜像 —— 宁可多扫一遍 db，也不能让"学过的词查不到"。
+    fn cache_update(&mut self, key: &str, value: &str) {
+        let Some(cache) = self.cache.as_mut() else {
+            return;
+        };
+        match std::sync::Arc::get_mut(cache) {
+            Some(map) => {
+                map.insert(key.to_string(), value.to_string());
+                // 这次写已经反映在镜像里，把代次对齐，免得下次查询白重建一遍。
+                self.cache_gen = self.db.write_generation();
+            }
+            None => {
+                self.cache = None;
+                self.cache_drops += 1;
+            }
         }
     }
 
@@ -317,6 +410,13 @@ impl UserDictionary {
             eprintln!("[user_dictionary] failed to open db '{}'.", self.name);
             return false;
         }
+        // #1196：打开成功就顺手建内存镜像。这里建（而不是等第一次查询）是为了让
+        // `LookupWords`（`&self`，给形码补全用）也能走内存，不必把所有调用点改成 `&mut self`。
+        // 幂等：重复 `Load` 不会重复扫。
+        if self.cache.is_none() {
+            self.cache = build_cache(self.db.as_ref());
+        }
+        self.cache_gen = self.db.write_generation();
         self.fetch_tick_count() || self.initialize()
     }
 
@@ -400,7 +500,24 @@ impl UserDictionary {
             return None;
         }
         self.fetch_tick_count();
-        let accessor = self.db.query("")?;
+        // #1196：能建镜像就建，之后的 DFS 全程在内存里做前缀扫
+        self.ensure_cache();
+        let cursor = match self.cache.clone() {
+            Some(map) => {
+                // 与 IO 路径同款：`query("")` 的 prefix 是空串，靠调用方自己判断边界
+                let mut scan =
+                    super::user_dict_cache::CacheScan::new(map, "");
+                scan.jump(" ");
+                EntryCursor::Cache(scan)
+            }
+            None => {
+                let accessor = self.db.query("")?;
+                let mut accessor = accessor;
+                // `Lookup` 里游标先跳到 " " 跳过元数据
+                accessor.jump(" ");
+                EntryCursor::Db(accessor)
+            }
+        };
         let mut state = DfsState {
             depth_limit,
             predict_word_from_depth,
@@ -409,12 +526,10 @@ impl UserDictionary {
             credibility: vec![initial_credibility],
             quality_len: vec![0.0],
             query_result: BTreeMap::new(),
-            accessor,
+            cursor,
             key: String::new(),
             value: String::new(),
         };
-        // `Lookup` 里游标先跳到 " " 跳过元数据
-        state.accessor.jump(" ");
         self.dfs_lookup(source, syll_graph, start_pos, "", &mut state);
         if state.query_result.is_empty() {
             return None;
@@ -573,18 +688,23 @@ impl UserDictionary {
         let mut count = 0usize;
         let mut exact_match_count = 0usize;
 
-        let Some(mut accessor) = self.db.query(input) else {
-            return (0, Some(K_END.to_string()));
+        // #1196：有镜像就走内存前缀扫，否则照旧开 LevelDB 游标
+        let mut cursor = match self.cache.clone() {
+            Some(map) => EntryCursor::Cache(super::user_dict_cache::CacheScan::new(map, input)),
+            None => match self.db.query(input) {
+                Some(accessor) => EntryCursor::Db(accessor),
+                None => return (0, Some(K_END.to_string())),
+            },
         };
-        if accessor.exhausted() {
+        if cursor.exhausted() {
             return (0, Some(K_END.to_string()));
         }
         if let Some(resume) = resume_key.filter(|key| !key.is_empty()) {
-            if !accessor.jump(resume) {
+            if !cursor.jump(resume) {
                 return (0, Some(K_END.to_string()));
             }
             // C++ 在 Jump 之后还要 GetNextRecord 一次：resume_key 指向的行已经读过了
-            if accessor.get_next_record().is_none() {
+            if cursor.next_record().is_none() {
                 return (0, Some(K_END.to_string()));
             }
         }
@@ -592,7 +712,7 @@ impl UserDictionary {
         let mut key;
         let mut last_key = String::new();
         let mut resume_out = None;
-        while let Some((current_key, value)) = accessor.get_next_record() {
+        while let Some((current_key, value)) = cursor.next_record() {
             key = current_key;
             // 精确匹配 = 键的下一字节正好是空格（码串在 len 处结束）
             let is_exact_match = key.len() > len && key.as_bytes()[len] == b' ';
@@ -654,6 +774,12 @@ impl UserDictionary {
         commits: i32,
         new_entry_prefix: &str,
     ) -> bool {
+        // 既没编码也没自定编码的词条学不进词典：写进去也永远查不出来
+        // （键会变成 `"\t<词>"`）。整句切分出来的「成分词条」就是这种，
+        // 它们只服务 n-gram，不该在 userdb 里留垃圾（2026-11-02）。
+        if entry.code.is_empty() && entry.custom_code.is_empty() {
+            return false;
+        }
         let code_str = if entry.custom_code.is_empty() {
             match self.translate_code_to_string(source, &entry.code) {
                 Some(code) => code,
@@ -664,7 +790,8 @@ impl UserDictionary {
         };
         let mut key = format!("{code_str}\t{}", entry.text);
         let mut value = UserDbValue::default();
-        if let Some(raw) = self.db.fetch(&key) {
+        // #1196：有镜像就从镜像读旧值（缓存与 db 同一个键空间，含 `new_entry_prefix`）
+        if let Some(raw) = self.fetch_raw(&key) {
             if let Some(parsed) = UserDbValue::unpack(&raw) {
                 value = parsed;
             }
@@ -690,7 +817,13 @@ impl UserDictionary {
             value.dee = formula_d(0.0, self.tick as f64, value.dee, value.tick as f64);
         }
         value.tick = self.tick;
-        self.db.update(&key, &value.pack())
+        let packed = value.pack();
+        let ok = self.db.update(&key, &packed);
+        // #1196：db 写成功才更新镜像 —— 写失败不能让内存里多出一条 db 里没有的词。
+        if ok {
+            self.cache_update(&key, &packed);
+        }
+        ok
     }
 
     /// `NewTransaction()`：提交上一个事务，再开新的。
@@ -820,9 +953,146 @@ mod tests {
         (dir, user_db)
     }
 
+    /// 直接往 db 里塞一条 —— 模拟"导入词条 / userdb 迁移"这类**绕过 `UserDictionary`**
+    /// 的写入。必须顺手 [`UserDictionary::invalidate_cache`]，否则内存镜像还是旧的，
+    /// 刚塞进去的词查不到（这也是真实代码里直接写 db 后必须做的事）。
+    fn seed(user_db: &mut UserDictionary, key: &str, value: &str) {
+        user_db.db().update(key, value);
+        user_db.invalidate_cache();
+    }
+
+    // ---- #1196 内存缓存的专项验证 ----
+
+    /// 缓存路径查出来的结果，必须与直接扫 db 完全一致。
+    #[test]
+    fn cached_lookup_words_agrees_with_raw_db_scan() {
+        let (_dir, mut user_db) = new_user_dict("cache_agree");
+        for (index, text) in ["阿", "八", "擦", "搭", "蛾"].iter().enumerate() {
+            seed(
+                &mut user_db,
+                &format!("a \t{text}"),
+                &format!("c={} d=1 t=1", index + 1),
+            );
+        }
+        user_db.warm_cache();
+        assert_eq!(user_db.cache_len(), 5, "镜像应有 5 条（元数据不算）");
+
+        let mut it = UserDictEntryIterator::new();
+        let (count, _) = user_db.lookup_words(&mut it, "a", false, 0, None);
+
+        // IO 侧手工扫一遍做对照
+        let mut raw = 0usize;
+        let mut accessor = user_db.db().query("a").unwrap();
+        while let Some((key, _)) = accessor.get_next_record() {
+            if key.starts_with("a ") {
+                raw += 1;
+            }
+        }
+        assert_eq!(count, raw, "缓存路径与 IO 路径必须给出同样的条数");
+        assert_eq!(count, 5);
+    }
+
+    /// **PR #1196 评审挑出的坑 1**：缓存路径返回的条目如果丢了 `code`，
+    /// 再拿去 `UpdateEntry` 就会写出一个"空码串"的新键，词频从此涨不上去
+    /// （表现为"打过的词永远回到后面"）。这里把它钉死：查出来 → 再学一次 →
+    /// 必须命中**同一个键**、`commits` 递增。
+    #[test]
+    fn cached_entry_round_trips_its_code() {
+        let Some(dict) = real_dict() else {
+            return;
+        };
+        let Some(graph) = build_graph(&dict, "nihao") else {
+            return;
+        };
+        let dir = TempDir::new("cache_code");
+        let db = Arc::new(LevelDb::new_user_db(dir.path(), "luna_pinyin"));
+        let mut user_db = UserDictionary::new("luna_pinyin", db);
+        assert!(user_db.load());
+        seed(&mut user_db, "ni hao \t你好", "c=5 d=5 t=1");
+        user_db.update_tick_count(10);
+        user_db.warm_cache();
+        assert_eq!(user_db.cache_len(), 1);
+
+        // 走**缓存**路径查（`cache_len` 非 0 ⇒ DFS 用的是 `CacheScan`）
+        let collector = user_db
+            .lookup(&dict, &graph, 0, 0, 0, 0.0)
+            .expect("缓存里应能查到「你好」");
+        let entries = collector.get(&5).unwrap().clone_entries();
+        let entry = entries.0.into_iter().next().unwrap();
+        assert_eq!(entry.text, "你好");
+        assert_eq!(entry.code.0.len(), 2, "缓存路径也必须带出完整 code");
+
+        // 拿它再学一次
+        assert!(user_db.update_entry(&dict, &entry, 1));
+        let raw = user_db
+            .db()
+            .fetch("ni hao \t你好")
+            .expect("键不该变；code 丢了就会另建一个空码键");
+        let value = UserDbValue::unpack(&raw).unwrap();
+        assert_eq!(value.commits, 6, "commits 应 5→6");
+        assert_eq!(user_db.cache_len(), 1, "不该多出第二个键");
+        // 缓存里也得是新的
+        let cached = UserDbValue::unpack(&user_db.fetch_raw("ni hao \t你好").unwrap()).unwrap();
+        assert_eq!(cached.commits, 6, "缓存与 db 必须同步");
+    }
+
+    /// **PR #1196 评审挑出的坑 2**：`new_entry_prefix` 插进 db key、而缓存用没加前缀的
+    /// key，于是"刚学完能看见、重载后消失"。这里缓存的就是最终写进 db 的那个 key，
+    /// 两边同一个键空间。
+    #[test]
+    fn prefixed_new_entry_lives_in_one_key_space() {
+        let (_dir, mut user_db) = new_user_dict("cache_prefix");
+        let dict = stub_dict();
+        let mut entry = DictEntry::default();
+        entry.text = "你好".into();
+        entry.custom_code = "ni hao ".into();
+        user_db.update_tick_count(5);
+
+        assert!(user_db.update_entry_with_prefix(&dict, &entry, 1, "~"));
+        let key = "~ni hao \t你好";
+        assert!(user_db.db().fetch(key).is_some(), "db 里的键应带前缀");
+        assert_eq!(user_db.cache_len(), 1);
+        assert!(
+            user_db.fetch_raw(key).is_some(),
+            "缓存里的键也要带前缀（与 db 同一个键空间）"
+        );
+
+        // 模拟"重载"：丢掉镜像重建，条目数与键都不该变
+        user_db.invalidate_cache();
+        user_db.warm_cache();
+        assert_eq!(user_db.cache_len(), 1, "重载后不该多出或掉条目");
+        assert!(user_db.fetch_raw(key).is_some());
+        assert!(
+            user_db.fetch_raw("ni hao \t你好").is_none(),
+            "不该出现没前缀的影子键"
+        );
+    }
+
+    /// 学词走的是双写：db 与缓存同时更新。
+    #[test]
+    fn learning_updates_cache_and_db_together() {
+        let (_dir, mut user_db) = new_user_dict("cache_learn");
+        let dict = stub_dict();
+        user_db.warm_cache();
+        assert_eq!(user_db.cache_len(), 0);
+
+        let mut entry = DictEntry::default();
+        entry.text = "你好".into();
+        entry.custom_code = "ni hao ".into();
+        assert!(user_db.update_entry(&dict, &entry, 1));
+        assert_eq!(user_db.cache_len(), 1, "学完立刻在缓存里");
+        assert!(user_db.db().fetch("ni hao \t你好").is_some(), "db 里也要有");
+
+        // 再学一次：仍是一个键，commits 累加
+        assert!(user_db.update_entry(&dict, &entry, 1));
+        assert_eq!(user_db.cache_len(), 1);
+        let value = UserDbValue::unpack(&user_db.fetch_raw("ni hao \t你好").unwrap()).unwrap();
+        assert_eq!(value.commits, 2);
+    }
+
     #[test]
     fn load_initializes_tick_to_zero() {
-        let (_dir, user_db) = new_user_dict("init");
+        let (_dir, mut user_db) = new_user_dict("init");
         assert_eq!(user_db.tick(), 0);
         assert!(user_db.loaded());
         assert_eq!(
@@ -873,10 +1143,10 @@ mod tests {
     /// 后者靠 `comment = "~ ma"` / `remaining_code_length` 表示"还差多少码"。
     #[test]
     fn lookup_words_matches_on_syllable_boundary() {
-        let (_dir, user_db) = new_user_dict("words");
-        user_db.db().update("ni hao \t你好", "c=5 d=5 t=1");
-        user_db.db().update("ni hao ma \t你好吗", "c=1 d=1 t=1");
-        user_db.db().update("ni \t你", "c=9 d=9 t=1");
+        let (_dir, mut user_db) = new_user_dict("words");
+        seed(&mut user_db, "ni hao \t你好", "c=5 d=5 t=1");
+        seed(&mut user_db, "ni hao ma \t你好吗", "c=1 d=1 t=1");
+        seed(&mut user_db, "ni \t你", "c=9 d=9 t=1");
 
         // 边界对齐 → 两条都算
         let mut it = UserDictEntryIterator::new();
@@ -910,9 +1180,9 @@ mod tests {
     /// 挂在 `is_exact_match` 的 else 分支上，边界对齐的条目永远全收。
     #[test]
     fn lookup_words_limit_applies_only_to_predictions() {
-        let (_dir, user_db) = new_user_dict("limit");
+        let (_dir, mut user_db) = new_user_dict("limit");
         for key in ["ni hao \t你好", "ni hao a \t你好啊", "ni hao ma \t你好吗"] {
-            user_db.db().update(key, "c=1 d=1 t=1");
+            seed(&mut user_db, key, "c=1 d=1 t=1");
         }
         let mut it = UserDictEntryIterator::new();
         let (count, _) = user_db.lookup_words(&mut it, "ni hao", true, 1, None);
@@ -922,9 +1192,9 @@ mod tests {
     /// `resume_key` 续扫：第一轮拿到的键再传回去，会跳过它继续往下。
     #[test]
     fn lookup_words_resume_key_continues_scan() {
-        let (_dir, user_db) = new_user_dict("resume");
+        let (_dir, mut user_db) = new_user_dict("resume");
         for key in ["ni h \t你哈", "ni ha \t你哈啊", "ni hao \t你好"] {
-            user_db.db().update(key, "c=1 d=1 t=1");
+            seed(&mut user_db, key, "c=1 d=1 t=1");
         }
         // 输入 "ni"：三条的 key[2] 都是 ' '，都算边界对齐
         let mut first = UserDictEntryIterator::new();
@@ -1011,9 +1281,9 @@ mod tests {
     #[test]
     fn transaction_rolls_back_learning() {
         let (_dir0, mut user_db) = new_user_dict("tx");
-        user_db.db().update("ni hao \t你好", "c=1 d=1 t=1");
+        seed(&mut user_db, "ni hao \t你好", "c=1 d=1 t=1");
         assert!(user_db.new_transaction());
-        user_db.db().update("ni hao \t你好", "c=99 d=99 t=9");
+        seed(&mut user_db, "ni hao \t你好", "c=99 d=99 t=9");
         assert_eq!(
             user_db.db().fetch("ni hao \t你好").as_deref(),
             Some("c=1 d=1 t=1"),
@@ -1027,7 +1297,7 @@ mod tests {
 
         // 3 秒内可撤
         assert!(user_db.new_transaction());
-        user_db.db().update("ni hao \t你好", "c=7 d=7 t=7");
+        seed(&mut user_db, "ni hao \t你好", "c=7 d=7 t=7");
         assert!(user_db.revert_recent_transaction(1));
         assert_eq!(
             user_db.db().fetch("ni hao \t你好").as_deref(),
@@ -1035,7 +1305,7 @@ mod tests {
         );
         // 超过 3 秒不许撤
         assert!(user_db.new_transaction());
-        user_db.db().update("ni hao \t你好", "c=8 d=8 t=8");
+        seed(&mut user_db, "ni hao \t你好", "c=8 d=8 t=8");
         assert!(!user_db.revert_recent_transaction(5));
         assert!(user_db.commit_pending_transaction());
     }
@@ -1107,7 +1377,7 @@ mod tests {
         let db = Arc::new(LevelDb::new_user_db(dir.path(), "luna_pinyin"));
         let mut user_db = UserDictionary::new("luna_pinyin", db);
         assert!(user_db.load());
-        user_db.db().update("ni hao \t你好", "c=5 d=5 t=1");
+        seed(&mut user_db, "ni hao \t你好", "c=5 d=5 t=1");
         user_db.update_tick_count(10);
 
         let collector = user_db
@@ -1145,7 +1415,7 @@ mod tests {
         let db = Arc::new(LevelDb::new_user_db(dir.path(), "luna_pinyin"));
         let mut user_db = UserDictionary::new("luna_pinyin", db);
         assert!(user_db.load());
-        user_db.db().update("ni hao ma \t你好吗", "c=3 d=3 t=1");
+        seed(&mut user_db, "ni hao ma \t你好吗", "c=3 d=3 t=1");
         user_db.update_tick_count(10);
 
         // 不开预测：捞不到（输入没走完就没有下一条边）
@@ -1179,7 +1449,7 @@ mod tests {
         let db = Arc::new(LevelDb::new_user_db(dir.path(), "luna_pinyin"));
         let mut user_db = UserDictionary::new("luna_pinyin", db);
         assert!(user_db.load());
-        user_db.db().update("ni hao \t你好", "c=-1 d=5 t=1");
+        seed(&mut user_db, "ni hao \t你好", "c=-1 d=5 t=1");
         user_db.update_tick_count(10);
 
         assert!(

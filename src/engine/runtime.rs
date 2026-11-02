@@ -252,6 +252,18 @@ impl Engine {
         // 正确做法：**照常过处理器链**（让 ascii_composer 切中英），只在"没被任何人吃掉"
         // 时**不记历史、不上屏**，那串乱码就没了。
         let is_lock_key = matches!(key.keycode, 0x14 | 0x90 | 0x91 | 0xFFE5);
+        // 临时探针（2026-11-01 19:1x，排查中英切换）：确认 Shift / CapsLock 到底有没有进引擎。
+        // 定位完**必须删掉**。
+        if matches!(key.keycode, 0x14 | 0x10 | 0x11 | 0xFFE1 | 0xFFE2 | 0xFFE5 | 0x90 | 0x91) {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(r"C:\Code\_keyprobe.txt")
+            {
+                let _ = writeln!(f, "keycode=0x{:x} modifier=0x{:x}", key.keycode, key.modifier);
+            }
+        }
         let input_before = self.context.input.clone();
         let mut result = self.run_processor_chain(key);
         // `ConcreteEngine::ProcessKey`（`engine.cc:180-182`）：**没被任何 processor
@@ -620,7 +632,12 @@ impl Engine {
         let history = self.context.commit_history.clone();
         let segs = &mut self.context.composition.segmentation.segments;
         for seg in segs.iter_mut() {
-            if seg.status >= SegStatus::Guess {
+            // 删词（`Context::delete_candidate`）会把段 `reopen` 成 Guess 且清空菜单，
+            // 并置 `needs_recompose` 期望下一轮 `compose` 重译出"去掉被删词"的新菜单。
+            // 若只按 `status >= Guess` 跳过，这段就永远得不到翻译、菜单恒空 —— 用户报的
+            // "删词后候选全空、什么都看不见"正是它。真正译好的段是「Guess **且** 有菜单」，
+            // 这类才跳过；菜单被清掉的 Guess 段必须重新翻译。
+            if seg.status >= SegStatus::Guess && seg.menu.is_some() {
                 continue;
             }
             let len = seg.end.saturating_sub(seg.start);

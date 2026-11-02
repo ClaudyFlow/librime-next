@@ -60,6 +60,9 @@ pub struct AsciiComposer {
     keymap: KeyBindingMap,
     switch_key: std::collections::HashMap<u32, SwitchStyle>,
     inline_uppercase: bool,
+    /// C++ `good_old_caps_lock_`：CapsLock 当成"大写锁定"而不是纯切换键
+    /// （按下时放行给系统去点亮锁定状态）。
+    good_old_caps_lock: bool,
     /// Shift / Ctrl / Alt / Super 是否被单独按下（单击判定用）。
     modifier_down: Option<u32>,
     toggle_deadline: Option<Instant>,
@@ -74,6 +77,7 @@ impl AsciiComposer {
             keymap: KeyBindingMap::new(),
             switch_key: std::collections::HashMap::new(),
             inline_uppercase: true,
+            good_old_caps_lock: false,
             modifier_down: None,
             toggle_deadline: None,
             raw_keys: String::new(),
@@ -113,6 +117,13 @@ impl AsciiComposer {
             .and_then(|v| v.as_bool())
         {
             self.inline_uppercase = v;
+        }
+        // `good_old_caps_lock`：true ⇒ CapsLock 按键放行给系统去点亮大写锁定（C++ 同款）。
+        if let Some(v) = config
+            .pointer("/ascii_composer/good_old_caps_lock")
+            .and_then(|v| v.as_bool())
+        {
+            self.good_old_caps_lock = v;
         }
         // 默认：Shift 作切换键（commit_code 改成 toggle 由方案配，缺省同 C++ 缺省 toggle）
         if self.switch_key.is_empty() {
@@ -215,6 +226,34 @@ impl Processor for AsciiComposer {
         if modifier_count > 1 {
             self.reset_modifier_state();
             return ProcessResult::Noop;
+        }
+
+        // 3a. CapsLock（C++ `ProcessCapsLock`）：`good_old_caps_lock` 语义。
+        //
+        // ⚠️ 2026-11-02 03:1x **修死代码**：这里原来写 `ch == 0x14` —— 那是 Windows 的
+        // `VK_CAPITAL`；而**引擎这一层收到的是 X11 keysym**（TIP 在 `Tip/src/keyboard.rs`
+        // 把 VK 0x14 翻成 `0xffe5`）。两者永远不相等 ⇒ 整块从未执行过，后果两条：
+        //   ① 按 CapsLock 不切中英 ⇒ 一个提示都没有（用户 03:0x「按大写的时候没有显示」）；
+        //   ② CapsLock 掉进"未处理键"那条路 ⇒ 把组字里攒的 raw 输入整串吐上屏
+        //      （用户 03:0x「按大写锁定有时候弹出一堆之前吞掉的字符」；
+        //       2026-11-01 19:2x 的 `yinamiao.........,......` 是同一个现象）。
+        if ch == 0xffe5 || ch == 0x14 {
+            // 抬手已经在上面 step 1 统一 return 了，这里只剩按下。
+            self.reset_modifier_state();
+            let style = self
+                .switch_key
+                .get(&ch)
+                .copied()
+                .unwrap_or(SwitchStyle::Toggle);
+            self.switch_ascii_mode(ctx, style);
+            // `good_old_caps_lock: true`（本机用户配置）⇒ **放行**，让 Windows 真的翻转
+            // 大写锁定 —— 否则锁没锁上由我们说了算，英文态打不出大写。
+            // false ⇒ 吞掉（C++ 同款），大写锁定永远不点亮。
+            return if self.good_old_caps_lock {
+                ProcessResult::Rejected
+            } else {
+                ProcessResult::Accepted
+            };
         }
 
         // 3. CapsLock：good-old 语义下直接放行，由切换键表决定行为
@@ -476,5 +515,52 @@ mod tests {
         let _ = AsciiComposer::new(&json!({"ascii_composer": {"inline_uppercase": false}}));
         c.input = "x".to_string();
         assert_eq!(c.input, "x");
+    }
+
+    /// 回归：CapsLock 走的是 **X11 keysym**（`0xffe5`），不是 Windows 的 `VK_CAPITAL`(0x14)。
+    ///
+    /// 2026-11-02 03:1x 之前这里比的是 `0x14`，于是整块 CapsLock 处理是死代码：
+    /// 按 CapsLock 不切中英（没有提示），按键落进"未处理键"那条路，把组字里攒的
+    /// raw 输入整串吐上屏（用户报的"按大写锁定弹出一堆之前吞掉的字符"）。
+    #[test]
+    fn caps_lock_keysym_toggles_ascii_mode() {
+        let composer_config = json!({
+            "ascii_composer": {
+                "good_old_caps_lock": true,
+                "switch_key": { "Caps_Lock": "clear" }
+            }
+        });
+        let mut composer = AsciiComposer::new(&composer_config);
+        let mut engine = engine_with("ni", false);
+        let caps_down = KeyEvent::new(0xffe5, 0);
+        // `good_old_caps_lock: true` ⇒ 放行给系统去点亮大写锁定，不再吞键
+        assert_eq!(
+            composer.process_key_event(&mut engine, &caps_down),
+            ProcessResult::Rejected
+        );
+        assert!(engine.context.get_option("ascii_mode"));
+        // `clear` 语义：切换时把组字清掉
+        assert_eq!(engine.context.input, "");
+        // 再按一次回中文
+        assert_eq!(
+            composer.process_key_event(&mut engine, &caps_down),
+            ProcessResult::Rejected
+        );
+        assert!(!engine.context.get_option("ascii_mode"));
+    }
+
+    /// `good_old_caps_lock: false` ⇒ 吞掉按键（大写锁定永远不点亮），C++ 同款。
+    #[test]
+    fn caps_lock_is_swallowed_without_good_old() {
+        let composer_config = json!({
+            "ascii_composer": { "switch_key": { "Caps_Lock": "toggle" } }
+        });
+        let mut composer = AsciiComposer::new(&composer_config);
+        let mut engine = engine_with("", false);
+        assert_eq!(
+            composer.process_key_event(&mut engine, &KeyEvent::new(0xffe5, 0)),
+            ProcessResult::Accepted
+        );
+        assert!(engine.context.get_option("ascii_mode"));
     }
 }

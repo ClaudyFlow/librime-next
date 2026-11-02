@@ -118,6 +118,14 @@ name = "probe_yuling2"
 path = "example/probe_yuling2.rs"
 
 [[example]]
+name = "probe_userdb"
+path = "example/probe_userdb.rs"
+
+[[example]]
+name = "seed_phrase"
+path = "example/seed_phrase.rs"
+
+[[example]]
 name = "deploy_real"
 path = "example/deploy_real.rs"
 
@@ -175,7 +183,22 @@ rsmarisa = "0.4"
 # 普通模式仍委托给它，速度不退化；语义对齐 librime 的 `boost::regex`。
 # 仍有的两处手工翻译见 `algo/calculus.rs`。
 rusty-leveldb = "4.0.2"
+# Lua 兼容层(2026-11-01):巧码等社区方案的 lua_processor/translator/filter。
+# vendored = 自带 Lua 5.4 源码编译,不依赖系统 lua。
+mlua = { version = "0.10", features = ["lua54", "vendored"] }
+# 真内存映射(2026-11-01):gram 模型 473MB 不再 fs::read 全量堆驻
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+] }
 fancy-regex = "0.20.0"
+
+[[test]]
+name = "mmap_verify"
+path = "test/mmap_verify.rs"
 
 [[test]]
 name = "reverse_lookup_scheme"
@@ -205,4 +228,15 @@ path = "example/neural_smoke.rs"
 [[example]]
 name = "neural_bench"
 path = "example/neural_bench.rs"
+
+# 端到端学词探针(2026-11-02):真实打字→选词→查用户词典有没有写进去。
+[[example]]
+name = "e2e_learn"
+path = "example/e2e_learn.rs"
+
+# 多会话学词探针(2026-11-02):同一进程两个会话抢同一个 userdb 的 LOCK,
+# 复现真机长驻引擎里"第二个会话静默丢掉用户词典"的坑。
+[[example]]
+name = "e2e_multi_session"
+path = "example/e2e_multi_session.rs"
 

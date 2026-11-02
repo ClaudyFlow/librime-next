@@ -259,6 +259,14 @@ impl Processor for Editor {
             return match handler {
                 CharHandler::DirectCommit => {
                     // C++ `Editor::DirectCommit`：`ctx->Commit(); return kRejected;`
+                    //
+                    // ⚠️ 2026-11-01 诊断日志：用户报「打字突然多出一堆英文字母」，
+                    // 这里是**最可疑**的一条路——组字中按到字母会把整串组合交出去。
+                    // 先只记录、不改行为；复现后按日志判定要不要动。
+                    eprintln!(
+                        "[editor] DirectCommit: input={:?} 将整串上屏（字符 {:?}）",
+                        ctx.input, ch
+                    );
                     ctx.commit();
                     ProcessResult::Rejected
                 }

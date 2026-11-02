@@ -407,6 +407,11 @@ pub fn create_segmentor(ticket: &Ticket) -> Option<Box<dyn Segmentor + Send + Sy
 }
 
 /// C++ `gears_module.cc` 的 translator 部分（当前已移植的那些）。
+///
+/// 用户词典句柄统一走 [`crate::dict::level_db::LevelDb::shared_user_db`] 的
+/// **进程级池**：LevelDB 的 `LOCK` 按目录独占，同一进程里第二个 `DB::open`
+/// 同一目录也会失败，所以"一次装配内共享"不够 —— 长驻引擎里每个会话都会新建
+/// 一个 `Engine`，必须全进程共用同一个句柄（详见该函数注释）。
 pub fn create_translator(ticket: &Ticket) -> Option<Box<dyn Translator + Send + Sync>> {
     let options = TranslatorOptions::from_config(ticket.config, &ticket.name_space);
     match ticket.klass.as_str() {
@@ -594,10 +599,15 @@ fn create_user_dictionary(
         eprintln!("[registry] cannot create userdb dir {db_dir:?}: {e}");
         return None;
     }
-    let db = std::sync::Arc::new(crate::dict::level_db::LevelDb::new_user_db(&db_dir, &name));
+    // 同一个 userdb 全进程只 `DB::open` 一次（`LOCK` 独占，见函数注释）。
+    let db: std::sync::Arc<dyn crate::dict::db::Db> =
+        crate::dict::level_db::LevelDb::shared_user_db(&db_dir, &name);
     let mut user_dict = crate::dict::user_dictionary::UserDictionary::new(&name, db);
     if !user_dict.load() {
-        eprintln!("[registry] failed to load user dict '{name}', continuing without it.");
+        eprintln!(
+            "[registry] failed to load user dict '{name}' for namespace '{}', continuing without it.",
+            ticket.name_space
+        );
         return None;
     }
     Some(user_dict)
@@ -671,10 +681,18 @@ fn translator_section(name_space: &str) -> String {
 /// 变体节 simp:/trad: 经 [`translator_section`] 解析到 `translator/<ns>`。
 fn translator_dict_name(ticket: &Ticket) -> Option<(String, String)> {
     let section = translator_section(&ticket.name_space);
-    let dict = ticket
-        .config
-        .pointer(&format!("{section}/dict"))
-        .and_then(|v| v.as_str())?;
+    // `dict:` 是 Rime-Next 的两段式写法；上游 librime 一直叫 `dictionary:`
+    // （`luna_pinyin_simp` / `wubi86` 这些老方案都还是 `dictionary`）。
+    // 只认 `dict:` 会让这些方案**连词典都打不开 → 整个 translator 造不出来 →
+    // 打什么都是一个候选都没有**（2026-11-02 实测出厂默认方案就是这状态）。
+    let dict = ["dict", "dictionary"].iter().find_map(|key| {
+        ticket
+            .config
+            .pointer(&format!("{section}/{key}"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    })?;
     let prism = ticket
         .config
         .pointer(&format!("{section}/prism"))
@@ -741,37 +759,107 @@ fn synthesize_variant_translators(config: &Value) -> Option<Value> {
         })
         .cloned()
         .collect();
-    // 繁简开关名：优先 `simplifier/option_name`（方案显式声明，如 flypy 的 zh_simp）；
-    // 否则从 `switch:` 列表里挑一个简繁开关（zh_hant / zh_simp / simplification）——
-    // 这样方案只要在 switch 里声明 `zh_hant`，就不必再在 simplifier 里重复一遍名字。
-    // 都找不到才回退到 rime 传统的 `simplification`。
-    let switch = config
-        .pointer("/simplifier/option_name")
-        .and_then(Value::as_str)
-        .map(|s| s.to_string())
-        .or_else(|| {
-            config.pointer("/switch").and_then(Value::as_array).and_then(|arr| {
-                arr.iter().find_map(|s| {
-                    s.get("name")
-                        .and_then(Value::as_str)
-                        .filter(|n| matches!(n, &"zh_hant" | &"zh_simp" | &"simplification"))
-                        .map(|n| n.to_string())
-                })
-            })
-        })
-        .unwrap_or_else(|| "simplification".to_string());
+    // 繁简开关：优先 `simplifier/option_name`（方案显式声明，如 flypy 的 zh_simp）；
+    // 否则从开关列表里挑一个简繁开关。
+    //
+    // ⚠️ 2026-11-02 修（用户报「打字一直不能造词、打十几遍也进不了第一页」）：
+    // 这里原来有两个致命错误，合起来让**简体变体永远处于关闭状态**——
+    //   ① 只读 `/switch`（单数）。**编译后的方案写的是 `/switches`（复数）**，
+    //      于是永远读不到，兜底成 `simplification`；而本机方案的繁简开关叫
+    //      `zh_hant`，`simplification` 这个选项根本没人设置 ⇒ 恒为 false。
+    //   ② 极性写死：`simp` 用开关本身、`trad` 用取反。但 `zh_hant` 的极性是
+    //      「true = 繁体」，照抄就反了。
+    // 结果：真正干活的是 `@trad`，而 `@trad` 又因为下面的 userdb 抢锁拿不到
+    // 用户词典（见 `create_user_dictionary`）→ 一个词都学不进去。
+    let (simp_when, trad_when) = variant_simplification_conditions(config);
     out.push(serde_json::json!({
         "name": "script_translator@simp",
-        "when": switch.clone()
+        "when": simp_when
     }));
     out.push(serde_json::json!({
         "name": "script_translator@trad",
-        "when": format!("!{switch}")
+        "when": trad_when
     }));
     if let Some(translators) = cfg.pointer_mut("/engine/translators") {
         *translators = serde_json::Value::Array(out);
     }
     Some(cfg)
+}
+
+/// 名字是不是「繁体极性」的开关（`true` = 繁体）。
+fn is_hant_switch_name(name: &str) -> bool {
+    matches!(name, "zh_hant" | "zh_trad" | "hant" | "traditional" | "zh_hant_tw")
+}
+
+/// 名字是不是「简体极性」的开关（`true` = 简体）。
+fn is_hans_switch_name(name: &str) -> bool {
+    matches!(
+        name,
+        "zh_hans" | "zh_simp" | "simplification" | "hans" | "simplified"
+    )
+}
+
+/// 求 `script_translator@simp` / `@trad` 两个变体的启用条件（`when` 表达式）。
+///
+/// 返回 `(simp_when, trad_when)`。**极性必须跟着开关名走**：`zh_hant` 是
+/// 「true = 繁体」，`simplification` / `zh_simp` 是「true = 简体」，写反就会
+/// 让引擎长期启用错误的那一路（2026-11-02 的「不造词」事故就是这么来的）。
+///
+/// 查找顺序：
+/// 1. `simplifier/option_name`（方案显式声明，最可靠）；
+/// 2. 开关列表里 `name:` 命中繁简开关名的第一项；
+/// 3. 开关列表里 `options: [zh_simp, zh_trad]` 这种单选组；
+/// 4. 都没有 → 回退 rime 传统的 `simplification`。
+///
+/// 开关列表同时接受 `/switches`（编译后的形态）与 `/switch`（源文件形态）。
+fn variant_simplification_conditions(config: &Value) -> (String, String) {
+    let switch_list = config
+        .pointer("/switches")
+        .or_else(|| config.pointer("/switch"))
+        .and_then(Value::as_array);
+
+    // ① 显式 option_name
+    if let Some(name) = config
+        .pointer("/simplifier/option_name")
+        .and_then(Value::as_str)
+    {
+        if is_hant_switch_name(name) {
+            return (format!("!{name}"), name.to_string());
+        }
+        if is_hans_switch_name(name) {
+            return (name.to_string(), format!("!{name}"));
+        }
+    }
+
+    if let Some(list) = switch_list {
+        // ② 单项开关（`name:`）
+        for item in list {
+            let Some(name) = item.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            if is_hant_switch_name(name) {
+                return (format!("!{name}"), name.to_string());
+            }
+            if is_hans_switch_name(name) {
+                return (name.to_string(), format!("!{name}"));
+            }
+        }
+        // ③ 单选组（`options: [zh_simp, zh_trad]`）：直接用两个选项名当条件
+        for item in list {
+            let Some(options) = item.get("options").and_then(Value::as_array) else {
+                continue;
+            };
+            let names: Vec<&str> = options.iter().filter_map(Value::as_str).collect();
+            let simp = names.iter().copied().find(|n| is_hans_switch_name(n));
+            let trad = names.iter().copied().find(|n| is_hant_switch_name(n));
+            if let (Some(s), Some(t)) = (simp, trad) {
+                return (s.to_string(), t.to_string());
+            }
+        }
+    }
+
+    // ④ 兜底
+    ("simplification".to_string(), "!simplification".to_string())
 }
 
 /// 深合并：对象递归合并，标量/数组整体覆盖（C++ 对应 `Config::Merge` 的语义）。
@@ -818,6 +906,10 @@ pub fn install_engine_components(
     let translators = {
         let variant_cfg = synthesize_variant_translators(config);
         let cfg = variant_cfg.as_ref().unwrap_or(config);
+        // 用户词典句柄由 `LevelDb::shared_user_db` 全进程共享：双变体方案会把
+        // `script_translator` 拆成 `@simp` / `@trad`，两个变体的 `dict` 往往指向
+        // 同一个 userdb 目录，而 `LOCK` 独占 —— 不共享就会出现「先开的赢、
+        // 后开的静默丢掉用户词典」，表现为一个词都学不进去。
         create_components_from_list(
             cfg,
             build_dir,
@@ -912,6 +1004,47 @@ mod tests {
     }
 
     #[test]
+    fn variant_conditions_read_plural_switches() {
+        // 编译后的方案写的是 `switches:`（复数）。以前只读 `switch`（单数），
+        // 于是永远读不到、兜底成 `simplification`；而实际方案的繁简开关叫
+        // `zh_hant`，`simplification` 这个选项没人设置 ⇒ 简体变体恒关。
+        let config = json!({
+            "switches": [
+                { "name": "ascii_mode", "reset": 0, "states": ["中文", "西文"] },
+                { "name": "zh_hant", "reset": 0, "states": ["簡體", "繁體"] }
+            ]
+        });
+        assert_eq!(
+            variant_simplification_conditions(&config),
+            ("!zh_hant".to_string(), "zh_hant".to_string())
+        );
+    }
+
+    #[test]
+    fn variant_conditions_follow_switch_polarity() {
+        // 简体极性开关（true = 简体）：simp 直接用它，trad 取反。
+        let config = json!({
+            "switch": [
+                { "name": "simplification", "reset": 1, "state": ["漢字", "汉字"] }
+            ]
+        });
+        assert_eq!(
+            variant_simplification_conditions(&config),
+            ("simplification".to_string(), "!simplification".to_string())
+        );
+        // 单选组（`options: [zh_simp, zh_trad]`）：直接用两个选项名当条件。
+        let radio = json!({
+            "switches": [
+                { "options": ["zh_simp", "zh_trad"], "reset": 0 }
+            ]
+        });
+        assert_eq!(
+            variant_simplification_conditions(&radio),
+            ("zh_simp".to_string(), "zh_trad".to_string())
+        );
+    }
+
+    #[test]
     fn variant_switch_inferred_from_switch_list_when_no_option_name() {
         // 2026-10-28：方案只要在 switch 里声明 `zh_hant`，引擎就直接绑定变体 when，
         // 不必再写 `simplifier/option_name`（那是给 flypy 之类想用别的开关名时显式覆盖用的）。
@@ -941,8 +1074,12 @@ mod tests {
             .pointer("/engine/translators/3/when")
             .and_then(Value::as_str)
             .expect("trad 应有 when 条件");
-        assert_eq!(simp_when, "zh_hant");
-        assert_eq!(trad_when, "!zh_hant");
+        // ⚠️ 极性：`zh_hant` 的语义是「true = 繁体」，所以**简体**变体要绑 `!zh_hant`。
+        // 2026-11-02 前这里写反了（simp 绑 zh_hant），配合「读不到开关列表」的 bug，
+        // 让简体变体长期处于关闭状态、真正干活的是拿不到用户词典的繁体变体，
+        // 表现为「打字一直不造词、打十几遍也进不了第一页」。
+        assert_eq!(simp_when, "!zh_hant");
+        assert_eq!(trad_when, "zh_hant");
         // 共享层 dict/prism 由深合并并进变体
         assert_eq!(
             synthesized.pointer("/translator/simp/dict").and_then(Value::as_str),

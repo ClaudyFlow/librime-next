@@ -55,8 +55,18 @@ fn full_pinyin_typing_journey() {
     let second = candidates(&s).get(1).cloned();
     assert!(second.is_some(), "nihao 应有第 2 候选");
     assert!(s.process_key(0x0032, 0), "数字 2 应被消费"); // XK_2
-    let committed = s.take_commit();
-    assert_eq!(committed.as_deref(), second.as_deref(), "数字 2 应上屏第二候选 {second:?}");
+    // 2026-11-01 语义统一(与空格修复同源):数字选**部分**候选 = 确认前缀
+    // 续组字,不发文本;全部确认才一起上屏。第二候选「你」覆盖 [0..2),
+    // 部分确认 → 组字串剩 hao;再确认完,前缀+末段一起上屏。
+    if second.as_deref() == Some("你") {
+        assert_eq!(s.take_commit().as_deref(), None, "部分确认不发文本");
+        assert_eq!(s.context().unwrap().input, "hao", "剩余编码 hao 留组字区");
+        assert!(s.process_key(0x0020, 0), "确认剩余");
+        assert_eq!(s.take_commit().as_deref(), Some("你好"), "前缀+末段一起上屏");
+    } else {
+        // 全覆盖候选:数字直接上屏
+        assert_eq!(s.take_commit().as_deref(), second.as_deref(), "数字 2 应上屏第二候选 {second:?}");
+    }
 
     // ---- ③ 翻页:nihao → Page_Down → 高亮进入第二页 -----------------------
     type_str(&mut s, "nihao");

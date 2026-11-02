@@ -110,6 +110,18 @@ pub trait Db: Send + Sync {
     }
     /// `Db::Remove()`。`false` = 已打开（C++ 拒绝删除打开中的 db）。
     fn remove(&self) -> bool;
+    /// 数据代次：每成功写一次（`update` / `erase` / 事务提交）自增。
+    ///
+    /// 用途：双变体方案的两个 `UserDictionary` 会**共享同一个 db 句柄**
+    /// （同一个 userdb 只允许一个 LevelDB 实例），各自却又有一份内存镜像。
+    /// 靠这个代次判断「别人写过没有」，过期就重建镜像 + 重读 tick，
+    /// 否则切到另一个变体后刚学的词会查不到。
+    ///
+    /// 默认 `0` = 该后端不参与（不需要共享的 db 可以不实现）。
+    fn write_generation(&self) -> u64 {
+        0
+    }
+
     /// `Db::Open()`。
     fn open(&self) -> bool;
     /// `Db::OpenReadOnly()`。

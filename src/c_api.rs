@@ -814,7 +814,15 @@ unsafe extern "C" fn rime_get_status(id: RimeSessionId, status: *mut RimeStatus)
         .context()
         .map(|c| c.is_composing())
         .unwrap_or(false) as Bool;
-    (*status).is_ascii_mode = 0;
+    // C++ `RimeGetStatus` 是**现场读**引擎选项的，这里原来把 `is_ascii_mode` 写死成 0。
+    // 后果（2026-11-02 定案）：引擎永远以为自己在中文态 —— `KeyEventResponse.ascii_mode`
+    // 恒为 `Some(false)` ⇒ `previous_ascii != response.ascii_mode` 永不成立 ⇒
+    // 「中英提示」一次都发不出去（`theme.log` 32 条全 `zh`、0 条 `en`），
+    // 任务栏「中/英」也不会变。**这才是根因**，不是渲染器那道门。
+    (*status).is_ascii_mode = session
+        .context()
+        .map(|c| c.get_option("ascii_mode"))
+        .unwrap_or(false) as Bool;
     (*status).is_full_shape = 0;
     (*status).is_simplified = 1;
     (*status).is_traditional = 0;
@@ -1095,11 +1103,26 @@ unsafe extern "C" fn rime_change_page(id: RimeSessionId, backward: Bool) -> Bool
     0
 }
 
-unsafe extern "C" fn rime_delete_candidate(_id: RimeSessionId, _index: usize) -> Bool {
+unsafe extern "C" fn rime_delete_candidate(id: RimeSessionId, index: usize) -> Bool {
+    let mut g = global().lock().unwrap();
+    if let Some(s) = g.sessions.get_mut(&id) {
+        if let Some(c) = s.context_mut() {
+            // 原来这里是空桩（恒 0）——宿主调 `RimeDeleteCandidate` 什么都不会发生
+            // （2026-11-01 用户报"打错的词删不掉"）。现在转发到 `Context`，
+            // 拉黑 + 重算本段；末段只剩一条候选时不给删（删光了就没法输入了）。
+            if c.menu_candidate_count() <= 1 {
+                return 0;
+            }
+            return c.delete_candidate(index) as Bool;
+        }
+    }
     0
 }
-unsafe extern "C" fn rime_delete_candidate_on_current_page(_id: RimeSessionId, _index: usize) -> Bool {
-    0
+unsafe extern "C" fn rime_delete_candidate_on_current_page(
+    id: RimeSessionId,
+    index: usize,
+) -> Bool {
+    rime_delete_candidate(id, index)
 }
 
 unsafe extern "C" fn rime_highlight_candidate(id: RimeSessionId, index: usize) -> Bool {

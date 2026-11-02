@@ -182,6 +182,13 @@ impl Translation for ScriptWordsTranslation {
                 self.ii = 0;
                 continue;
             };
+            // 用户按 Ctrl+Delete 删掉的词：直接从候选里**消失**。
+            // 光靠 `bonus` 的 −1000×weight 压不动：用户词层自带 +1e9，
+            // 惩罚量级差 6 个数量级，删过的词照样排在首选（2026-11-01 用户报"删不掉"）。
+            if crate::engine::user_ngram::is_blocked_global(&entry.text) {
+                self.ii += 1;
+                continue;
+            }
             // C++ `set_quality(exp(entry->weight) + initial +
             //                  entry->quality_len / full_code_length)`
             let mut quality = self.quality_stride * (*code_len) as f64

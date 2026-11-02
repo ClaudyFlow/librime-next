@@ -1,9 +1,10 @@
 //! `src/rime/translator.h` + `gear/script_translator.cc`：`Translator` trait + 拼音翻译器。
 
 use crate::algo::syllabifier::{SyllableGraph, Syllabifier};
+use crate::dict::corrector::EditDistanceCorrector;
 use crate::dict::dictionary::Dictionary;
 use crate::dict::user_dictionary::UserDictionary;
-use crate::dict::vocabulary::DictEntry;
+use crate::dict::vocabulary::{Code, DictEntry, SyllableId};
 use crate::engine::candidate::Candidate;
 use crate::engine::commit_history::CommitHistory;
 use crate::engine::gear::poet::{Poet, Sentence, WordGraph};
@@ -90,6 +91,11 @@ pub struct ScriptTranslator {
     /// 用户词典（`Translator::user_dict_`）。`None` = 方案没开 `enable_user_dict`
     /// 或者拿不到词典名。
     pub user_dict: Option<UserDictionary>,
+    /// 纠错器（`translator/enable_correction: true` 时懒建）。
+    ///
+    /// 音节表来自 [`Dictionary::table`]，一次建好；每次 `build_graph` 只需要
+    /// [`EditDistanceCorrector::clone`]（共享同一份音节表与查询缓存）。
+    pub correction: Option<EditDistanceCorrector>,
 }
 
 impl ScriptTranslator {
@@ -103,6 +109,7 @@ impl ScriptTranslator {
             options,
             poet: Poet::new(None),
             user_dict: None,
+            correction: None,
         }
     }
 
@@ -116,6 +123,38 @@ impl ScriptTranslator {
     pub fn with_poet(mut self, poet: Poet) -> Self {
         self.poet = poet;
         self
+    }
+
+    /// 建纠错器（`translator/enable_correction: true` 时）。
+    ///
+    /// 幂等：没开开关、或已经建过就直接返回。音节表从 `Table` 拿 —— prism 那边
+    /// 不暴露 syllabary（`dict/prism.h` 只有查词方法），而 `Table` 有。
+    /// 拿不到音节表（词典没打开）时保持 `None`，纠错静默失效。
+    pub fn ensure_correction(&mut self) {
+        if !self.options.enable_correction || self.correction.is_some() {
+            return;
+        }
+        let Some(syllabary) = self.dict.table.syllabary() else {
+            return;
+        };
+        // ⚠️ id 必须是 **prism 的拼写 id**，不能是 table 的音节 id：
+        // `syllabifier` 拿到 `tolerance_search` 的结果后直接拿它去
+        // `prism.query_spelling(id)` 查属性（`syllabifier.cc:97-104`），
+        // 所以这里逐条用 `prism.get_value` 把音节串翻成 prism 自己的 id。
+        // 串从 `Table` 拿（prism 不暴露 syllabary，见 `EditDistanceCorrector` 的文档）。
+        let mut pairs: Vec<(String, SyllableId)> = Vec::new();
+        for (spelling, _syllable_id) in syllabary.syllable_to_id() {
+            if let Some(spelling_id) = self.dict.prism.get_value(&spelling) {
+                pairs.push((spelling.to_string(), spelling_id));
+            }
+        }
+        if pairs.is_empty() {
+            return;
+        }
+        self.correction = Some(EditDistanceCorrector::with_syllabary(
+            self.options.correction_tolerance,
+            pairs,
+        ));
     }
 
     /// 构造候选的 preedit 串（对照 C++ `ScriptSyllabifier::GetPreeditString`）。
@@ -226,11 +265,58 @@ impl ScriptTranslator {
             false,
             None,
         );
+        // 纠错：`enable_correction` 打开 + 纠错器已建（音节表来自 Table）。
+        // 挂上后纠出来的拼写带 `is_correction` + `credibility = log(0.01)`，
+        // 因此只会在真候选**后面**出现（Xime 说的"只追加、绝不替换"）。
+        if let Some(corrector) = self.correction.as_ref() {
+            syllabifier.enable_correction(Box::new(corrector.clone()));
+        }
         let consumed = syllabifier.build_syllable_graph(input, &self.dict.prism, &mut graph);
         if consumed <= 0 {
             return None;
         }
         Some((graph, consumed as usize))
+    }
+
+    /// 覆盖 `[0, end]` 的一条音节路径 → `Code`（用户词典的学词键）。
+    ///
+    /// 整句候选的 `entry` 原本**没有 code**，于是 `Memorize` 写不进用户词典
+    /// （`update_entry` 见空 code 就跳过）——用户上屏的整句永远学不会，下次打同样
+    /// 一串还是整句候选压在前面，刚打过的词"又回到后面"（2026-11-01 实机报告）。
+    ///
+    /// 走法：每个起点取**跨度最大**的边（长音节优先，与 `Transpose` 的序一致），
+    /// 直到走满 `end`。切分点优先用 `stops`（整句各成分的 end_pos，来自 poet），
+    /// 这样学进去的切法与屏幕上看到的分词一致。
+    fn code_for(&self, input: &str, end: usize, stops: &[usize]) -> Option<Code> {
+        if end == 0 {
+            return None;
+        }
+        let (graph, _consumed) = self.build_graph(input)?;
+        let mut ids: Vec<crate::algo::syllabifier::SyllableId> = Vec::new();
+        let mut pos = 0usize;
+        while pos < end {
+            // 优先落在成分边界上（poet 的分词点），否则取最长音节
+            let target = stops
+                .iter()
+                .copied()
+                .find(|s| *s > pos && *s <= end && graph.edges.get(&pos).map_or(false, |m| m.contains_key(s)))
+                .or_else(|| {
+                    graph.edges.get(&pos).and_then(|m| {
+                        m.keys()
+                            .filter(|e| **e <= end)
+                            .max()
+                            .copied()
+                    })
+                })?;
+            let syllable_id = graph
+                .edges
+                .get(&pos)
+                .and_then(|m| m.get(&target))
+                .and_then(|sp| sp.keys().next().copied())?;
+            ids.push(syllable_id);
+            pos = target;
+        }
+        Some(Code::from_slice(&ids))
     }
 
     /// `PrepareForMakingSentence`（`script_translator.cc:705-722`）：
@@ -310,6 +396,10 @@ impl ScriptTranslator {
                 if self.options.blacklist.contains(&entry.text) {
                     continue;
                 }
+                // 同上（translation.rs 的 peek）：删过的词直接消失，不靠压分。
+                if crate::engine::user_ngram::is_blocked_global(&entry.text) {
+                    continue;
+                }
                 let quality =
                     entry.code.len() as f64 * QUALITY_SYLLABLE_STRIDE + QUALITY_TIER_USER + entry.weight;
                 // 收集器键是段内相对 end;候选跨度补成绝对坐标。
@@ -328,6 +418,14 @@ impl ScriptTranslator {
                 out.push(candidate);
             }
         }
+        // 用户词典候选按质量降序(2026-11-01):lookup 顺序≠质量序,
+        // 不排序会把高频单字顶在多字词组前面(实机:打过十几遍的词组
+        // 被两个 1e12 的单字压住)。整句让位判据也依赖这里的顺序。
+        out.sort_by(|a, b| {
+            b.quality
+                .partial_cmp(&a.quality)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         out
     }
 }
@@ -342,6 +440,8 @@ impl Translator for ScriptTranslator {
         if !self.options.has_any_tag(&segment.tags) {
             return None;
         }
+        // 纠错器懒建一次（`enable_correction` 没开时什么都不做）
+        self.ensure_correction();
 
         // ---- 层 1(先算):用户词典——命中整段就不出整句 ------------------
         // C++ `IsExactMatch` 的判据含用户词典词条:打过十几遍的词组再打,
@@ -357,6 +457,13 @@ impl Translator for ScriptTranslator {
         {
             let consumed = sentence.end_pos;
             let preedit = self.build_preedit(input, consumed);
+            // 学词键：整句覆盖 [0, consumed] 的音节路径；切分点用 poet 的成分边界。
+            let stops: Vec<usize> = sentence
+                .components()
+                .iter()
+                .map(|(end_pos, _, _)| *end_pos)
+                .collect();
+            let sentence_code = self.code_for(input, consumed, &stops);
             let mut candidate = Candidate::new(
                 "script",
                 segment.start,
@@ -369,6 +476,7 @@ impl Translator for ScriptTranslator {
             )
             .with_entry(crate::dict::vocabulary::DictEntry {
                 text: sentence.text.clone(),
+                code: sentence_code.unwrap_or_default(),
                 ..Default::default()
             })
             .with_components(
@@ -452,5 +560,148 @@ impl Translator for ScriptTranslator {
             }
         }
         written
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 真实词典夹具（`luna_pinyin.table.bin` + `luna_pinyin_simp.prism.bin`），
+    /// 缺夹具时静默跳过 —— 与其它真实数据测试同风格。
+    fn real_dict() -> Option<Dictionary> {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test/e2e/build");
+        Dictionary::open(&dir, "luna_pinyin", "luna_pinyin_simp")
+    }
+
+    #[test]
+    fn correction_config_defaults_off_and_reads_from_schema() {
+        assert!(
+            !TranslatorOptions::default().enable_correction,
+            "纠错默认关（与上游一致：要方案作者主动开）"
+        );
+        let config: serde_json::Value = serde_json::from_str(
+            r#"{"translator": {"enable_correction": true, "correction_tolerance": 2}}"#,
+        )
+        .unwrap();
+        let options = TranslatorOptions::from_config(&config, "translator");
+        assert!(options.enable_correction);
+        assert_eq!(options.correction_tolerance, 2);
+        // 容差有个上限，配得再大也不让噪声无限膨胀
+        let config: serde_json::Value =
+            serde_json::from_str(r#"{"translator": {"correction_tolerance": 99}}"#).unwrap();
+        assert!(TranslatorOptions::from_config(&config, "translator").correction_tolerance <= 3);
+    }
+
+    /// 端到端：把「nihao」打成「nihap」（`o` 敲到邻键 `p`）时，开了纠错整串能被
+    /// 音节图解释完；关着就只能解释到一半。
+    #[test]
+    fn correction_saves_a_mistyped_syllable() {
+        let Some(dict) = real_dict() else {
+            return;
+        };
+        let input = "nihap";
+        // `Dictionary` 不 `Clone`，两遍各自打开一次
+        let Some(dict) = real_dict() else {
+            return;
+        };
+        let hao = syllable_id(&dict, "hao");
+        assert!(
+            !edges_have(
+                &ScriptTranslator::new(dict).build_graph(input).unwrap().0,
+                2,
+                5,
+                hao
+            ),
+            "关着纠错时「hap」不该被解释成「hao」"
+        );
+
+        let Some(dict) = real_dict() else {
+            return;
+        };
+        let mut options = TranslatorOptions::default();
+        options.enable_correction = true;
+        let mut translator = ScriptTranslator::with_options(dict, options);
+        translator.ensure_correction();
+        let Some(corrector) = translator.correction.as_ref() else {
+            panic!("开了 enable_correction 就该建出纠错器（音节表来自 Table）");
+        };
+        assert!(corrector.syllabary_len() > 0, "音节表不该为空");
+        // id 用 **table 的音节 id**：图里 `spellings` 的键是 `query_spelling` 出来的
+        // syllable_id，而不是 prism 的 spelling_id（`tolerance_search` 返回的那个）。
+        let hao = syllable_id(&translator.dict, "hao");
+        let (g, _) = translator.build_graph(input).unwrap();
+        assert!(
+            edges_have(&g, 2, 5, hao),
+            "「nihap」的 `hap` 应被纠成 `hao`（p 是 o 的邻键）"
+        );
+        // 反过来：不是邻键的替换不该被当成误触
+        let mao = syllable_id(&translator.dict, "mao");
+        if let Some(mao) = mao {
+            let (g, _) = translator.build_graph("nihaz").unwrap();
+            assert!(!edges_have(&g, 2, 5, Some(mao)), "「z」不是「o」的邻键，不该纠");
+        }
+    }
+
+    /// `Table` 里某个拼写对应的**音节 id**。
+    fn syllable_id(dict: &Dictionary, spelling: &str) -> Option<SyllableId> {
+        dict.table
+            .syllabary()?
+            .syllable_to_id()
+            .into_iter()
+            .find(|(text, _)| *text == spelling)
+            .map(|(_, id)| id)
+    }
+
+    /// 音节图里 `start → end` 这条边上有没有 `syllable` 这个音节。
+    fn edges_have(
+        graph: &SyllableGraph,
+        start: usize,
+        end: usize,
+        syllable: Option<SyllableId>,
+    ) -> bool {
+        let Some(syllable) = syllable else {
+            return false;
+        };
+        graph
+            .edges
+            .get(&start)
+            .and_then(|ends| ends.get(&end))
+            .is_some_and(|spellings| spellings.contains_key(&syllable))
+    }
+
+    /// 纠错不能抢位：`syllabifier` 给纠出来的拼写打 `is_correction` +
+    /// `credibility = log(0.01)`，所以「打错才有的候选」一定比「打对就有的」低。
+    #[test]
+    fn corrected_spellings_are_penalized() {
+        let Some(dict) = real_dict() else {
+            return;
+        };
+        let mut options = TranslatorOptions::default();
+        options.enable_correction = true;
+        let mut translator = ScriptTranslator::with_options(dict, options);
+        translator.ensure_correction();
+        // 打对的：整串可解释，且没有一条边是 correction
+        let (good, _) = translator.build_graph("nihao").expect("「nihao」应能建图");
+        assert!(
+            !has_correction_edge(&good),
+            "打对时不该出现纠错边"
+        );
+        // 打错的：纠错边存在，且 credibility 是惩罚值
+        let (bad, _) = translator.build_graph("nihap").expect("「nihap」应能建图");
+        assert!(has_correction_edge(&bad), "打错时应出现纠错边");
+    }
+
+    /// 判据用 `credibility`：纠错的拼写被罚 `log(0.01)`（`is_correction` 是
+    /// `algo` 模块内可见的字段，这里只能看分数）。
+    fn has_correction_edge(graph: &SyllableGraph) -> bool {
+        graph
+            .edges
+            .values()
+            .flat_map(|ends| ends.values())
+            .flat_map(|spellings| spellings.values())
+            .any(|props| {
+                props.credibility <= crate::algo::syllabifier::K_CORRECTION_CREDIBILITY
+            })
     }
 }

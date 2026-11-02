@@ -80,6 +80,7 @@ pub mod reverse_lookup_dictionary;
 pub mod text_db;
 pub mod tsv;
 pub mod user_db;
+pub mod user_dict_cache;
 pub mod user_dictionary;
 pub mod vocabulary;
 

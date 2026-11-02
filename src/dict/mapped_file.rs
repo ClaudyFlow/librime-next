@@ -44,6 +44,81 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+// ── 真 mmap(2026-11-01):gram 模型 473MB 不再全量堆驻 ──────────────────
+// 旧注释说"这些文件最大 6MB"——gram 时代(单本 206MB)假设已破。
+// 只读模式用 CreateFileMappingW + MapViewOfFile:按需换页、进程内共享
+// 页缓存、繁体页在简体模式下永不触碰。
+
+/// 一个只读的 Windows 内存映射视图。持有文件句柄 + 映射句柄 + 视图指针,
+/// `Drop` 时解除映射并关闭句柄。
+struct MmapView {
+    file: fs::File,
+    mapping: windows::Win32::Foundation::HANDLE,
+    view: *mut u8,
+    len: usize,
+}
+
+impl MmapView {
+    fn open(path: &Path) -> io::Result<Self> {
+        use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
+        use windows::Win32::System::Memory::{
+            CreateFileMappingW, MapViewOfFile, FILE_MAP_READ, PAGE_READONLY,
+        };
+        let _ = FILE_SHARE_READ;
+        use std::os::windows::io::AsRawHandle;
+        let file = fs::File::open(path)?;
+        let metadata = file.metadata()?;
+        let len = metadata.len() as usize;
+        if len == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "空文件不可映射"));
+        }
+        unsafe {
+            let mapping = CreateFileMappingW(
+                windows::Win32::Foundation::HANDLE(file.as_raw_handle()),
+                None,
+                PAGE_READONLY,
+                0,
+                0,
+                None,
+            )?;
+            let view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+            if view.Value.is_null() {
+                let _ = windows::Win32::Foundation::CloseHandle(mapping);
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self {
+                file,
+                mapping,
+                view: view.Value.cast::<u8>(),
+                len,
+            })
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        // SAFETY:视图存活期由 Self 持有(mapping/view 在 Drop 里释放),
+        // 长度 = 文件大小,映射期间内容不变。
+        unsafe { std::slice::from_raw_parts(self.view, self.len) }
+    }
+}
+
+// SAFETY:只读映射等价于 `&[u8]` 的共享语义;句柄仅用于 Drop。
+unsafe impl Send for MmapView {}
+unsafe impl Sync for MmapView {}
+
+impl Drop for MmapView {
+    fn drop(&mut self) {
+        unsafe {
+            use windows::Win32::Foundation::CloseHandle;
+            use windows::Win32::System::Memory::UnmapViewOfFile;
+            let _ = UnmapViewOfFile(windows::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: self.view.cast::<core::ffi::c_void>(),
+            });
+            let _ = CloseHandle(self.mapping);
+        }
+    }
+}
+
 /// `OffsetPtr<T>` 的字节数
 pub const OFFSET_PTR_SIZE: usize = 4;
 /// `String` 的字节数
@@ -59,13 +134,54 @@ pub const fn align_up(size: usize, align: usize) -> usize {
 }
 
 /// 一份 `MappedFile` 的字节镜像。
-#[derive(Debug, Clone)]
+///
+/// 2026-11-01:只读模式改为**真 mmap**(`MmapView`,按需换页);可写模式仍是
+/// 内存暂存(`buf`)+ `save` 落盘。`Clone` 手写:只读重新映射,可写拷贝缓冲。
 pub struct MappedFile {
     path: PathBuf,
     buf: Vec<u8>,
-    /// 写模式下"已经分配到哪"（对应 C++ 的 `size_`）；读模式下等于 `buf.len()`。
+    /// 写模式下"已经分配到哪"（对应 C++ 的 `size_`）；读模式下等于视图长度。
     used: usize,
     writable: bool,
+    mmap: Option<MmapView>,
+}
+
+impl std::fmt::Debug for MappedFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MappedFile")
+            .field("path", &self.path)
+            .field("used", &self.used)
+            .field("writable", &self.writable)
+            .field("mmapped", &self.mmap.is_some())
+            .finish()
+    }
+}
+
+impl Clone for MappedFile {
+    fn clone(&self) -> Self {
+        if let Some(view) = &self.mmap {
+            // 只读:重新映射同一文件(便宜,OS 页缓存共享)
+            match MmapView::open(&self.path) {
+                Ok(mmap) => {
+                    return Self {
+                        path: self.path.clone(),
+                        buf: Vec::new(),
+                        used: self.used,
+                        writable: false,
+                        mmap: Some(mmap),
+                    };
+                }
+                Err(_) => {}
+            }
+        }
+        Self {
+            path: self.path.clone(),
+            buf: self.buf.clone(),
+            used: self.used,
+            writable: self.writable,
+            mmap: None,
+        }
+    }
 }
 
 impl MappedFile {
@@ -74,6 +190,18 @@ impl MappedFile {
     /// `MappedFile::OpenReadOnly()`（`mapped_file.cc:73`）。
     pub fn open_read_only(path: impl Into<PathBuf>) -> io::Result<Self> {
         let path = path.into();
+        // 真 mmap:gram 模型(单本 206MB)按需换页,不全量堆驻。
+        // 映射失败(跨盘/权限/文件系统)退回 fs::read,语义不变。
+        if let Ok(mmap) = MmapView::open(&path) {
+            let used = mmap.len;
+            return Ok(Self {
+                path,
+                buf: Vec::new(),
+                used,
+                writable: false,
+                mmap: Some(mmap),
+            });
+        }
         let buf = fs::read(&path)?;
         let used = buf.len();
         Ok(Self {
@@ -81,7 +209,22 @@ impl MappedFile {
             buf,
             used,
             writable: false,
+            mmap: None,
         })
+    }
+
+    /// 测试专用:字节一致性校验用。
+    #[doc(hidden)]
+    pub fn as_bytes_view_for_test(&self) -> &[u8] {
+        self.view()
+    }
+
+    /// 字节视图:只读 = mmap 视图;可写 = 内存暂存缓冲。
+    fn view(&self) -> &[u8] {
+        match &self.mmap {
+            Some(mmap) => mmap.bytes(),
+            None => &self.buf,
+        }
     }
 
     /// `MappedFile::Create(capacity)`（`mapped_file.cc:47`）：清空文件并给足容量。
@@ -94,6 +237,7 @@ impl MappedFile {
             path,
             buf: vec![0u8; capacity],
             used: 0,
+            mmap: None,
             writable: true,
         })
     }
@@ -118,7 +262,7 @@ impl MappedFile {
 
     /// `file_size()`：文件的**容量**（不是已用长度）。
     pub fn capacity(&self) -> usize {
-        self.buf.len()
+        self.view().len()
     }
 
     /// 已用长度：读模式下是文件长度；写模式下是"分配水位"。
@@ -130,7 +274,7 @@ impl MappedFile {
 
     #[inline]
     fn check(&self, pos: usize, len: usize) -> Option<()> {
-        if pos.checked_add(len).is_some_and(|end| end <= self.buf.len()) {
+        if pos.checked_add(len).is_some_and(|end| end <= self.view().len()) {
             Some(())
         } else {
             None
@@ -145,12 +289,12 @@ impl MappedFile {
 
     pub fn u8_at(&self, pos: usize) -> Option<u8> {
         self.check(pos, 1)?;
-        Some(self.buf[pos])
+        Some(self.view()[pos])
     }
 
     pub fn u32_at(&self, pos: usize) -> Option<u32> {
         self.check(pos, 4)?;
-        Some(u32::from_le_bytes(self.buf[pos..pos + 4].try_into().ok()?))
+        Some(u32::from_le_bytes(self.view()[pos..pos + 4].try_into().ok()?))
     }
 
     pub fn i32_at(&self, pos: usize) -> Option<i32> {
@@ -163,15 +307,15 @@ impl MappedFile {
 
     pub fn bytes_at(&self, pos: usize, len: usize) -> Option<&[u8]> {
         self.check(pos, len)?;
-        Some(&self.buf[pos..pos + len])
+        Some(&self.view()[pos..pos + len])
     }
 
     /// 从 `pos` 读一个 NUL 结尾的字节串（不校验 UTF-8）。
     pub fn cstr_bytes_at(&self, pos: usize) -> Option<&[u8]> {
-        if pos >= self.buf.len() {
+        if pos >= self.view().len() {
             return None;
         }
-        let tail = &self.buf[pos..];
+        let tail = &self.view()[pos..];
         let end = tail.iter().position(|&b| b == 0)?;
         Some(&tail[..end])
     }

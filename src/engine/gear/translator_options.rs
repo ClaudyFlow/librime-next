@@ -44,6 +44,15 @@ pub struct TranslatorOptions {
     pub comment_formatter: Projection,
     /// `dictionary_exclude`：命中即丢弃的词面。
     pub blacklist: HashSet<String>,
+    /// `enable_correction`：拼写纠错（打错一个邻键时也出候选）。
+    ///
+    /// C++ 侧由 `ScriptTranslator` 读同一个键，然后给 `Syllabifier` 挂上
+    /// `EditDistanceCorrector`（`script_translator.cc` 的 `enable_correction()`）。
+    /// 默认 **false** —— 与上游默认一致：纠错会让"想不到但存在"的拼写混进候选，
+    /// 要方案作者主动开。
+    pub enable_correction: bool,
+    /// `correction/tolerance`：容忍几次误触（默认 1）。
+    pub correction_tolerance: usize,
 }
 
 impl TranslatorOptions {
@@ -58,6 +67,8 @@ impl TranslatorOptions {
             preedit_formatter: Projection::default(),
             comment_formatter: Projection::default(),
             blacklist: HashSet::new(),
+            enable_correction: false,
+            correction_tolerance: 1,
         };
 
         // 变体命名空间（simp/trad）配置挂在 `translator/` 下（Rime-Next 双变体设计，
@@ -97,6 +108,19 @@ impl TranslatorOptions {
             .and_then(Value::as_bool)
         {
             options.strict_spelling = v;
+        }
+        // 纠错开关（`translator/enable_correction`）与容差（`translator/correction_tolerance`）。
+        if let Some(v) = config
+            .pointer(&format!("{}/enable_correction", section_prefix))
+            .and_then(Value::as_bool)
+        {
+            options.enable_correction = v;
+        }
+        if let Some(v) = config
+            .pointer(&format!("{}/correction_tolerance", section_prefix))
+            .and_then(Value::as_u64)
+        {
+            options.correction_tolerance = usize::try_from(v).unwrap_or(1).clamp(1, 3);
         }
 
         // tag / tags：配了 `tag` 就替换第一个；**没配** `tag` 就把默认的 `abc` 清空，

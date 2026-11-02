@@ -42,6 +42,14 @@ pub struct UserNgram {
     clock: u64,
     /// 因为超上限被丢掉的条数（诊断用）。
     evicted: u64,
+    /// 单个词的提交次数（用户反复打同一个词时，靠它进首选——不依赖上文）。
+    unigram: HashMap<String, PairCount>,
+    /// 被用户**手动删掉**的词（`Ctrl+Delete`）：永不抬分，并压低排序。
+    blocked: std::collections::HashSet<String>,
+    /// 最近提交过的词（最多 4 个）：单次提交往往只有 1 个词，必须带上文才凑得出二元组。
+    recent: Vec<String>,
+    /// 自上次落盘以来提交的次数（每 N 次写一次盘，避免每键都写文件）。
+    dirty: u32,
 }
 
 impl UserNgram {
@@ -84,6 +92,122 @@ impl UserNgram {
     /// 2026-10-31 接线定口径：整段重学会让旧记录反复计数（学习即递增），
     /// 运行时必须**每次提交只喂本次的词**，由调用方负责切词
     /// （多段组合 = 逐段候选；整句提交的回切词待词典贪心，见 1031日志）。
+    /// **运行时增量入口**：把本次提交的词接到"最近窗口"后面再学。
+    ///
+    /// 为什么需要它：一次提交常常只有一个词（用户点了一条候选），
+    /// `learn_words` 要求 ≥2 个词，直接喂就会静默不学（2026-11-01 用户报
+    /// "打过十几遍还是不在首选"就是这个原因）。
+    pub fn learn_commit(&mut self, words: &[String]) {
+        for word in words {
+            if word.is_empty() {
+                continue;
+            }
+            // 词频：反复打同一个词 ⇒ 直接抬高它的分数
+            self.clock += 1;
+            let entry = self.unigram.entry(word.clone()).or_default();
+            entry.count = entry.count.saturating_add(1);
+            entry.last_used = self.clock;
+            self.recent.push(word.clone());
+            if self.recent.len() > 4 {
+                self.recent.remove(0);
+            }
+        }
+        self.dirty += 1;
+        let window = self.recent.clone();
+        self.learn_words(&window);
+    }
+
+    /// 用户删词：从统计里抹掉，并拉黑（打错一次就永远别再冒头）。
+    pub fn penalize(&mut self, word: &str) {
+        if word.is_empty() {
+            return;
+        }
+        self.blocked.insert(word.to_string());
+        self.unigram.remove(word);
+        self.bigram.retain(|(_, next), _| next != word);
+        self.trigram.retain(|(_, _, next), _| next != word);
+        self.dirty += 1;
+    }
+
+    /// 这个词是否被拉黑。
+    pub fn is_blocked(&self, word: &str) -> bool {
+        self.blocked.contains(word)
+    }
+
+    /// 落盘（TSV：`b<TAB>词1<TAB>词2<TAB>次数` / `t<TAB>词1<TAB>词2<TAB>词3<TAB>次数`）。
+    pub fn save(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write as _;
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut out = String::new();
+        for word in &self.blocked {
+            out.push_str(&format!("x	{word}
+"));
+        }
+        for (word, entry) in &self.unigram {
+            out.push_str(&format!("u	{word}	{}
+", entry.count));
+        }
+        for ((first, second), entry) in &self.bigram {
+            out.push_str(&format!("b	{first}	{second}	{}
+", entry.count));
+        }
+        for ((a, b, c), entry) in &self.trigram {
+            out.push_str(&format!("t	{a}	{b}	{c}	{}
+", entry.count));
+        }
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(out.as_bytes())?;
+        self.dirty = 0;
+        Ok(())
+    }
+
+    /// 读盘；文件不存在时静默返回。
+    pub fn load(&mut self, path: &std::path::Path) {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
+        for line in text.lines() {
+            let parts: Vec<&str> = line.split('\t').collect();
+            match parts.first().copied() {
+                Some("x") if parts.len() == 2 => {
+                    self.blocked.insert(parts[1].to_string());
+                }
+                Some("u") if parts.len() == 3 => {
+                    if let Ok(count) = parts[2].parse::<u32>() {
+                        self.clock += 1;
+                        self.unigram.insert(parts[1].to_string(), PairCount { count, last_used: self.clock });
+                    }
+                }
+                Some("b") if parts.len() == 4 => {
+                    if let Ok(count) = parts[3].parse::<u32>() {
+                        self.clock += 1;
+                        self.bigram.insert(
+                            (parts[1].to_string(), parts[2].to_string()),
+                            PairCount { count, last_used: self.clock },
+                        );
+                    }
+                }
+                Some("t") if parts.len() == 5 => {
+                    if let Ok(count) = parts[4].parse::<u32>() {
+                        self.clock += 1;
+                        self.trigram.insert(
+                            (parts[1].to_string(), parts[2].to_string(), parts[3].to_string()),
+                            PairCount { count, last_used: self.clock },
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// 该落盘了吗（每 10 次提交写一次）。
+    pub fn should_flush(&self) -> bool {
+        self.dirty >= 10
+    }
+
     pub fn learn_words(&mut self, words: &[String]) {
         let words: Vec<String> = words
             .iter()
@@ -133,15 +257,28 @@ impl UserNgram {
         candidate: &str,
         weight: f64,
     ) -> f64 {
+        // ⚠️ 2026-11-01 修：以前这里先 `let Some(prev) = prev else { return 0.0 }`，
+        // 于是**词频加成和黑名单在"没有上文"时完全不生效**——用户打第一个词
+        // （如 yinamiao → 一纳秒）永远拿不到加成、删了也压不下去。
+        // 现在把「拉黑」和「词频」提到最前，二元/三元才受上文约束。
+        if self.is_blocked(candidate) {
+            return -weight * 1000.0; // 黑名单：压到几乎最后（10 太小，压不过词典权重）
+        }
+        let unigram = self
+            .unigram
+            .get(candidate)
+            .map(|entry| entry.count as f64)
+            .unwrap_or(0.0);
+        let unigram_bonus = weight * (1.0 + unigram).ln() * 4.0; // 词频权重 1.5→4.0（要让"常打的词"压过词典序）
         let Some(prev) = prev else {
-            return 0.0;
+            return unigram_bonus;
         };
         let bigram = self.bigram_count(prev, candidate) as f64;
         let trigram = before_last
             .map(|first| self.trigram_count(first, prev, candidate) as f64)
             .unwrap_or(0.0);
         // 三元给双倍权重：更具体，也更说明用户就是这个搭配。
-        weight * ((1.0 + bigram).ln() + 2.0 * (1.0 + trigram).ln())
+        unigram_bonus + weight * ((1.0 + bigram).ln() + 2.0 * (1.0 + trigram).ln())
     }
 
     /// 超上限时按最久未用淘汰，直到回到上限以内。
@@ -234,7 +371,45 @@ mod tests {
 /// 进程级个人 n-gram 表（本进程学习、本进程使用——青简边界：不跨应用）。
 pub fn global() -> &'static std::sync::Mutex<UserNgram> {
     static GLOBAL: std::sync::OnceLock<std::sync::Mutex<UserNgram>> = std::sync::OnceLock::new();
-    GLOBAL.get_or_init(|| std::sync::Mutex::new(UserNgram::new()))
+    GLOBAL.get_or_init(|| {
+        let mut ngram = UserNgram::new();
+        ngram.load(&store_path());
+        std::sync::Mutex::new(ngram)
+    })
+}
+
+/// 个人 n-gram 的落盘位置（%APPDATA%/Rime-Next/user_ngram.tsv）。
+pub fn store_path() -> std::path::PathBuf {
+    std::env::var_os("APPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default()
+        .join("Rime-Next")
+        .join("user_ngram.tsv")
+}
+
+/// 候选生成期的快速判定：这个词被用户删过吗？
+///
+/// 独立的 lock scope（不能和 `bonus` 的锁重入），命中即跳过该候选。
+/// 放在这里而不是让各处自己 `global().lock()`，是为了避免把锁的生命周期
+/// 拖进候选构造（容易和 `bonus` 撞成死锁）。
+pub fn is_blocked_global(word: &str) -> bool {
+    if word.is_empty() {
+        return false;
+    }
+    global()
+        .lock()
+        .map(|ngram| ngram.is_blocked(word))
+        .unwrap_or(false)
+}
+
+/// 学一次提交并适时落盘。
+pub fn learn_and_maybe_flush(words: &[String]) {
+    if let Ok(mut ngram) = global().lock() {
+        ngram.learn_commit(words);
+        if ngram.should_flush() {
+            let _ = ngram.save(&store_path());
+        }
+    }
 }
 
 /// 默认加成权重（`translator/ngram_weight` 配置化之前先取 1.0）。
@@ -259,6 +434,7 @@ pub fn last_two_words(history: &CommitHistory) -> (Option<String>, Option<String
 #[cfg(test)]
 mod wiring_tests {
     use super::*;
+    use crate::engine::commit_history::CommitRecord;
 
     /// 口径过滤:raw 丢弃、单字丢弃(2026-10-31 接线定稿)。
     #[test]

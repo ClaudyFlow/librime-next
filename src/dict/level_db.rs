@@ -38,8 +38,9 @@
 //! * **`reuse_logs`**。`rusty-leveldb` 默认 `true`（复用 `.log` 而不是每次 open 都
 //!   转成 `.ldb`），C++ 默认 `false`。只影响落盘时机，不影响可见数据。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use rusty_leveldb::{Options as LdbOptions, WriteBatch, DB};
 
@@ -64,6 +65,9 @@ struct LevelDbState {
     loaded: bool,
     readonly: bool,
     disabled: bool,
+    /// 写次数（`Db::write_generation`）：共享同一 db 的多个 UserDictionary
+    /// 靠它判断自己的内存镜像是否过期。
+    writes: u64,
     cursors: Vec<Option<rusty_leveldb::DBIterator>>,
 }
 
@@ -75,6 +79,7 @@ impl LevelDbState {
             loaded: false,
             readonly: false,
             disabled: false,
+            writes: 0,
             cursors: Vec::new(),
         }
     }
@@ -100,7 +105,11 @@ impl LevelDbState {
         let Some(db) = self.db.as_mut() else {
             return false;
         };
-        db.put(key.as_bytes(), value.as_bytes()).is_ok()
+        let ok = db.put(key.as_bytes(), value.as_bytes()).is_ok();
+        if ok {
+            self.writes += 1;
+        }
+        ok
     }
 
     fn erase(&mut self, key: &str) -> bool {
@@ -114,7 +123,11 @@ impl LevelDbState {
         let Some(db) = self.db.as_mut() else {
             return false;
         };
-        db.delete(key.as_bytes()).is_ok()
+        let ok = db.delete(key.as_bytes()).is_ok();
+        if ok {
+            self.writes += 1;
+        }
+        ok
     }
 
     fn meta_fetch(&mut self, key: &str) -> Option<String> {
@@ -176,6 +189,33 @@ impl LevelDb {
         )
     }
 
+    /// 取**进程级共享**的用户词典句柄（同一路径只 `DB::open` 一次）。
+    ///
+    /// 为什么必须进程级：LevelDB 的 `LOCK` 是**按目录独占**的，同一进程里第二次
+    /// `DB::open` 同一目录同样会失败。长驻的引擎进程（Server 监视、空闲会话回收）
+    /// 里每个会话都会新建一个 `Engine`，而每个 `Engine` 都要开同一个 `.userdb` ——
+    /// 结果就是「先开的赢、后开的静默丢掉用户词典」，表现为学词时好时坏、
+    /// 用户词永远进不了首页（2026-11-02 用户报「打十几遍还是不在第一页」）。
+    ///
+    /// 句柄用 `Weak` 登记：所有持有者都释放后条目自动失效，下次重新打开，
+    /// 因此用户库被删除/重建后不会一直握着旧句柄。
+    pub fn shared_user_db(db_dir: &Path, name: &str) -> Arc<LevelDb> {
+        fn pool() -> &'static Mutex<HashMap<PathBuf, Weak<LevelDb>>> {
+            static POOL: OnceLock<Mutex<HashMap<PathBuf, Weak<LevelDb>>>> = OnceLock::new();
+            POOL.get_or_init(|| Mutex::new(HashMap::new()))
+        }
+        let path = super::db::db_file_path(db_dir, name, USERDB_EXTENSION);
+        let mut pool = pool().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = pool.get(&path).and_then(Weak::upgrade) {
+            return existing;
+        }
+        // 顺手清掉已失效的弱引用，长驻进程里 key 不会越积越多。
+        pool.retain(|_, weak| weak.strong_count() > 0);
+        let db = Arc::new(LevelDb::new_user_db(db_dir, name));
+        pool.insert(path, Arc::downgrade(&db));
+        db
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, LevelDbState> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -198,6 +238,10 @@ impl LevelDb {
 impl Db for LevelDb {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn write_generation(&self) -> u64 {
+        self.lock().writes
     }
 
     fn file_path(&self) -> &Path {
@@ -348,13 +392,21 @@ impl LevelDb {
             ..Default::default()
         };
         state.readonly = readonly;
-        state.db = DB::open(&self.file_path, options).ok();
+        state.db = match DB::open(&self.file_path, options) {
+            Ok(db) => Some(db),
+            Err(e) => {
+                // 2026-11-02 用户报「打字一直不能造词」排查：原来这里 `.ok()` 把真实
+                // 失败原因吞了，日志只剩一句「error opening db」，看不出是锁冲突、
+                // 目录缺失还是数据损坏。错误原文一律打出来。
+                eprintln!(
+                    "[level_db] error opening db '{}' (readonly={readonly}) at {:?}: {e:?}",
+                    self.name, self.file_path
+                );
+                None
+            }
+        };
         state.loaded = state.db.is_some();
         if !state.loaded {
-            eprintln!(
-                "[level_db] error opening db '{}' (readonly={readonly}).",
-                self.name
-            );
             return false;
         }
         if !readonly && state.meta_fetch("/db_name").is_none() {
@@ -413,7 +465,11 @@ impl Transactional for LevelDb {
                 Op::Delete(key) => batch.delete(&key),
             }
         }
-        db.write(batch, false).is_ok()
+        let ok = db.write(batch, false).is_ok();
+        if ok {
+            state.writes += 1;
+        }
+        ok
     }
 
     fn in_transaction(&self) -> bool {
@@ -575,6 +631,49 @@ mod tests {
         assert_eq!(db.meta_fetch("/db_type").as_deref(), Some("userdb"));
         assert!(db.close());
         assert!(!db.loaded());
+    }
+
+    /// 前提事实：LevelDB 的 `LOCK` 按目录独占，**同一进程内**第二次 `DB::open`
+    /// 同一 userdb 同样失败。
+    ///
+    /// 这就是「长驻引擎里第二个会话静默丢掉用户词典、学词时好时坏」的根因，
+    /// 也是 [`LevelDb::shared_user_db`] 必须做成进程级池的理由。
+    /// 哪天这条断言失败（第二把竟然打开成功），说明前提变了，可以重新评估池的必要性。
+    #[test]
+    fn user_db_lock_is_exclusive_within_one_process() {
+        let dir = TempDir::new("lock");
+        let first = LevelDb::new_user_db(dir.path(), "t");
+        assert!(first.open(), "第一个实例应当能打开");
+
+        let second = LevelDb::new_user_db(dir.path(), "t");
+        assert!(
+            !second.open(),
+            "同一进程内第二次打开同一 userdb 竟然成功了 —— LOCK 独占前提已变"
+        );
+
+        // 第一个实例仍持有锁，仍可读
+        assert!(first.loaded());
+        assert!(first.close());
+    }
+
+    /// 进程级共享：同路径反复取到的是**同一个实例**（锁只被一份持有）。
+    #[test]
+    fn shared_user_db_reuses_one_instance() {
+        let dir = TempDir::new("shared");
+        let a = LevelDb::shared_user_db(dir.path(), "t");
+        let b = LevelDb::shared_user_db(dir.path(), "t");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "同路径必须拿到同一个共享句柄，否则会出现第二个 DB::open"
+        );
+        assert!(a.loaded() || a.open());
+
+        // 句柄全部释放后条目失效，下次重新打开（用户库被重建也不会握旧句柄）
+        drop(a);
+        drop(b);
+        let c = LevelDb::shared_user_db(dir.path(), "t");
+        assert!(c.loaded() || c.open());
+        assert!(c.close());
     }
 
     #[test]
