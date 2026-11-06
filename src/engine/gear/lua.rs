@@ -228,6 +228,11 @@ pub struct LuaHost {
 /// * `get_genuine` / `to_phrase` —— 候选方法（`to_phrase().code:print()` 是
 ///   `completion_gate` 数码长的唯一途径）。
 const LUA_PRELUDE: &str = r#"
+-- 照搬 hchunhui/librime-lua `src/lib/lua.cc::pmain`：
+-- LuaJIT / Lua 5.1 只有全局 `unpack`，5.2+ 才改成 `table.unpack`。
+-- 宇浩 `yuhao_embeded_cands.lua` 直接写 `table.unpack(args)`，缺这行会炸。
+table.unpack = table.unpack or unpack
+
 local set_mt = {}
 set_mt.__index = set_mt
 set_mt.__sub = function(a, b)
@@ -241,6 +246,14 @@ set_mt.__add = function(a, b)
   for k in pairs(b) do if type(k) == "string" then r[k] = true end end
   return r
 end
+-- 上游 `src/lib/lua.cc::SetReg` 还有交集(__mul)与 `empty()` 方法，
+-- 社区脚本用 `tags * Set({...})` 判交集、`Set({}):empty()` 判空。
+set_mt.__mul = function(a, b)
+  local r = setmetatable({}, set_mt)
+  for k in pairs(a) do if type(k) == "string" and b[k] then r[k] = true end end
+  return r
+end
+function set_mt:empty() return next(self) == nil end
 function Set(t)
   local s = setmetatable({}, set_mt)
   if t then for _, v in ipairs(t) do s[v] = true end end
@@ -328,6 +341,146 @@ function __config_value(v)
 end
 "#;
 
+/// 照搬 hchunhui/librime-lua `src/lib/lutf8lib-compat.c` + `xluaopen_utf8()`。
+///
+/// **LuaJIT 是 Lua 5.1 ABI，没有 `utf8` 库**；而本机 `plugin/yuhao/*`、
+/// `plugin/tiger/*`、`plugin/input_statistics/*` 大量使用
+/// `utf8.len / utf8.codes / utf8.char / utf8.codepoint`。只把 mlua 的 feature
+/// 从 `lua54` 换成 `luajit`，这些脚本会整片报
+/// `attempt to index a nil value (global 'utf8')` —— 这是比编译更容易踩的坑。
+///
+/// 上游是 C 版（Lua 5.3 `lutf8lib.c` 移植到 5.1）；这里等价实现成纯 Lua，
+/// `boot()` 只在 `_G.utf8 == nil` 时注入，lua54 下完全不参与。
+/// 转义统一用 `\ddd`（Lua 5.1 不认 `\xHH`），不用 `//` 整除运算符。
+const LUA_UTF8_COMPAT: &str = r#"
+if _G.utf8 == nil then
+  local unpack_ = table.unpack or unpack
+  local utf8 = {}
+  utf8.charpattern = "[\0-\127\194-\244][\128-\191]*"
+
+  local function encode(cp)
+    if cp < 0x80 then
+      return string.char(cp)
+    elseif cp < 0x800 then
+      return string.char(0xC0 + math.floor(cp / 64), 0x80 + cp % 64)
+    elseif cp < 0x10000 then
+      return string.char(0xE0 + math.floor(cp / 4096),
+                         0x80 + math.floor(cp / 64) % 64,
+                         0x80 + cp % 64)
+    end
+    return string.char(0xF0 + math.floor(cp / 262144),
+                       0x80 + math.floor(cp / 4096) % 64,
+                       0x80 + math.floor(cp / 64) % 64,
+                       0x80 + cp % 64)
+  end
+
+  local function decode(s, pos)
+    local b = s:byte(pos)
+    if not b then return nil end
+    if b < 0x80 then return b, pos + 1 end
+    local n, cp
+    if b < 0xE0 then n, cp = 1, b - 0xC0
+    elseif b < 0xF0 then n, cp = 2, b - 0xE0
+    elseif b < 0xF8 then n, cp = 3, b - 0xF0
+    else return nil end
+    for k = 1, n do
+      local c = s:byte(pos + k)
+      if not c or c < 0x80 or c > 0xBF then return nil end
+      cp = cp * 64 + (c - 0x80)
+    end
+    return cp, pos + n + 1
+  end
+
+  function utf8.char(...)
+    local out = {}
+    for i = 1, select('#', ...) do
+      local cp = select(i, ...)
+      if type(cp) ~= 'number' or cp < 0 or cp > 0x10FFFF then
+        error('value out of range', 2)
+      end
+      out[#out + 1] = encode(math.floor(cp))
+    end
+    return table.concat(out)
+  end
+
+  function utf8.codepoint(s, i, j)
+    i = i or 1
+    j = j or i
+    if i < 0 then i = #s + 1 + i end
+    if j < 0 then j = #s + 1 + j end
+    local out, pos = {}, i
+    while pos <= j do
+      local cp, nextpos = decode(s, pos)
+      if not cp then error('invalid UTF-8 code', 2) end
+      out[#out + 1] = cp
+      pos = nextpos
+    end
+    return unpack_(out)
+  end
+
+  function utf8.len(s, i, j)
+    i = i or 1
+    j = j or -1
+    if i < 0 then i = #s + 1 + i end
+    if j < 0 then j = #s + 1 + j end
+    if i < 1 or i > #s + 1 then error('initial position out of bounds', 2) end
+    local n, pos = 0, i
+    while pos <= j do
+      local cp, nextpos = decode(s, pos)
+      if not cp then return nil, pos end
+      n = n + 1
+      pos = nextpos
+    end
+    return n
+  end
+
+  function utf8.offset(s, n, i)
+    i = i or (n >= 0 and 1 or #s + 1)
+    if i < 0 then i = #s + 1 + i end
+    if n == 0 then
+      local pos = i
+      while pos > 1 do
+        local b = s:byte(pos - 1)
+        if b >= 0x80 and b <= 0xBF then pos = pos - 1 else break end
+      end
+      return pos
+    elseif n > 0 then
+      local pos = i
+      for _ = 2, n do
+        local _, nextpos = decode(s, pos)
+        if not nextpos then return nil end
+        pos = nextpos
+      end
+      return pos <= #s and pos or nil
+    end
+    local pos = i
+    for _ = 1, -n do
+      pos = pos - 1
+      while pos > 1 do
+        local b = s:byte(pos)
+        if b >= 0x80 and b <= 0xBF then pos = pos - 1 else break end
+      end
+      if pos < 1 then return nil end
+    end
+    return pos
+  end
+
+  function utf8.codes(s)
+    local pos = 1
+    return function()
+      if pos > #s then return nil end
+      local cp, nextpos = decode(s, pos)
+      if not cp then error('invalid UTF-8 code', 2) end
+      local p = pos
+      pos = nextpos
+      return p, cp
+    end
+  end
+
+  _G.utf8 = utf8
+end
+"#;
+
 impl LuaHost {
     /// 启动 VM：设搜索路径、注册 `rime_api`、执行引导脚本。
     pub fn boot(data_roots: &[PathBuf]) -> mlua::Result<Self> {
@@ -354,6 +507,12 @@ impl LuaHost {
         package.set("path", format!("{};{}", paths.join(";"), existing))?;
 
         lua.load(LUA_PRELUDE).set_name("@prelude").exec()?;
+
+        // 上游 `pmain()` 里的 `xluaopen_utf8(L)`：LuaJIT / Lua 5.1 没有 utf8 库。
+        // lua54 下 `_G.utf8` 已存在，这段不会执行（零回归）。
+        if matches!(globals.get::<Value>("utf8")?, Value::Nil) {
+            lua.load(LUA_UTF8_COMPAT).set_name("@utf8_compat").exec()?;
+        }
 
         // rime-lua 的约定：脚本里裸调 `yield(cand)` 就是 `coroutine.yield(cand)`。
         // 由 C++ 侧把这个全局别名装进去（脚本从来不写 `coroutine.yield`）。
@@ -497,7 +656,9 @@ impl LuaHost {
     /// 按点号分层查全局（`yuhao.core` → `_G.yuhao.core`）。
     fn globals_lookup(&self, name: &str) -> Option<Value> {
         let mut current = Value::Table(self.lua.globals());
-        for segment in name.split('.') {
+        // 上游 `sub_module_init` 用 `*` 分层（`Component*TableTranslator`），
+        // 本地历史写法用 `.` 分层；两种都收，社区脚本不用改。
+        for segment in name.split(|c| c == '.' || c == '*') {
             let Value::Table(table) = current else {
                 return None;
             };
@@ -1872,6 +2033,88 @@ return processor
             .expect("有候选流");
         let items = collect_translation(stream);
         assert_eq!(items.first().map(|c| c.text.as_str()), Some("Hx"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 照搬上游 `src/lib/lua.cc::SetReg`：交集 `__mul`、`empty()`，
+    /// 以及 `pmain()` 的 `table.unpack = table.unpack or unpack`（LuaJIT 5.1 别名）。
+    #[test]
+    fn set_helper_supports_upstream_intersection_and_unpack_alias() {
+        let dir = temp_root("set2");
+        let host = LuaHost::boot(&[dir.clone()]).expect("boot");
+        let ok: bool = host
+            .lua
+            .load(
+                r#"
+local a, b = Set({"a","b"}), Set({"b","c"})
+local inter, diff, union = a * b, a - b, a + b
+return inter["b"] == true and inter["a"] == nil
+  and diff["a"] == true and union["c"] == true
+  and Set({}):empty() and not a:empty()
+  and table.unpack({7,8}) == 7
+"#,
+            )
+            .eval()
+            .expect("执行");
+        assert!(ok, "Set 交集 / empty / table.unpack 别名");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 模拟 LuaJIT(5.1) 的 VM（没有 utf8 库）：兜底层语义要和 lua54 一致。
+    /// 本机 `plugin/yuhao/*`、`plugin/tiger/*`、`input_statistics.lua` 全靠这几个函数。
+    #[test]
+    fn utf8_compat_covers_luajit_51_abi() {
+        let lua = Lua::new();
+        lua.globals().set("utf8", Value::Nil).expect("清空 utf8");
+        lua.load(LUA_UTF8_COMPAT).exec().expect("注入 utf8 兼容层");
+
+        let (rebuilt, len, count): (String, i64, i64) = lua
+            .load(
+                r#"
+local s = "A中B"
+local rebuilt, n = {}, 0
+for p, cp in utf8.codes(s) do
+  n = n + 1
+  rebuilt[#rebuilt + 1] = utf8.char(cp)
+end
+return table.concat(rebuilt), utf8.len(s), n
+"#,
+            )
+            .eval()
+            .expect("utf8.codes / char / len");
+        assert_eq!(rebuilt, "A中B");
+        assert_eq!(len, 3);
+        assert_eq!(count, 3);
+
+        let (a, b, c, off): (i64, i64, i64, i64) = lua
+            .load(
+                r#"
+local s = "A中B"
+local a, b, c = utf8.codepoint(s, 1, 5)
+return a, b, c, utf8.offset(s, 2, 1)
+"#,
+            )
+            .eval()
+            .expect("utf8.codepoint / offset");
+        assert_eq!([a, b, c], [65, 0x4E2D, 66]);
+        assert_eq!(off, 2, "第二个字符『中』从字节 2 开始");
+    }
+
+    /// 上游 `sub_module_init` 的 `Component*Sub` 写法：`*` 分层也能解析。
+    #[test]
+    fn star_submodule_path_resolves_like_upstream() {
+        let dir = temp_root("submod");
+        std::fs::write(
+            dir.join("lua").join("rime.lua"),
+            "yuhao = { core = { filter = function(input, env) return input end } }\n",
+        )
+        .unwrap();
+        let host = LuaHost::boot(&[dir.clone()]).expect("boot");
+        assert!(
+            host.resolve_component("filter", "*yuhao*core").is_some(),
+            "`*` 分层应能解析到 _G.yuhao.core"
+        );
+        assert!(host.resolve_component("filter", "*yuhao.core").is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
