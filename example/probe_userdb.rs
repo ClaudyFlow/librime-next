@@ -9,6 +9,7 @@
 
 use librime_next::dict::db::{Db, DbAccessor};
 use librime_next::dict::level_db::LevelDb;
+use librime_next::dict::user_db::UserDbValue;
 use std::path::PathBuf;
 
 fn main() {
@@ -46,15 +47,49 @@ fn main() {
             return;
         }
     };
+    // 值格式判别：上游三字段是**带键名的空格分隔**（`c=21 d=3.50902 t=3402`），
+    // evo 五字段是**纯逗号 CSV**（`21,3.50902,3402,2,6fn3k`）。同一个库里两种可以
+    // 共存 —— 老词是升级前写的，新词是升级后写的，读的时候按分隔符分流。
     let mut total = 0usize;
+    let mut legacy = 0usize;
+    let mut compact = 0usize;
+    let mut broken = 0usize;
     while let Some((key, value)) = acc.get_next_record() {
         if total < limit {
-            println!("{key}\t{value}");
+            let (tag, parsed) = if UserDbValue::is_legacy_format(&value) {
+                legacy += 1;
+                ("旧·键值", UserDbValue::unpack(&value))
+            } else {
+                match UserDbValue::unpack(&value) {
+                    Some(v) => {
+                        compact += 1;
+                        ("新·CSV", Some(v))
+                    }
+                    None => {
+                        broken += 1;
+                        ("坏值", None)
+                    }
+                }
+            };
+            let extra = match parsed {
+                Some(v) => format!(
+                    "   → commits={} dee={:.5} tick={} pos={} stamp={}",
+                    v.commits, v.dee, v.tick, v.position, v.manual_stamp
+                ),
+                None => String::new(),
+            };
+            println!("{key}\t{tag}\t{value}{extra}");
+        } else if UserDbValue::is_legacy_format(&value) {
+            legacy += 1;
+        } else if UserDbValue::unpack(&value).is_some() {
+            compact += 1;
+        } else {
+            broken += 1;
         }
         total += 1;
         if total > 200_000 {
             break;
         }
     }
-    println!("# 总条数 >= {total}");
+    println!("# 总条数 >= {total}（旧格式 {legacy} / 新格式 {compact} / 坏值 {broken}）");
 }

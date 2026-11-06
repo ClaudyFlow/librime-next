@@ -33,23 +33,24 @@ pub type WordGraph = BTreeMap<usize, BTreeMap<usize, Vec<DictEntry>>>;
 pub const K_PENALTY: f64 = -13.815_510_557_964_274;
 
 /// `class Grammar`（`gear/grammar.h:11-38`）—— 语法模型只暴露这一个方法。
+///
+/// 2026-11-03：octagram 实现（`grammar.rs`）已移除，**当前没有实现者**，
+/// 所有 translator 的 `Poet` 都持 `None`，恒走动态规划。接口保留是为了
+/// 将来若有「能批量算分的语法模型」可以原样填进来（单点 `query` 的
+/// 毫秒级代价决定了 transformer 不适合直接挂这里，见 `rescore.rs`）。
 pub trait Grammar: Send + Sync {
     /// 给定前文与当前词，返回该词在此处的对数概率（越大越通顺）。
     fn query(&self, context: &str, word: &str, is_rear: bool) -> f64;
 }
 
-/// 语法分系数（`WEASEL_GRAMMAR_SCALE`，默认 1.0）。进程内只读一次环境。
-fn grammar_scale() -> f64 {
-    static SCALE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *SCALE.get_or_init(|| {
-        std::env::var("WEASEL_GRAMMAR_SCALE")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(1.0)
-    })
-}
-
 /// `Grammar::Evaluate`（`gear/grammar.h:23-36`）：词条权重 + 语法分。
+///
+/// 2026-11-03 起 octagram 移除、`Grammar` 无实现者，`grammar` 恒为 `None`，
+/// 于是这个函数退化成 `entry_weight + K_PENALTY`——即**每词一笔固定扣分**，
+/// 效果是让动态规划偏好「词更少、词更长」的路径。签名保留 `Option<&dyn Grammar>`，
+/// 将来有能批量算分的模型可直接填槽。
+/// （原 `WEASEL_GRAMMAR_SCALE` 系数随 gram 一并移除：它缩放的已不再是语法分，
+/// 而是一个常量惩罚，留着只会误导。）
 pub fn evaluate(
     context: &str,
     word: &str,
@@ -61,9 +62,6 @@ pub fn evaluate(
         Some(g) => g.query(context, word, is_rear),
         None => K_PENALTY,
     };
-    // 临时实验：语法分的权重系数（`WEASEL_GRAMMAR_SCALE`，默认 1.0）。
-    // 用来验证「模型语料偏古/偏专业时，语法分压过词频」这个假设。
-    let grammar_score = grammar_score * grammar_scale();
     // 排障开关：打印每一次词格打分的三段（词频 / 语法 / 合计），排查「明明该选 A 却选 B」。
     if std::env::var_os("WEASEL_POET_TRACE").is_some() {
         eprintln!(

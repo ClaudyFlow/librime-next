@@ -811,7 +811,7 @@ mod tests {
     /// **互通验证**：读一台真实机器上由 C++ 版 librime 写出来的 `.userdb`。
     ///
     /// 做法是**先拷到临时目录**再打开 —— 用户词典是活数据，测试绝不能碰原件。
-    /// 本机没有该文件时静默跳过（与 `gram_db` 的 `open_real_gram_file` 同风格）。
+    /// 本机没有该文件时静默跳过 —— 这类"读真实机器数据"的测试不能因环境缺件而失败。
     #[test]
     fn reads_real_cpp_written_userdb() {
         let Some(appdata) = std::env::var_os("APPDATA") else {

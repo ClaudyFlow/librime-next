@@ -112,6 +112,21 @@ pub const K_DEFAULT_ALPHABET: &str = "abcdefghijklmnopqrstuvwxyz";
 /// `kTypeIsCorrectionMask`（`prism.cc:27`）：`type` 的 bit 30 记 `is_correction`，
 /// 避开符号位（`1 << 31` 会把 `type` 变成负数）
 pub const K_TYPE_IS_CORRECTION_MASK: i32 = 1 << 30;
+
+/// 辅助码描述符标志位（librime-evo `kAuxiliaryDescriptorFlag = 0x100`）。
+///
+/// `SpellingDescriptor::type` 是个复用字段：低位是 `SpellingType`，bit30 记纠错，
+/// **bit8** 记"这条拼写带辅助码"。选 bit8 而不是另开字段，是因为 prism 的
+/// 描述符布局（`i32 syllable_id / i32 type / f32 credibility / String tips`）
+/// 要与上游保持字节兼容 —— 换布局就不是"读同一个 .prism.bin"了。
+pub const K_AUXILIARY_DESCRIPTOR_FLAG: i32 = 0x100;
+
+/// 辅字码字符集在 `tips` 里的信封前缀（`\x01AUX1\x01`）。
+///
+/// evo 把"该音节允许哪些辅助码字"塞进 tips：`\x01AUX1\x01<字符集>\x01<真 tips>`。
+/// 用 `\x01` 当分隔符是因为它在 YAML 与用户词表里都不会自然出现，
+/// 老版本读到这里只会当成一段奇怪的 tips，不影响显示之外的任何逻辑。
+pub const K_AUXILIARY_TIPS_PREFIX: &str = "\u{1}AUX1\u{1}";
 /// `kSpellingTypeMask`（`prism.cc:28`）：掩掉 bit 30 后剩下的就是 `SpellingType`
 pub const K_SPELLING_TYPE_MASK: i32 = !K_TYPE_IS_CORRECTION_MASK;
 
@@ -241,8 +256,46 @@ impl SpellingDescriptor {
     }
 
     /// `packed_type & kSpellingTypeMask`：剥掉纠错位之后的 `SpellingType` 数值。
+    ///
+    /// 辅助码标志位（bit8）同样要剥掉 —— 它是"标记"不是"类型"，
+    /// 留着会让 `type` 变成 256 这种越界值，候选类型直接掉进 `Invalid`。
     pub fn unpacked_type(&self) -> i32 {
-        self.r#type & K_SPELLING_TYPE_MASK
+        self.r#type & K_SPELLING_TYPE_MASK & !K_AUXILIARY_DESCRIPTOR_FLAG
+    }
+
+    /// 这条拼写是否带辅助码（`props.auxiliary`）。
+    pub fn is_auxiliary(&self) -> bool {
+        self.r#type & K_AUXILIARY_DESCRIPTOR_FLAG != 0
+    }
+
+    /// 辅助码字符集：该音节允许哪些字作为辅助码（evo `auxiliary_characters`）。
+    ///
+    /// 来自 tips 的信封头 `\x01AUX1\x01<chars>\x01`；没有信封时返回空串。
+    pub fn auxiliary_characters(&self) -> &str {
+        if !self.is_auxiliary() {
+            return "";
+        }
+        let Some(rest) = self.tips.strip_prefix(K_AUXILIARY_TIPS_PREFIX) else {
+            return "";
+        };
+        match rest.find('\u{1}') {
+            Some(end) => &rest[..end],
+            None => "",
+        }
+    }
+
+    /// 剥掉辅助码信封后的**真** tips（显示用的那部分）。
+    pub fn visible_tips(&self) -> &str {
+        if !self.is_auxiliary() {
+            return &self.tips;
+        }
+        let Some(rest) = self.tips.strip_prefix(K_AUXILIARY_TIPS_PREFIX) else {
+            return &self.tips;
+        };
+        match rest.find('\u{1}') {
+            Some(end) => &rest[end + 1..],
+            None => "",
+        }
     }
 
     /// 转成 `algo::SpellingType`。
@@ -558,6 +611,14 @@ impl Prism {
     /// `format_`：`Load()` 从 `format` 字符串里解析出的版本号。
     pub fn format(&self) -> f64 {
         self.format
+    }
+
+    /// `Prism::SupportsAuxiliaryCharacters()`：`format >= 3.2` 的 prism 才可能带辅助码。
+    ///
+    /// 阈值来自 evo（`prism.h:94`）—— 3.2 是拼写描述符带上 tips 的那一版。
+    /// 它不是"一定有辅助码"，只是"有可能有"，调用方还要逐条看 flag。
+    pub fn supports_auxiliary_characters(&self) -> bool {
+        self.format >= 3.2
     }
 
     pub fn metadata(&self) -> Option<&Metadata> {

@@ -41,9 +41,10 @@ use crate::engine::gear::echo_translator::EchoTranslator;
 use crate::engine::gear::filter::{Filter, SingleCharFilter, Uniquifier};
 use crate::engine::gear::history_translator::HistoryTranslator;
 use crate::engine::gear::key_binder::KeyBinder;
+use crate::engine::gear::keypad_processor::KeypadProcessor;
+use crate::engine::gear::partial_commit::PartialCommit;
 use crate::engine::gear::matcher::Matcher;
 use crate::engine::gear::navigator::Navigator;
-use crate::engine::gear::poet::Poet;
 use crate::engine::gear::processor::Processor;
 use crate::engine::gear::punctuator::{PunctSegmentor, PunctTranslator, Punctuator};
 use crate::engine::gear::recognizer::Recognizer;
@@ -332,36 +333,76 @@ pub fn create_filter(ticket: &Ticket) -> Option<Box<dyn Filter + Send + Sync>> {
             ticket.build_dir,
         ))),
         "simplifier" => {
-            // 配置节点：带 alias 时优先读 `alias:` 块，否则回退到 `simplifier:` 块
-            // （与原版 `Simplifier` 读 `ticket.config` 的方式对齐）。
-            let node = ticket
-                .config
-                .pointer(&format!("/{}", ticket.name_space))
-                .or_else(|| ticket.config.pointer("/simplifier"));
-            let config_name = node
-                .and_then(|n| n.get("opencc_config"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("t2s.json");
-            let option_name = node
-                .and_then(|n| n.get("option_name"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
+            // C++ `SimplifierComponent::Create`：`name_space == "filter"` 时归一到
+            // `simplifier`（无别名的 `- simplifier` 处方就是这样）。
+            let name_space = if ticket.name_space == "filter" {
+                "simplifier".to_string()
+            } else {
+                ticket.name_space.clone()
+            };
             // opencc 数据在 `<root>/opencc`。`build_dir` 在生产里是 `<用户目录>/build`，
             // 而 opencc 落在**共享目录** —— 所以必须按 roots 逐个试，不能只看 `build_dir.parent()`。
+            // 顺序即 C++：用户目录优先、共享目录其次（同一个 `opencc_config` 名两份都在时，
+            // 用户那份胜出 —— 用户覆盖官方简繁表靠的就是这条）。
+            let mut tried: Vec<PathBuf> = Vec::new();
             for root in ticket.data_roots {
-                if let Some(simplifier) =
-                    Simplifier::new(&root.join(crate::lever::paths::OPENCC_DIR), config_name, option_name.clone())
-                {
-                    return Some(Box::new(simplifier));
+                let dir = root.join(crate::lever::paths::OPENCC_DIR);
+                if !tried.contains(&dir) {
+                    tried.push(dir.clone());
                 }
             }
             // 单根布局（roots 为空）时的回退：兼容直接构造 Ticket 的调用方。
-            let opencc_dir = ticket.build_dir.parent()?.join(crate::lever::paths::OPENCC_DIR);
-            Simplifier::new(&opencc_dir, config_name, option_name)
-                .map(|s| Box::new(s) as Box<dyn Filter + Send + Sync>)
+            if tried.is_empty()
+                && let Some(parent) = ticket.build_dir.parent()
+            {
+                tried.push(parent.join(crate::lever::paths::OPENCC_DIR));
+            }
+            // e2e 沙箱：`data_roots` 是 `<夹具>/userdata` + `<夹具>/build`，
+            // 而 opencc 数据摆在 `<夹具>/opencc`（`build_dir.parent()`）——
+            // 两处都要试，否则「装箱单里写了的方案」会在测试里静默丢滤镜。
+            if let Some(parent) = ticket.build_dir.parent() {
+                let candidate = parent.join(crate::lever::paths::OPENCC_DIR);
+                if !tried.contains(&candidate) {
+                    tried.push(candidate);
+                }
+            }
+            for opencc_dir in &tried {
+                if let Some(simplifier) = Simplifier::from_config(ticket.config, &name_space, opencc_dir) {
+                    return Some(Box::new(simplifier));
+                }
+            }
+            // 一个都没加载成功：把找过的位置与目标配置名报出来（否则就是"滤镜凭空消失"）
+            let wanted = ticket
+                .config
+                .pointer(&format!("/{name_space}"))
+                .or_else(|| ticket.config.pointer("/simplifier"))
+                .and_then(|n| n.get("opencc_config"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("t2s.json");
+            eprintln!(
+                "[registry] simplifier `{}` 的 opencc 配置 `{wanted}` 在 {:?} 下都加载失败",
+                name_space, tried
+            );
+            None
         }
+        // rime-lua 滤镜：`function filter(input, env)`，`input:iter()` 迭代候选。
+        "lua_filter" => lua_roots(ticket).and_then(|roots| {
+            crate::engine::gear::lua::LuaFilter::create(&roots, &ticket.name_space, ticket.config.clone())
+                .map(|filter| Box::new(filter) as Box<dyn Filter + Send + Sync>)
+        }),
         _ => None,
     }
+}
+
+/// lua 组件要的数据根：`Ticket` 的 `data_roots`，为空时回退 `build_dir.parent()`。
+///
+/// lua 脚本布局在 `<root>/lua/` 与 `<root>/plugin/`，两处都要能找到 ——
+/// 单根布局（e2e 沙箱）下 `data_roots` 是空的，不回退就一个脚本都发现不了。
+fn lua_roots(ticket: &Ticket) -> Option<Vec<PathBuf>> {
+    if !ticket.data_roots.is_empty() {
+        return Some(ticket.data_roots.to_vec());
+    }
+    ticket.build_dir.parent().map(|dir| vec![dir.to_path_buf()])
 }
 
 pub fn create_processor(ticket: &Ticket) -> Option<Box<dyn Processor + Send + Sync>> {
@@ -380,12 +421,22 @@ pub fn create_processor(ticket: &Ticket) -> Option<Box<dyn Processor + Send + Sy
         "express_editor" => Some(Box::new(Editor::express(ticket.config))),
         "fluid_editor" | "fluency_editor" => Some(Box::new(Editor::fluid(ticket.config))),
         "key_binder" => Some(Box::new(KeyBinder::new(ticket.config))),
+        // librime-evo（amzxyz）自研组件：小键盘数字的 auto / compose / select 三策略，
+        // 方案里必须排在 `key_binder` 之前。上游 librime 没有这个类。
+        "keypad_processor" => Some(Box::new(KeypadProcessor::new(ticket.config))),
+        "partial_commit" => Some(Box::new(PartialCommit::new(ticket.config))),
         "navigator" => Some(Box::new(Navigator::new(ticket.config))),
         "punctuator" => Some(Box::new(Punctuator::new(ticket.config))),
         "recognizer" => Some(Box::new(Recognizer::new(ticket.config, &ticket.name_space))),
         "selector" => Some(Box::new(Selector)),
         "shape_processor" => Some(Box::new(ShapeProcessor)),
         "speller" => Some(Box::new(Speller::new(ticket.config))),
+        // rime-lua：`lua_processor@*名字` / `lua_processor@名字`。
+        // 组件名原样交给 lua 层解析（`*` 走全局、无星走 require）。
+        "lua_processor" => lua_roots(ticket).and_then(|roots| {
+            crate::engine::gear::lua::LuaProcessor::create(&roots, &ticket.name_space)
+                .map(|processor| Box::new(processor) as Box<dyn Processor + Send + Sync>)
+        }),
         _ => None,
     }
 }
@@ -402,6 +453,13 @@ pub fn create_segmentor(ticket: &Ticket) -> Option<Box<dyn Segmentor + Send + Sy
             ticket.config,
             &ticket.name_space,
         ))),
+        // 后置辅助码：`nihao`m` 里的 `` `m `` 是输入约束，不是独立段
+        // （librime-evo `auxiliary_suffix_segmentor`）。
+        "auxiliary_suffix_segmentor" => Some(Box::new(
+            crate::engine::gear::auxiliary_suffix_segmentor::AuxiliarySuffixSegmentor::new(
+                ticket.config,
+            ),
+        )),
         _ => None,
     }
 }
@@ -434,10 +492,11 @@ pub fn create_translator(ticket: &Ticket) -> Option<Box<dyn Translator + Send + 
         }
         "table_translator" => {
             let (dict_name, prism_name) = translator_dict_name(ticket)?;
-            let dict = crate::dict::dictionary::Dictionary::open(
+            let dict = crate::dict::dictionary::Dictionary::open_with_packs(
                 ticket.build_dir,
                 &dict_name,
                 &prism_name,
+                &translator_packs(ticket),
             )?;
             let mut translator = TableTranslator::new(dict, options);
             // 学词时顺带编码"历史上连续几个词"（`table_translator.cc:222`，默认 true）
@@ -489,17 +548,10 @@ pub fn create_translator(ticket: &Ticket) -> Option<Box<dyn Translator + Send + 
             {
                 translator.enable_charset_filter = v;
             }
-            // 语法模型：与 `script_translator` 同一套 `model:` 解析。
-            // 形码方案（wubi86 / cangjie5）出厂都没配 model，走动态规划。
-            let roots: Vec<&Path> = ticket.data_roots.iter().map(PathBuf::as_path).collect();
-            let section = translator_section(&ticket.name_space);
-            if let Some(view) = grammar_view(ticket.config, &section) {
-                if let Some(octagram) = crate::engine::gear::grammar::create(&view, &roots) {
-                    translator = translator.with_poet(Poet::with_left_associative(Some(Box::new(
-                        octagram,
-                    ))));
-                }
-            }
+            // 语法模型（octagram `.gram`）已于 2026-11-03 整体移除：
+            // 组句恒走 `Poet` 的动态规划，语法判断交给字符级 transformer
+            // （`NeuralRescoreFilter` / `NeuralPredictFilter`）在候选产出后完成。
+            // 方案里残留的 `translator/model:` 与 `grammar:` 键一律忽略。
             // 用户词典（学词 / 调频）：C++ 里是 `Translator` 基类的 `user_dict_`
             if let Some(user_dict) = create_user_dictionary(ticket, &dict_name) {
                 translator = translator.with_user_dict(user_dict);
@@ -528,27 +580,49 @@ pub fn create_translator(ticket: &Ticket) -> Option<Box<dyn Translator + Send + 
             // 词库**单文件直接用**：`translator/dict` 指到哪本就编译哪本，
             // 不做任何 opencc 处理（既不部署期生成、也不运行时转换）。
             // 带 `.simp` / `.trad` 标记的是变体词库，同样各自一份现成文件。
-            let dict = crate::dict::dictionary::Dictionary::open(
+            // `packs` 是附加权重表，与主表一起参与查询（见 `translator_packs`）。
+            let dict = crate::dict::dictionary::Dictionary::open_with_packs(
                 ticket.build_dir,
                 &dict_name,
                 &prism_name,
+                &translator_packs(ticket),
             )?;
             let mut translator = ScriptTranslator::with_options(dict, options);
-            // 语法模型：只认 `model:`（`translator/simp/model: han.simp` →
-            // `model/han.simp.gram`）。没有就不装，`Poet` 走动态规划。
-            let roots: Vec<&Path> = ticket.data_roots.iter().map(PathBuf::as_path).collect();
-            let section = translator_section(&ticket.name_space);
-            if let Some(view) = grammar_view(ticket.config, &section) {
-                if let Some(octagram) = crate::engine::gear::grammar::create(&view, &roots) {
-                    translator = translator.with_poet(Poet::new(Some(Box::new(octagram))));
-                }
-            }
+            // 语法模型已移除（见上），`Poet` 保持 `new(None)` 走动态规划。
             // 用户词典（学词 / 调频）：`Translator::user_dict_`
             if let Some(user_dict) = create_user_dictionary(ticket, &dict_name) {
                 translator = translator.with_user_dict(user_dict);
             }
+            // 后置辅助码（librime-evo）：`translator/aux_suffix` 触发符 +
+            // `<词典>.reverse.bin` 里的 `\x1faux` 键。反查表不存在就静默不启用 ——
+            // 出厂词库都没有这份数据，不该为此打日志刷屏。
+            let aux_trigger = ticket
+                .config
+                .pointer(&format!("/{}/aux_suffix", ticket.name_space))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !aux_trigger.is_empty() {
+                let path = ticket.build_dir.join(format!("{dict_name}.reverse.bin"));
+                let reverse = crate::dict::reverse_lookup_dictionary::ReverseDb::open(&path)
+                    .ok()
+                    .and_then(|mut db| if db.load() { Some(db) } else { None })
+                    .map(std::sync::Arc::new);
+                if reverse.is_some() {
+                    translator = translator.with_auxiliary(aux_trigger, reverse);
+                }
+            }
             Some(Box::new(translator))
         }
+        // rime-lua 翻译器：脚本自己产候选，`dict` / `prism` 一概不用。
+        // 配置树整份交给脚本（`env.engine.schema.config:get_string(...)` 读它）。
+        "lua_translator" => lua_roots(ticket).and_then(|roots| {
+            crate::engine::gear::lua::LuaTranslator::create(
+                &roots,
+                &ticket.name_space,
+                ticket.config.clone(),
+            )
+            .map(|translator| Box::new(translator) as Box<dyn Translator + Send + Sync>)
+        }),
         _ => None,
     }
 }
@@ -586,6 +660,28 @@ fn create_user_dictionary(
         eprintln!("[registry] unsupported user db class '{db_class}', skipping user dict.");
         return None;
     }
+    // 学习模式（librime-evo 三模式）：`<namespace>/user_dict_mode = auto|manual|off`。
+    // `off` 与上游的 `enable_user_dict: false` 等价，只是写法更明确。
+    let mode = match ticket
+        .config
+        .pointer(&pointer("user_dict_mode"))
+        .and_then(|v| v.as_str())
+    {
+        None => crate::dict::user_dictionary::UserDictMode::Auto,
+        Some(text) => match crate::dict::user_dictionary::UserDictMode::parse(text) {
+            Some(mode) => mode,
+            None => {
+                eprintln!(
+                    "[registry] invalid user_dict_mode '{text}' for namespace '{}'; disabling user dict.",
+                    ticket.name_space
+                );
+                return None;
+            }
+        },
+    };
+    if mode == crate::dict::user_dictionary::UserDictMode::Off {
+        return None;
+    }
     let name = ticket
         .config
         .pointer(&pointer("user_dict"))
@@ -603,6 +699,7 @@ fn create_user_dictionary(
     let db: std::sync::Arc<dyn crate::dict::db::Db> =
         crate::dict::level_db::LevelDb::shared_user_db(&db_dir, &name);
     let mut user_dict = crate::dict::user_dictionary::UserDictionary::new(&name, db);
+    user_dict.set_mode(mode);
     if !user_dict.load() {
         eprintln!(
             "[registry] failed to load user dict '{name}' for namespace '{}', continuing without it.",
@@ -623,38 +720,8 @@ fn language_component(name: &str) -> String {
     }
 }
 
-/// 语言模型（octagram / `Poet`）的配置视图：`<section>/model`（如 `zh-han.simp`）
-/// → `{ "grammar": { "language": "<前缀>", … } }`。
-///
-/// `model:` 写的是**前缀**：引擎按 `paths.rs` 的 `.gram` 规则扫
-/// `<数据根>/model/<前缀>*.gram`（用户目录优先、其次程序文件夹，按 id 平铺不建
-/// 系列夹），**全部挂载**，查询取各本最高分。
-/// 模型名规则：`zh-han.<simp|trad>.<语料>-<级别>`，如
-/// `zh-han.simp.essay-bgc`（字级 29 MB）/`zh-han.trad.essay-bgw`（词级 208 MB）；
-/// 写全名则只挂那一本。
-///
-/// 2026-10-28 起 **`model:` 是唯一写法**：旧的顶层 `grammar/language`（以及
-/// `model.yaml` 的 `hans`/`hant` preset、`zh-hans-t-essay-bgw` 那串官方名）
-/// 都不再识别。没有 `model:` 就不装 `Poet`，走动态规划。
-///
-/// 调参（惩罚系数等）可写在同一个节下的 `grammar:` 映射里，覆盖在 `language` 之上。
-fn grammar_view(config: &Value, section: &str) -> Option<Value> {
-    let model = config
-        .pointer(&format!("{section}/model"))?
-        .as_str()?
-        .to_string();
-    let mut node = serde_json::Map::new();
-    node.insert("language".to_string(), Value::String(model));
-    if let Some(tuning) = config
-        .pointer(&format!("{section}/grammar"))
-        .and_then(Value::as_object)
-    {
-        for (key, value) in tuning {
-            node.insert(key.clone(), value.clone());
-        }
-    }
-    Some(serde_json::json!({ "grammar": Value::Object(node) }))
-}
+// （`grammar_view` 已于 2026-11-03 随 octagram 语法模型一并移除：方案里的
+//  `model:` / `grammar:` 键不再被读取，组句恒走动态规划。）
 
 /// 变体翻译器（simp/trad）配置**只能**挂在 `translator/` 下（Rime-Next 双变体设计，
 /// 2026-10-28）：`translator/simp`、`translator/trad`。给定命名空间，返回它实际
@@ -700,6 +767,30 @@ fn translator_dict_name(ticket: &Ticket) -> Option<(String, String)> {
         .map(str::to_string)
         .unwrap_or_else(|| dict.to_string());
     Some((dict.to_string(), prism))
+}
+
+/// `translator/packs`：附加码表名（C++ `dictionary.cc:442-446` 读 `{ns}/packs`）。
+///
+/// 分包是**运行期**的东西 —— 部署期只负责把每张表编出来，查询时必须真的打开它们
+/// （`Dictionary::Load` 的 `tables_[1..]`）。典型用法是「主表给码、分包给权」：
+/// 巧码的 `qiaoma.dict.yaml` 只声明 `columns: [text, code]`，权重全在
+/// `qiaoma.base` / `.ext` / `.user` 里。不加载分包 → 所有单字权重为 0 →
+/// 拼音反查（有权重）把形码候选整个挤出首屏（2026-11-03 巧码实测）。
+fn translator_packs(ticket: &Ticket) -> Vec<String> {
+    let section = translator_section(&ticket.name_space);
+    ticket
+        .config
+        .pointer(&format!("{section}/packs"))
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Rime-Next 双变体扩展（2026-10-28）：`translator:` 下挂 `simp:`/`trad:` 子模块时，
@@ -1088,43 +1179,6 @@ mod tests {
         assert_eq!(
             synthesized.pointer("/translator/trad/prism").and_then(Value::as_str),
             Some("pinyin")
-        );
-    }
-
-    #[test]
-    fn model_key_is_the_only_way_to_name_the_language_model() {
-        // 2026-10-28：语言模型只认 `model:`（→ model/<名>.gram），
-        // 旧的 `grammar/language` 与 model.yaml 的 hans/hant 预设不再识别。
-        let config = json!({
-            "translator": {
-                "simp": { "model": "zh-han.simp.essay-bgc" },
-                "trad": { "model": "zh-han.trad.essay-bgc" }
-            }
-        });
-        assert_eq!(
-            grammar_view(&config, "/translator/simp"),
-            Some(json!({ "grammar": { "language": "zh-han.simp.essay-bgc" } }))
-        );
-        assert_eq!(
-            grammar_view(&config, "/translator/trad"),
-            Some(json!({ "grammar": { "language": "zh-han.trad.essay-bgc" } }))
-        );
-        // 只有 `grammar/language` 而没有 `model:` → 不装模型
-        let legacy = json!({ "grammar": { "language": "zh-hans-t-essay-bgw" } });
-        assert_eq!(grammar_view(&legacy, "/translator"), None);
-        // 调参写在 `<section>/grammar` 里，覆盖在 language 之上
-        let tuned = json!({
-            "translator": {
-                "model": "zh-han.simp.essay-bgc",
-                "grammar": { "collocation_max_length": 5 }
-            }
-        });
-        assert_eq!(
-            grammar_view(&tuned, "/translator"),
-            Some(json!({ "grammar": {
-                "language": "zh-han.simp.essay-bgc",
-                "collocation_max_length": 5
-            } }))
         );
     }
 

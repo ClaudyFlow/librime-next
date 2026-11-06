@@ -321,11 +321,16 @@ impl DictEntryIterator {
 /// 单独抽出来是为了让"取键 → 逐拼写 → 逐音节查页"这段能脱离 `Dictionary` 测试。
 pub fn add_chunks_for_keys(
     result: &mut DictEntryIterator,
-    table: &Table,
+    tables: &[&Table],
     prism: &crate::dict::prism::Prism,
     keys: &[crate::dict::prism::Match],
     code_length: usize,
 ) {
+    // 音节串（补全提示那截）只在主表里查：音节表由主表定义，分包共用同一套 id
+    // （C++ `Chunk` 虽然记了自己那张 `table`，但 `GetSyllableById` 走的是主表）。
+    let Some(primary) = tables.first().copied() else {
+        return;
+    };
     for key in keys {
         let mut accessor = prism.query_spelling(key.value);
         while !accessor.exhausted() {
@@ -340,14 +345,24 @@ pub fn add_chunks_for_keys(
             // `dictionary.cc:326-331`：只有补全时才可能"音节比用户打的码还长"。
             let mut remaining_code = String::new();
             if key.length > code_length {
-                let syllable = table.get_syllable_by_id(syllable_id);
+                let syllable = primary.get_syllable_by_id(syllable_id);
                 if syllable.len() > code_length {
                     remaining_code = syllable[code_length..].to_string();
                 }
             }
-            let words = table.query_words(syllable_id);
-            if !words.exhausted() {
-                result.add_chunk(Chunk::from_accessor(table, words, remaining_code, 0.0, 0.0));
+            // 主表 + 分包（`dictionary.cc:332` 的 `for (const auto& table : tables_)`）：
+            // 同一个音节 id 在每张表里可能各有一份词条，各自成一页。
+            for table in tables {
+                let words = table.query_words(syllable_id);
+                if !words.exhausted() {
+                    result.add_chunk(Chunk::from_accessor(
+                        table,
+                        words,
+                        remaining_code.clone(),
+                        0.0,
+                        0.0,
+                    ));
+                }
             }
         }
     }

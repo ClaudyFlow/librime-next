@@ -96,6 +96,19 @@ pub struct ScriptTranslator {
     /// 音节表来自 [`Dictionary::table`]，一次建好；每次 `build_graph` 只需要
     /// [`EditDistanceCorrector::clone`]（共享同一份音节表与查询缓存）。
     pub correction: Option<EditDistanceCorrector>,
+    /// 完整输入串（含 `segment.end` **之后**的辅助码尾巴）。
+    ///
+    /// `query()` 只拿得到段内子串，而后置辅助码 `nihao`m` 的 `` `m `` 全在段外 ——
+    /// 所以由 [`Translator::sync_context`] 每轮把它抄进来。
+    pub full_input: String,
+    /// 后置辅助码触发符（`translator/aux_suffix`）；空 = 不启用。
+    pub aux_trigger: String,
+    /// 直接辅助码开关（`translator/auxiliary_mode`，默认 true）。
+    pub auxiliary_mode: bool,
+    /// 辅助码查表器（缓存音节表与字形反查结果）。
+    pub aux_matcher: crate::engine::gear::auxiliary_matcher::AuxiliaryMatcher,
+    /// 辅助码反查词典（`.reverse.bin` 里带 `\x1faux` 键时才有用）。
+    pub aux_reverse: Option<std::sync::Arc<crate::dict::reverse_lookup_dictionary::ReverseDb>>,
 }
 
 impl ScriptTranslator {
@@ -110,7 +123,77 @@ impl ScriptTranslator {
             poet: Poet::new(None),
             user_dict: None,
             correction: None,
+            full_input: String::new(),
+            aux_trigger: String::new(),
+            auxiliary_mode: true,
+            aux_matcher: crate::engine::gear::auxiliary_matcher::AuxiliaryMatcher::new(),
+            aux_reverse: None,
         }
+    }
+
+    /// 配好后置辅助码（`translator/aux_suffix` + `.reverse.bin`）。
+    pub fn with_auxiliary(
+        mut self,
+        trigger: &str,
+        reverse: Option<std::sync::Arc<crate::dict::reverse_lookup_dictionary::ReverseDb>>,
+    ) -> Self {
+        self.aux_trigger = trigger.to_string();
+        self.aux_reverse = reverse;
+        self
+    }
+
+    /// `auxiliary_enabled()`：有反查表 + 开关没关。
+    pub fn auxiliary_enabled(&self) -> bool {
+        self.auxiliary_mode && self.aux_reverse.is_some()
+    }
+
+    /// 从段 + 完整输入算出后置辅助码串（`ScriptTranslator::Query` 开头那段）。
+    ///
+    /// 条件三个都要满足：
+    /// 1. 段上带 `auxiliary_suffix` 标签（由 `auxiliary_suffix_segmentor` 打）；
+    /// 2. 段末尾紧跟触发符；
+    /// 3. 触发符之后至少还有一个字符。
+    pub fn auxiliary_suffix(&self, segment: &Segment) -> Option<String> {
+        if !self.auxiliary_enabled() || self.aux_trigger.is_empty() {
+            return None;
+        }
+        if !segment.has_tag("auxiliary_suffix") {
+            return None;
+        }
+        let full = &self.full_input;
+        let after_marker = segment.end + self.aux_trigger.len();
+        if full.len() <= after_marker {
+            return None;
+        }
+        if !full.get(segment.end..)?.starts_with(&self.aux_trigger) {
+            return None;
+        }
+        Some(full[after_marker..].to_string())
+    }
+
+    /// 把一条流按后置辅助码过滤。
+    ///
+    /// 辅助码是**输入约束**，不是候选层：命中的留下、没命中的整条丢。
+    /// 用 `FilteredTranslation` 包装而不是预先 drain，是为了保住懒流 ——
+    /// 一屏只要 5 条，没必要为过滤把几百条候选全物化。
+    fn apply_aux_filter(
+        &self,
+        inner: Box<dyn crate::engine::gear::translation::Translation>,
+        aux: &str,
+    ) -> Box<dyn crate::engine::gear::translation::Translation> {
+        let Some(reverse) = self.aux_reverse.clone() else {
+            return inner;
+        };
+        // 闭包自己持一份 matcher：反查结果（字形 → 辅助码）在整条流上复用，
+        // 每次 peek 都新建一份会把同一批字反复查几十次。
+        let mut matcher = crate::engine::gear::auxiliary_matcher::AuxiliaryMatcher::new();
+        let input = aux.to_string();
+        Box::new(crate::engine::gear::translation::FilteredTranslation::new(
+            inner,
+            move |candidate: &mut Candidate| {
+                matcher.matches(Some(reverse.as_ref()), &candidate.text, &input)
+            },
+        ))
     }
 
     /// 挂上用户词典（`Translator::user_dict_`）。
@@ -162,10 +245,25 @@ impl ScriptTranslator {
     /// 用 prism 把候选覆盖的输入重新切分成音节，用分隔符连接，
     /// 再套 `preedit_formatter`。切分失败时返回空串（候选 preedit 留空）。
     fn build_preedit(&self, input: &str, end: usize) -> String {
+        self.syllabify(input, end)
+            .map(|(preedit, _)| preedit)
+            .unwrap_or_default()
+    }
+
+    /// 一次切分同时产出 **preedit 串**与**音节顶点**。
+    ///
+    /// 顶点是**相对本段**的字节偏移、升序、首 = 0、末 = `end`
+    /// （C++ `Spans::vertices()` 的形态；`partial_commit` 靠它把
+    /// 「前 N 个音节」翻成输入上的切点）。
+    ///
+    /// 切分与 preedit 本来就是同一件事的两种投影，分开算会得到两套边界
+    /// （preedit 用最短切分，spans 又另走一遍最长切分 → 屏幕上看到的分隔
+    /// 和 Ctrl+数字切的位置对不上），所以这里**只有一条** DFS。
+    fn syllabify(&self, input: &str, end: usize) -> Option<(String, Vec<usize>)> {
         let sub = &input[..end.min(input.len())];
         let n = sub.len();
         if n == 0 {
-            return String::new();
+            return None;
         }
         // 每个起始位置能起的合法音节（只关心跨度，不关心音节 id）。
         let mut match_at: Vec<Vec<usize>> = vec![Vec::new(); n + 1];
@@ -201,7 +299,7 @@ impl ScriptTranslator {
         }
         dfs(0, n, &match_at, &mut Vec::new(), &mut best);
         if best.is_empty() {
-            return String::new();
+            return None;
         }
         // 用分隔符连接各音节。
         let delimiter = self.options.delimiters.chars().next().unwrap_or(' ');
@@ -214,7 +312,16 @@ impl ScriptTranslator {
             out.push_str(&sub[prev..pos]);
             prev = pos;
         }
-        out
+        // 顶点：0 → 各音节末位。`best` 已经是升序闭区间终点。
+        let mut vertices = Vec::with_capacity(best.len() + 1);
+        vertices.push(0);
+        vertices.extend(best.iter().copied());
+        Some((out, vertices))
+    }
+
+    /// 相对顶点 → 绝对顶点（补上段起点）。
+    fn absolute_spans(base: usize, vertices: &[usize]) -> Vec<usize> {
+        vertices.iter().map(|v| base + v).collect()
     }
 
     /// 整句候选（`ScriptTranslation::Evaluate` 的 sentence 分支，
@@ -431,9 +538,10 @@ impl ScriptTranslator {
                     quality + ngram_bonus(&entry.text),
                 )
                 .with_entry(entry);
-                let preedit = self.build_preedit(input, end);
-                if !preedit.is_empty() {
-                    candidate = candidate.with_preedit(preedit);
+                if let Some((preedit, vertices)) = self.syllabify(input, end) {
+                    candidate = candidate
+                        .with_preedit(preedit)
+                        .with_spans(Self::absolute_spans(seg_start, &vertices));
                 }
                 out.push(candidate);
             }
@@ -441,16 +549,49 @@ impl ScriptTranslator {
         // 用户词典候选按质量降序(2026-11-01):lookup 顺序≠质量序,
         // 不排序会把高频单字顶在多字词组前面(实机:打过十几遍的词组
         // 被两个 1e12 的单字压住)。整句让位判据也依赖这里的顺序。
+        //
+        // 2026-11-05（librime-evo 手排）：**手排位置压过质量**。
+        // 用户把「拟好」钉在第 2 位，就该排第 2 —— 不管它被学过多少次。
+        // 组内仍按质量降序，所以没手排的词相对次序不变。
         out.sort_by(|a, b| {
-            b.quality
-                .partial_cmp(&a.quality)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            let pinned = |c: &Candidate| {
+                c.entry
+                    .as_ref()
+                    .map(|e| e.manual_position > 0)
+                    .unwrap_or(false)
+            };
+            match (pinned(a), pinned(b)) {
+                (true, true) => {
+                    let pa = a.entry.as_ref().map(|e| e.manual_position).unwrap_or(0);
+                    let pb = b.entry.as_ref().map(|e| e.manual_position).unwrap_or(0);
+                    pa.cmp(&pb).then_with(|| {
+                        b.quality
+                            .partial_cmp(&a.quality)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                }
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                (false, false) => b
+                    .quality
+                    .partial_cmp(&a.quality)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            }
         });
         out
     }
 }
 
 impl Translator for ScriptTranslator {
+    /// 抄一份完整输入：后置辅助码的尾巴在 `segment.end` 之后，`query` 拿不到。
+    fn sync_context(&mut self, ctx: &crate::engine::context::Context) {
+        if ctx.input != self.full_input {
+            self.full_input.clear();
+            self.full_input.push_str(&ctx.input);
+        }
+        self.auxiliary_mode = !ctx.get_option("auxiliary_off");
+    }
+
     fn query(
         &mut self,
         input: &str,
@@ -506,6 +647,15 @@ impl Translator for ScriptTranslator {
                     .map(|(_, text, _)| text.clone())
                     .collect(),
             );
+            // 整句的音节顶点：**poet 的分词边界**就是权威切点
+            // （C++ 整句候选的 `Spans` 由 `SentenceSyllabifier` 用同一份
+            //  components 生成）。没有成分时退化成「整段一个音节」。
+            let mut spans = vec![segment.start];
+            spans.extend(stops.iter().map(|pos| segment.start + pos));
+            if spans.len() < 2 {
+                spans.push(segment.start + consumed);
+            }
+            candidate = candidate.with_spans(spans);
             if !preedit.is_empty() {
                 candidate = candidate.with_preedit(preedit);
             }
@@ -541,13 +691,19 @@ impl Translator for ScriptTranslator {
         let collector = self.dict.lookup_from_graph(&graph, 0, None, false);
         // preedit 预计算:懒流拿不到 Projection(非 Clone),对**去重后的 end**
         // 各算一次格式化串(一屏候选 end 至多几个),流内查表。键 = 绝对 end。
+        // 同一趟顺手记下音节顶点:每个词表候选都要靠它支持 Ctrl+数字按需提交,
+        // 而流内再切一次会把这项工作从「O(不同 end 数)」放大成「O(候选数)」。
         let ends: Vec<usize> = collector.keys().copied().collect();
         let mut preedit_by_end = std::collections::HashMap::with_capacity(ends.len());
+        let mut spans_by_end = std::collections::HashMap::with_capacity(ends.len());
         for end in ends {
-            let mut preedit = self.build_preedit(input, end);
-            if !preedit.is_empty() {
+            if let Some((mut preedit, vertices)) = self.syllabify(input, end) {
                 self.options.format_preedit(&mut preedit);
                 preedit_by_end.insert(segment.start + end, preedit);
+                spans_by_end.insert(
+                    segment.start + end,
+                    Self::absolute_spans(segment.start, &vertices),
+                );
             }
         }
         tiers.push(Box::new(crate::engine::gear::translation::ScriptWordsTranslation::new(
@@ -558,9 +714,21 @@ impl Translator for ScriptTranslator {
             self.options.initial_quality,
             None,
             preedit_by_end,
+            spans_by_end,
             Some((ngram_before.clone(), ngram_prev.clone())),
         )));
 
+        // 后置辅助码（`nihao`m`）：整串是**输入约束**，命中的候选才留。
+        // C++ 在 `ScriptTranslation::PrepareCandidate` 里逐条过滤；这里在
+        // 交出流之前统一包一层，三层的语义一致。
+        let aux = self.auxiliary_suffix(segment);
+        if let Some(aux) = aux {
+            let filtered: Vec<Box<dyn crate::engine::gear::translation::Translation>> = tiers
+                .into_iter()
+                .map(|tier| self.apply_aux_filter(tier, &aux))
+                .collect();
+            tiers = filtered;
+        }
         Some(Box::new(crate::engine::gear::translation::TieredTranslation::new(tiers)))
     }
 

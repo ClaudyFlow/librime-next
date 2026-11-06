@@ -10,12 +10,19 @@
 //! 盖掉旧待办(待办只有一个槽)。
 //!
 //! "正在算的那一批不再排第二份":结果表按 (模型, 前文, 候选列表) 做键。
+//!
+//! # 第二种活:续写预测
+//!
+//! 同一个线程还接预测任务(见 [`crate::engine::gear::neural::predict_filter`])。
+//! 预测是**逐字自回归**,一步一次 forward,比整批打分更慢,更不能上按键路径 ——
+//! 但两者抢的是同一个后台槽:预测只在候选稀薄时被提交,频率远低于重排,
+//! 排在重排后面等一拍无所谓。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
-use super::neural::{rerank_order, LazySentenceModel, RerankOptions};
+use super::neural::{predict_extensions, rerank_order, LazySentenceModel, PredictOptions, RerankOptions};
 
 /// 结果表只是给「同一次输入被重查一遍」兜底的,不是长期缓存:装满就整张丢掉,
 /// 比维护 LRU 简单,代价也只是重算一次。
@@ -30,11 +37,28 @@ struct Job {
     options: RerankOptions,
 }
 
+/// 一批待续写的任务。
+struct PredictJob {
+    key: String,
+    context: String,
+    /// 要往后接的候选文本(通常是当前首候选)。
+    prefixes: Vec<String>,
+    options: PredictOptions,
+}
+
+/// 后台线程的一件活。
+enum Task {
+    Rerank(Job),
+    Predict(PredictJob),
+}
+
 struct WorkerState {
-    /// 已完成的结果:`key → 重排后的下标序列`。
+    /// 已完成的重排结果:`key → 重排后的下标序列`。
     done: HashMap<String, Vec<usize>>,
+    /// 已完成的预测结果:`key → (完整文本, 平均对数概率)`。
+    done_predict: HashMap<String, Vec<(String, f64)>>,
     /// 待办(单槽,新的盖旧的)。
-    pending: Option<Job>,
+    pending: Option<Task>,
     /// 停工标志。
     stopping: bool,
 }
@@ -63,6 +87,8 @@ pub struct RescoreWorker {
 pub struct NeuralScorer {
     model: LazySentenceModel,
     pub options: RerankOptions,
+    /// 续写预测的参数(与重排各管一套:一个决定"排哪条",一个决定"续什么")。
+    pub predict_options: PredictOptions,
 }
 
 impl NeuralScorer {
@@ -70,7 +96,32 @@ impl NeuralScorer {
         Self {
             model: LazySentenceModel::new(model_path),
             options: RerankOptions::default(),
+            predict_options: PredictOptions::default(),
         }
+    }
+
+    /// 对每个前缀做短续写,返回 `(完整文本 = 前缀 + 续写, 平均对数概率)`。
+    ///
+    /// 模型缺失时返回空表 —— 调用方按"没有预测"处理,不影响原有候选。
+    fn predict(&self, context: &str, prefixes: &[String]) -> Vec<(String, f64)> {
+        let Some(model) = self.model.get() else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, f64)> = Vec::new();
+        for prefix in prefixes {
+            for (extension, score) in
+                predict_extensions(model, context, prefix, &self.predict_options)
+            {
+                let text = format!("{prefix}{extension}");
+                if text == *prefix || out.iter().any(|(existing, _)| *existing == text) {
+                    continue;
+                }
+                out.push((text, score));
+            }
+        }
+        out.sort_by(|a, b| b.1.total_cmp(&a.1));
+        out.truncate(self.predict_options.max_results);
+        out
     }
 
     /// 模型可用时跑一次重排;模型缺失/句子不足两条时返回空表
@@ -120,8 +171,8 @@ pub fn init_from_data_roots(roots: &[std::path::PathBuf]) {
         return;
     }
     const CANDIDATES: &[&str] = &[
-        "neural/sentence-model.safetensors",
-        "neural/sentence-model-desktop.safetensors",
+        "model/sentence-model.safetensors",
+        "model/sentence-model-desktop.safetensors",
     ];
     let mut slot = GLOBAL.write().expect("rescore 全局表毒化不可恢复");
     if slot.is_some() {
@@ -136,6 +187,17 @@ pub fn init_from_data_roots(roots: &[std::path::PathBuf]) {
             }
         }
     }
+}
+
+/// 同步给一段文本打分（`log P(text | context)`），模型不可用时 `None`。
+///
+/// **只给上屏路径用**：一次提交算一次，不在按键路径上。预测/重排另有异步通道，
+/// 不要拿它俩去调这个函数——那是把几十毫秒塞进按键预算。
+pub fn score_text(context: &str, text: &str) -> Option<f64> {
+    let worker = global()?;
+    let model = worker.scorer.model.get()?;
+    let scores = model.score_sentences(context, &[text]);
+    scores.first().copied()
 }
 
 /// 全局 worker 的共享句柄;未初始化(没有模型)时返回 `None`。
@@ -158,6 +220,7 @@ impl RescoreWorker {
         Self {
             state: Mutex::new(WorkerState {
                 done: HashMap::new(),
+                done_predict: HashMap::new(),
                 pending: None,
                 stopping: false,
             }),
@@ -198,16 +261,50 @@ impl RescoreWorker {
         if state.done.contains_key(&key) {
             return;
         }
-        state.pending = Some(Job {
+        state.pending = Some(Task::Rerank(Job {
             key,
             context: context.to_string(),
             sentences,
             static_scores,
             options,
-        });
+        }));
         self.ensure_thread(&mut state);
         drop(state);
         self.wake.notify_one();
+    }
+
+    /// 提交一批续写任务。与 [`Self::submit`] 同构:立即返回,结果落在
+    /// [`Self::predict_for`]。
+    pub fn submit_predict(
+        &self,
+        context: &str,
+        prefixes: Vec<String>,
+        options: PredictOptions,
+    ) {
+        if prefixes.is_empty() {
+            return;
+        }
+        let key = make_key(self.model_tag(), context, &prefixes);
+        let mut state = self.state.lock().unwrap();
+        if state.stopping || state.done_predict.contains_key(&key) {
+            return;
+        }
+        state.pending = Some(Task::Predict(PredictJob {
+            key,
+            context: context.to_string(),
+            prefixes,
+            options,
+        }));
+        self.ensure_thread(&mut state);
+        drop(state);
+        self.wake.notify_one();
+    }
+
+    /// 预测结果就绪就返回;没算完就 `None`(调用方先不给预测)。
+    pub fn predict_for(&self, context: &str, prefixes: &[String]) -> Option<Vec<(String, f64)>> {
+        let key = make_key(self.model_tag(), context, prefixes);
+        let state = self.state.lock().unwrap();
+        state.done_predict.get(&key).cloned()
     }
 
     /// 有现成结果就返回重排后的下标序列;没有就 `None`(调用方按静态顺序走)。
@@ -231,6 +328,7 @@ impl RescoreWorker {
     pub fn clear(&self) {
         let mut state = self.state.lock().unwrap();
         state.done.clear();
+        state.done_predict.clear();
         if state.pending.is_some() {
             state.pending = None;
             self.wake.notify_one();
@@ -286,13 +384,24 @@ impl RescoreWorker {
             };
             let owner = me.as_ref().and_then(|w| w.upgrade());
             let Some(owner) = owner else { return };
-            let order = owner.scorer.rerank(&job.context, &job.sentences, &job.static_scores);
-            let mut state = owner.state.lock().unwrap();
-            if state.done.len() >= MAX_RESULTS {
-                state.done.clear();
+            match job {
+                Task::Rerank(job) => {
+                    let order = owner.scorer.rerank(&job.context, &job.sentences, &job.static_scores);
+                    let mut state = owner.state.lock().unwrap();
+                    if state.done.len() >= MAX_RESULTS {
+                        state.done.clear();
+                    }
+                    state.done.insert(job.key, order);
+                }
+                Task::Predict(job) => {
+                    let predicted = owner.scorer.predict(&job.context, &job.prefixes);
+                    let mut state = owner.state.lock().unwrap();
+                    if state.done_predict.len() >= MAX_RESULTS {
+                        state.done_predict.clear();
+                    }
+                    state.done_predict.insert(job.key, predicted);
+                }
             }
-            state.done.insert(job.key, order);
-            drop(state);
             // 落地信号:引擎线程在 get_context 时轮询代数,变了就 re-compose。
             owner.generation.fetch_add(1, Ordering::Release);
             // 回到外圈前降级;worker 若已被丢弃(测试场景),下轮 upgrade 失败退出。

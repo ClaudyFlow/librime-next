@@ -162,8 +162,15 @@ pub struct Switcher {
     config: Value,
     /// `switcher/caption`：菜单提示语，缺省 `:-)`（C++ `LoadSettings`）。
     caption: String,
-    /// `switcher/hotkeys`：唤起键。
+    /// `switcher/hotkeys`：唤起键（打开方案選單，标准 Rime 三步交互）。
     hotkeys: Vec<KeyEvent>,
+    /// `switcher/direct_next_hotkeys`：**按一下直接切到下一方案**，不弹選單。
+    ///
+    /// 2026-11-07 加：用户要的是「Ctrl+` 切方案」，而不是「打开選單 → 再按高亮
+    /// → 空格确认」；而且選單依赖候选窗显示链路（锚点/可见性），一旦宿主没给插入点
+    /// 就整帧不显示，看起来像「按键直接过去了」。直切绕开整条 UI 链路，
+    /// 按键被 `Accepted` 吞掉、方案立即重建，确定有反馈。缺省空 = 标准 Rime 行为。
+    direct_next: Vec<KeyEvent>,
     /// `switcher/save_options`：这些开关的状态要写进 `user.yaml`。
     save_options: HashSet<String>,
     /// `switcher/fold_options`：一进来就折叠开关列表。
@@ -216,6 +223,18 @@ impl Switcher {
             })
             .unwrap_or_default();
 
+        // `switcher/direct_next_hotkeys`：与 hotkeys 同样的键串列表，但语义是直切。
+        let direct_next = default_config
+            .pointer("/switcher/direct_next_hotkeys")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .filter_map(KeyEvent::parse)
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let save_options = default_config
             .pointer("/switcher/save_options")
             .and_then(Value::as_array)
@@ -239,6 +258,7 @@ impl Switcher {
             config: default_config,
             caption,
             hotkeys,
+            direct_next,
             save_options,
             active: false,
             items: Vec::new(),
@@ -559,6 +579,16 @@ impl Switcher {
 
 impl Processor for Switcher {
     fn process_key_event(&mut self, engine: &mut Engine, key: &KeyEvent) -> ProcessResult {
+        // ⓪ 直切热键：按一下立刻换下一方案，不弹選單、不等确认。
+        //    `key.release()` 带 Release 位，不会匹配这里的键串，所以只在按下方向触发。
+        //    `request_schema` 只登记，`Engine::process_key` 在处理器链跑完后 `apply_schema`。
+        if !self.active && self.direct_next.iter().any(|hotkey| hotkey == key) {
+            if let Some(next) = self.next_schema(&engine.schema.schema_id) {
+                engine.request_schema(next);
+            }
+            return ProcessResult::Accepted;
+        }
+
         // ① 热键：没开就开，开了就跳到下一个方案（C++ `ProcessKeyEvent` 开头那段）
         if self.is_hotkey(key) {
             if !self.active {
@@ -652,6 +682,29 @@ mod tests {
         assert!(s.hotkeys.iter().any(|k| k.keycode == 0xffc1 || k.repr().contains("F4")));
         assert!(s.save_options.contains("full_shape"));
         assert!(!s.is_active());
+    }
+
+    /// 2026-11-07 回归：`Ctrl+grave` 配成直切键后，不应再被当成"打开選單"的热键。
+    #[test]
+    fn direct_next_hotkeys_are_separate_from_menu_hotkeys() {
+        let s = Switcher::new(
+            json!({
+                "switcher": {
+                    "hotkeys": ["F4"],
+                    "direct_next_hotkeys": ["Control+grave"]
+                },
+                "schema_list": [{ "schema": "luna_pinyin" }]
+            }),
+            Path::new("."),
+            None,
+        );
+        assert_eq!(
+            s.direct_next,
+            vec![KeyEvent::parse("Control+grave").unwrap()],
+            "直切键应被解析成 keycode=0x60 + Control"
+        );
+        assert_eq!(s.hotkeys.len(), 1, "F4 仍负责打开選單");
+        assert!(!s.is_hotkey(&KeyEvent::parse("Control+grave").unwrap()));
     }
 
     #[test]

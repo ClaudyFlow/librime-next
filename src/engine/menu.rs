@@ -18,7 +18,7 @@ use crate::engine::candidate::Candidate;
 use crate::engine::context::Context;
 use crate::engine::gear::filter::Filter;
 use crate::engine::gear::translation::{MergedTranslation, Translation};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 /// 懒式候选菜单(对照 C++ `Menu`)。
 pub struct Menu {
@@ -26,6 +26,13 @@ pub struct Menu {
     result: RefCell<Option<Box<dyn Translation>>>,
     /// 已物化前缀(`candidates_`)。
     candidates: RefCell<Vec<Candidate>>,
+    /// 滤镜链是否已经套过(`AddFilter` 只该发生一次)。
+    ///
+    /// 2026-11-03：没有这个标志时，`apply_filters` 会在每次 re-compose 时于
+    /// **已被 `prepare()` 消费过的**流上再包一层滤镜，头部逐轮被啃
+    /// （探针实测：同一输入连续 compose，重排批次 6→3→2→1 条，
+    ///  批次键因此永远对不上，`order_for` 一次都没命中）。
+    filters_ready: Cell<bool>,
 }
 
 impl Default for Menu {
@@ -41,6 +48,8 @@ impl Clone for Menu {
         Self {
             result: RefCell::new(None),
             candidates: RefCell::new(self.candidates.borrow().clone()),
+            // 克隆出来的流是空的,滤镜得重新套。
+            filters_ready: Cell::new(false),
         }
     }
 }
@@ -58,7 +67,18 @@ impl Menu {
         Self {
             result: RefCell::new(None),
             candidates: RefCell::new(Vec::new()),
+            filters_ready: Cell::new(false),
         }
+    }
+
+    /// 滤镜链是否已套过。`apply_filters` 据此避免重复包装（见字段注释）。
+    pub fn filters_ready(&self) -> bool {
+        self.filters_ready.get()
+    }
+
+    /// 标记滤镜链已套（`apply_filters` 末尾调用）。
+    pub fn mark_filters_ready(&self) {
+        self.filters_ready.set(true);
     }
 
     /// `Menu::AddTranslation`:并入一个翻译器输出(多个时 MergedTranslation

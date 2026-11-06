@@ -16,7 +16,7 @@
 //! | `ResourceType`（`name` / `prefix` / `suffix`，config 是 `{"config","",".yaml"}`） | 只留 `prefix`/`suffix` 字段，`name` 恒为 config 的 `"config"` |
 //! | `ResourceResolver::root_path()` | 用 [`ResourceResolver::roots`]（多根搜索，CLI 要对拍多目录） |
 //! | `FallbackResourceResolver` | 没有（多根 + override 已覆盖当前用法） |
-//! | `.bin` / `.gram` / `.txt` / `.theme.toml` / `.lua` 的分目录规则 | 没有（那是 dict/lever 层的事） |
+//! | `.bin` / `.txt` / `.theme.toml` / `.lua` 的分目录规则 | 没有（那是 dict/lever 层的事） |
 //!
 //! ## 分目录规则（Weasel-Next 补丁版 `ResolvePath` 的子集，2026-10-25 系列文件夹）
 //!

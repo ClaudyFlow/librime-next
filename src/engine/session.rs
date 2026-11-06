@@ -21,7 +21,7 @@ impl Session {
     }
 
     /// [`Self::create`] 的带数据根版本：`data_roots` 按"用户目录优先、共享目录其次"传入，
-    /// 供 `simplifier`（opencc）与 `script_translator`（`.gram`）找外部数据。
+    /// 供 `simplifier`（opencc）与神经模型（`model/`）找外部数据。
     pub fn create_with_roots(
         build_dir: &Path,
         schema_id: &str,

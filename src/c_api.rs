@@ -56,8 +56,8 @@ impl Global {
 
     /// 数据根列表，按 C++ `ResourceResolver` 的顺序：**用户目录优先、共享目录其次**。
     ///
-    /// `simplifier`（`opencc/`）与 `script_translator`（`model/*.gram`）靠它找外部数据 ——
-    /// 两者不一定在同一个根下：出厂布局里 `model/` 跟用户目录走、`opencc/` 在共享目录。
+    /// `simplifier`（`opencc/`）与神经模型（`model/*.safetensors`）靠它找外部数据 ——
+    /// 两者不一定在同一个根下：`model/` 在共享目录、opencc 数据也可能另置一份。
     fn data_roots(&self) -> Vec<PathBuf> {
         let mut roots: Vec<PathBuf> = Vec::new();
         for dir in [&self.user_data_dir, &self.shared_data_dir] {
@@ -568,6 +568,8 @@ unsafe extern "C" fn rime_create_session() -> RimeSessionId {
     let roots = g.data_roots();
     // 神经重排(进程级单例):数据根里有 safetensors 模型才启用。
     crate::engine::gear::rescore::init_from_data_roots(&roots);
+    // eassy（细胞词库）运行时索引：后台建 trie，未就绪/失败都不影响输入。
+    crate::dict::eassy_matcher::init_from_data_roots(&roots);
     let default_schema = default_schema_id(&g);
     let session = Session::create_with_roots(&build_dir, &default_schema, &roots);
     g.sessions.insert(id, session);
@@ -777,8 +779,18 @@ unsafe extern "C" fn rime_get_context(id: RimeSessionId, ctx: *mut RimeContext) 
     (*ctx).menu.select_keys = cstr_dup("123456789");
     (*ctx).commit_text_preview = std::ptr::null_mut();
     (*ctx).select_labels = std::ptr::null_mut();
-    // 预测:无组字时才有意义(有组字时清空,避免和候选混淆)
-    if g.sessions
+    // 预测:无组字时才有意义(有组字时清空,避免和候选混淆)。
+    //
+    // ⚠️ 2026-11-03 事故:`predictions` / `predictions_len` 是本工程**扩展**的字段,
+    // 上游 `rime_api.h` 里的 `RimeContext` 只有 5 个字段。5e32988（11-03 01:17）加字段时
+    // 没同步头文件,于是宿主(Engine 按头文件生成绑定)传进来的是 5 字段结构,
+    // 这边却按 7 字段写 → **越界写 8 字节** → Engine 一按键就 0xc0000005(实测 7 次 APPCRASH)。
+    // 现在按调用方声明的 `data_size` 判断:结构不够大就一个字节都不碰。
+    let extended = (*ctx).data_size as usize >= std::mem::size_of::<RimeContext>();
+    if !extended {
+        // 老宿主:没有这两个字段,别写(写了就是越界)。
+    } else if g
+        .sessions
         .get(&id)
         .and_then(|session| session.context())
         .map(|context| context.input.is_empty())
@@ -823,7 +835,10 @@ unsafe extern "C" fn rime_free_context(ctx: *mut RimeContext) {
         (*ctx).menu.candidates = std::ptr::null_mut();
     }
     cstr_free((*ctx).commit_text_preview);
-    if !(*ctx).predictions.is_null() {
+    // 同上:`predictions*` 是扩展字段 —— 宿主结构不够大时**连读都不能读**（读到的是别人的栈/堆）。
+    if (*ctx).data_size as usize >= std::mem::size_of::<RimeContext>()
+        && !(*ctx).predictions.is_null()
+    {
         let n = (*ctx).predictions_len.max(0) as usize;
         let arr = std::slice::from_raw_parts_mut((*ctx).predictions, n + 1);
         for p in arr.iter_mut() {
@@ -1528,6 +1543,19 @@ mod host_smoke {
     use super::*;
     use std::ffi::{CStr, CString};
 
+    /// 测试沙箱的自动清理守卫。
+    ///
+    /// 这个用例要拷一份完整的 `build/`（200MB+），之前只在**开头**清一次旧目录，
+    /// 每次跑完都留一份在 `%TEMP%`（PID 每次不同 ⇒ 越积越多，实测攒到 7GB、
+    /// 把系统盘写满）。改成 Drop 收尾，提前 `return` 的失败分支也能清掉。
+    struct Sandbox(std::path::PathBuf);
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// 新会话的初始方案：`active:` 优先，其次清单第一条。
     ///
     /// 真机后果（2026-10-29）：只看清单第一条时，`schema.yaml` 排第一的 `cangjie.5`
@@ -1611,6 +1639,7 @@ mod host_smoke {
         // 沙箱:拷 build\ 和 schema\ 到临时目录,不带 userdb\ 和 installation.yaml
         let sandbox = std::env::temp_dir().join(format!("host-smoke-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&sandbox);
+        let _sandbox_guard = Sandbox(sandbox.clone());
         std::fs::create_dir_all(sandbox.join("build")).unwrap();
         // 拷 build 产物
         let src_build = format!("{real_user}/build");

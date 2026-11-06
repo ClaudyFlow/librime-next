@@ -84,8 +84,8 @@ fn main() {
     println!("=== 神经重排打字速度基准(release,本轮机器)===");
     println!("设计约束:score_sentences 在后台线程跑,按键路径只有 order_for 的哈希查找(<1µs)。");
     println!();
-    bench_model("keyboard(6层)", "test-data/neural/sentence-model.safetensors");
-    bench_model("desktop(8层)", "test-data/neural/sentence-model-desktop.safetensors");
+    bench_model("keyboard(6层)", "test-data/model/sentence-model.safetensors");
+    bench_model("desktop(8层)", "test-data/model/sentence-model-desktop.safetensors");
 
     // ---- 引擎按键基线(无神经重排时的每键耗时) ------------------------
     println!("=== 参照:引擎每键耗时(bench_keystroke 结论) ===");

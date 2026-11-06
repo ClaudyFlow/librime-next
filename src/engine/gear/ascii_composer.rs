@@ -3,7 +3,8 @@
 //! 对照组是**装机在跑的那份**（`/c/code/librime`，含 weasel 补丁的
 //! inline uppercase / inline keypad）。主干行为：
 //!
-//! * **单击** Shift / Ctrl / Alt / Super（500ms 内抬起）切换 `ascii_mode`；
+//! * **单击**在 `switch_key` 里显式绑定过的修饰键（500ms 内抬起）才切 `ascii_mode`；
+//!   `noop` 和未绑定的键**不切**（C++ `ToggleAsciiModeWithKey` 查表 miss 就返回 false）；
 //! * CapsLock 也可作切换键（`ascii_composer/switch_key/Caps_Lock`）；
 //! * **纯西文态且没在组字** ⇒ `Rejected`，让前端把按键直接上屏（这是"中文输入法里打英文"的手感）；
 //! * 西文态组字时空格 / 回车 ⇒ 结算上屏并自动回到中文态；
@@ -169,13 +170,15 @@ impl AsciiComposer {
         let _ = mode;
     }
 
+    /// C++ `AsciiComposer::ToggleAsciiModeWithKey`：**查表未命中就不切换**。
+    ///
+    /// 2026-11-06 修：原来写 `unwrap_or(SwitchStyle::Toggle)`，于是配置里
+    /// `Control_L: noop`（C++ `load_bindings` 直接 `continue`，不进 `bindings_`）
+    /// 反而变成「默认 Toggle」——单按 Ctrl 就切中英。用户配置明明写了 `noop`。
     fn toggle_with_key(&mut self, ctx: &mut crate::engine::context::Context, keycode: u32) {
-        let style = self
-            .switch_key
-            .get(&keycode)
-            .copied()
-            .unwrap_or(SwitchStyle::Toggle);
-        self.switch_ascii_mode(ctx, style);
+        if let Some(&style) = self.switch_key.get(&keycode) {
+            self.switch_ascii_mode(ctx, style);
+        }
         self.reset_modifier_state();
     }
 
@@ -208,12 +211,11 @@ impl Processor for AsciiComposer {
                     .toggle_deadline
                     .map_or(false, |deadline| Instant::now() < deadline);
                 if ch == code && within_window {
-                    let style = self
-                        .switch_key
-                        .get(&ch)
-                        .copied()
-                        .unwrap_or(SwitchStyle::Toggle);
-                    self.switch_ascii_mode(ctx, style);
+                    // C++ `ToggleAsciiModeWithKey`：`bindings_.find()` miss ⇒ `return false`。
+                    // `noop` 与未绑定的修饰键都不在表里，所以这里必须直接不切。
+                    if let Some(&style) = self.switch_key.get(&ch) {
+                        self.switch_ascii_mode(ctx, style);
+                    }
                 }
                 self.reset_modifier_state();
             }
@@ -240,11 +242,13 @@ impl Processor for AsciiComposer {
         if ch == 0xffe5 || ch == 0x14 {
             // 抬手已经在上面 step 1 统一 return 了，这里只剩按下。
             self.reset_modifier_state();
-            let style = self
-                .switch_key
-                .get(&ch)
-                .copied()
-                .unwrap_or(SwitchStyle::Toggle);
+            // C++ `ascii_composer.cc:157` 的 `caps_lock_switch_style_ != Noop` 门控：
+            // 只有 `switch_key` 里显式配了 Caps_Lock 才把它当中英切换键，否则整块不处理。
+            // `0x14` 是 Windows `VK_CAPITAL` 的历史兼容入口，表里的键是 X11 `0xffe5`。
+            let caps_keysym = if ch == 0x14 { 0xffe5 } else { ch };
+            let Some(&style) = self.switch_key.get(&caps_keysym) else {
+                return ProcessResult::Noop;
+            };
             self.switch_ascii_mode(ctx, style);
             // `good_old_caps_lock: true`（本机用户配置）⇒ **放行**，让 Windows 真的翻转
             // 大写锁定 —— 否则锁没锁上由我们说了算，英文态打不出大写。
@@ -562,5 +566,72 @@ mod tests {
             ProcessResult::Accepted
         );
         assert!(engine.context.get_option("ascii_mode"));
+    }
+
+    /// 2026-11-06 回归（用户三问之一）：「为什么 Ctrl 是切换中英文」。
+    ///
+    /// 用户 `%APPDATA%/Rime-Next/default.yaml` 明确写了 `Control_L/R: noop`，
+    /// C++ `load_bindings` 会把 `noop` 跳过、不进 `bindings_`，而
+    /// `ToggleAsciiModeWithKey` 查表 miss 就 `return false` ⇒ 不切。
+    /// 旧 Rust 实现在 miss 时回落 `SwitchStyle::Toggle`，把 noop 变成了默认切中英。
+    #[test]
+    fn noop_ctrl_single_click_does_not_toggle_ascii_mode() {
+        let config = json!({
+            "ascii_composer": {
+                "good_old_caps_lock": true,
+                "switch_key": {
+                    "Shift_L": "toggle",
+                    "Shift_R": "toggle",
+                    "Control_L": "noop",
+                    "Control_R": "noop",
+                    "Caps_Lock": "clear"
+                }
+            }
+        });
+        let mut composer = AsciiComposer::new(&config);
+        let mut engine = engine_with("", false);
+        let release = crate::engine::key_event::K_RELEASE_MASK;
+
+        // 左 Ctrl 单击（按下 + 500ms 内抬起）
+        composer.process_key_event(&mut engine, &KeyEvent::new(0xffe3, 0));
+        composer.process_key_event(&mut engine, &KeyEvent::new(0xffe3, release));
+        assert!(
+            !engine.context.get_option("ascii_mode"),
+            "Control_L: noop ⇒ 单按不该切中英"
+        );
+
+        // 右 Ctrl 同样
+        composer.process_key_event(&mut engine, &KeyEvent::new(0xffe4, 0));
+        composer.process_key_event(&mut engine, &KeyEvent::new(0xffe4, release));
+        assert!(!engine.context.get_option("ascii_mode"), "Control_R 同理");
+
+        // 表里显式绑定的 Shift 仍然要能切（不能把功能一起改没）
+        let shift = modifier_keysym(true);
+        composer.process_key_event(&mut engine, &KeyEvent::new(shift, 0));
+        composer.process_key_event(&mut engine, &KeyEvent::new(shift, release));
+        assert!(
+            engine.context.get_option("ascii_mode"),
+            "Shift_L: toggle 必须照旧生效"
+        );
+    }
+
+    /// 未绑定的修饰键 / 未配置 CapsLock 时都不该切中英（C++ 门控语义）。
+    #[test]
+    fn unbound_modifier_and_caps_lock_are_inert() {
+        let mut composer = AsciiComposer::new(&json!({})); // 默认只有 Shift_L
+        let mut engine = engine_with("", false);
+        let release = crate::engine::key_event::K_RELEASE_MASK;
+
+        // Alt_L 没绑 ⇒ 单击不切
+        composer.process_key_event(&mut engine, &KeyEvent::new(0xffe9, 0));
+        composer.process_key_event(&mut engine, &KeyEvent::new(0xffe9, release));
+        assert!(!engine.context.get_option("ascii_mode"));
+
+        // CapsLock 没绑 ⇒ 整块不处理，连按键都不吞
+        assert_eq!(
+            composer.process_key_event(&mut engine, &KeyEvent::new(0xffe5, 0)),
+            ProcessResult::Noop
+        );
+        assert!(!engine.context.get_option("ascii_mode"));
     }
 }

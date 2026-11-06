@@ -71,17 +71,19 @@ pub mod dict_entry_iterator;
 pub mod dict_settings;
 pub mod dictionary;
 pub mod entry_collector;
-pub mod gram_db;
 pub mod level_db;
+pub mod manual_stamp;
 pub mod mapped_file;
 pub mod preset_vocabulary;
 pub mod prism;
 pub mod reverse_lookup_dictionary;
 pub mod text_db;
 pub mod tsv;
+pub mod eassy_matcher;
 pub mod user_db;
 pub mod user_dict_cache;
 pub mod user_dictionary;
+pub mod user_manual_order;
 pub mod vocabulary;
 
 // corrector / marisa / string_table / string_table_builder / table 均已补齐：

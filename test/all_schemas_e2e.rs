@@ -11,11 +11,34 @@ use librime_next::lever::deployer::Deployer;
 use librime_next::lever::deployment_tasks::DeploymentTask;
 use std::path::{Path, PathBuf};
 
+/// 共享数据目录（`SHARE_DIR`）。
+///
+/// 0.18.6 起共享数据在 `<安装目录>\data`（如
+/// `C:\Program Files\Rime-Next\Weasel-Next-0.18.6\data`）；`C:\Program Files\Weasel-Next\Rime-Next`
+/// 是 0.18.4 时代的旧布局，只有老装机上还在。**别再写死旧路径当唯一来源**——
+/// 那会让这个"真实数据"端到端测的是一棵过期树。
+fn shared_data_dir() -> Option<PathBuf> {
+    // 按安装目录名升序取最高的一个（0.18.5 < 0.18.6），只要它带 data\schema。
+    if let Ok(entries) = std::fs::read_dir(r"C:\Program Files\Rime-Next") {
+        let mut candidates: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path().join("data"))
+            .filter(|data| data.join("schema").is_dir())
+            .collect();
+        candidates.sort();
+        if let Some(data) = candidates.pop() {
+            return Some(data);
+        }
+    }
+    let legacy = PathBuf::from(r"C:\Program Files\Weasel-Next\Rime-Next");
+    legacy.is_dir().then_some(legacy)
+}
+
 fn real_roots() -> Option<(PathBuf, PathBuf)> {
-    let shared = PathBuf::from(r"C:\Program Files\Weasel-Next\Rime-Next");
+    let shared = shared_data_dir()?;
     let user = std::env::var_os("APPDATA")
         .map(|a| PathBuf::from(a).join("Rime-Next"))?;
-    (shared.is_dir() && user.is_dir()).then(|| (shared, user))
+    user.is_dir().then(|| (shared, user))
 }
 
 fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -107,6 +130,12 @@ fn real_code_for(staging: &Path, shared: &Path, sandbox_user: &Path, schema_id: 
 
 /// 对一个方案打字并收集（消费的键数, 候选文本数, 是否组字态）。
 fn type_probe(session: &mut Session, keys: &str) -> (usize, usize, bool) {
+    // 方案可以把自己的 `ascii_mode` 开关写成 `reset: 1`（如 sunman）⇒ 引擎按方案默认态
+    // 进入**西文优先**，`ascii_composer` 把字母键全部 Rejected 给操作系统。那是方案自身
+    // 的默认状态，不是引擎故障；这里象用户按一下 Shift 那样先切回中文再探。
+    if let Some(engine) = session.engine.as_mut() {
+        engine.context.set_option("ascii_mode", false);
+    }
     let mut consumed = 0usize;
     for ch in keys.chars() {
         if session.process_key(ch as u32, 0) {
@@ -122,7 +151,10 @@ fn type_probe(session: &mut Session, keys: &str) -> (usize, usize, bool) {
                 .segments
                 .iter()
                 .filter_map(|s| s.menu.as_ref())
-                .map(|m| m.candidate_count())
+                // 惰性菜单：`candidate_count()` 只数已物化的条目，`all_candidates()`
+                // 才会 `prepare(usize::MAX)`。这里要的是"这个方案能不能出候选"，
+                // 必须走后者，否则恒 0。
+                .map(|m| m.all_candidates().len())
                 .sum::<usize>()
         })
         .unwrap_or(0);
@@ -154,15 +186,36 @@ fn every_staged_schema_loads_types_and_yields_candidates() {
         "deploy_workspace 应全过（此前基线 21/0）"
     );
 
-    // staging 里的方案目录即已部署方案清单
-    let mut schemas: Vec<String> = std::fs::read_dir(&staging)
-        .expect("staging 可读")
-        .flatten()
-        .filter(|e| e.path().is_dir())
-        .filter_map(|e| e.file_name().to_str().map(str::to_string))
-        .collect();
+    // 已部署方案清单：`workspace_update` 会把清单写回 `staging/default.yaml` 的
+    // `schema_list`，这是**唯一可靠**的来源。
+    // 别用 staging 的顶层目录当清单——2026-10-28 改成系列文件夹布局后，顶层是
+    // `pinyin` / `wubi` / `double_pinyin` 这类**系列名**，不是方案 id（`pinyin.luna` / `wubi.86`），
+    // 拿它去 `Session::create` 会一律"引擎加载失败"。
+    let default_yaml = staging.join("default.yaml");
+    let mut schemas: Vec<String> = librime_next::load_file(&default_yaml)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/schema_list")
+                .and_then(|list| list.as_array())
+                .cloned()
+        })
+        .map(|list| {
+            list.iter()
+                .filter_map(|item| {
+                    item.pointer("/schema")
+                        .and_then(|id| id.as_str())
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     schemas.sort();
-    assert!(!schemas.is_empty(), "staging 里应有方案");
+    schemas.dedup();
+    assert!(
+        !schemas.is_empty(),
+        "staging/default.yaml 的 schema_list 应有方案（部署没写回清单？）"
+    );
 
     let mut failures: Vec<String> = Vec::new();
     println!(
@@ -230,11 +283,21 @@ fn every_staged_schema_loads_types_and_yields_candidates() {
     }
 
     // 精确断言（可确定预期行为的方案）
+    // 方案 id 在 2026-10-28 改成点分系列 id：`luna_pinyin_simp` → `pinyin.luna`、
+    // `wubi86` → `wubi.86`。两种写法都认，谁在清单里用谁。
+    let pick = |candidates: &[&str]| -> Option<String> {
+        candidates
+            .iter()
+            .find(|want| schemas.iter().any(|id| id == *want))
+            .map(|id| (*id).to_string())
+    };
     {
-        let mut s = Session::create(&staging, "luna_pinyin_simp");
-        assert!(s.engine.is_some());
+        let luna = pick(&["pinyin.luna", "luna_pinyin_simp"])
+            .expect("staging 里应有拼音方案（pinyin.luna / luna_pinyin_simp）");
+        let mut s = Session::create(&staging, &luna);
+        assert!(s.engine.is_some(), "{luna}: 引擎应加载成功");
         for ch in "nihao".chars() {
-            assert!(s.process_key(ch as u32, 0));
+            assert!(s.process_key(ch as u32, 0), "{luna}: 键 {ch} 应被消费");
         }
         let has_nihao = s.context().map_or(false, |c| {
             c.composition
@@ -245,13 +308,14 @@ fn every_staged_schema_loads_types_and_yields_candidates() {
                 .flat_map(|m| m.all_candidates().into_iter().map(|c| c.text.clone()))
                 .any(|t| t == "你好")
         });
-        assert!(has_nihao, "luna_pinyin_simp: nihao 应出「你好」");
+        assert!(has_nihao, "{luna}: nihao 应出「你好」");
     }
     {
-        let mut s = Session::create(&staging, "wubi86");
-        assert!(s.engine.is_some());
+        let wubi = pick(&["wubi.86", "wubi86"]).expect("staging 里应有五笔方案（wubi.86 / wubi86）");
+        let mut s = Session::create(&staging, &wubi);
+        assert!(s.engine.is_some(), "{wubi}: 引擎应加载成功");
         for ch in "aaaa".chars() {
-            assert!(s.process_key(ch as u32, 0));
+            assert!(s.process_key(ch as u32, 0), "{wubi}: 键 {ch} 应被消费");
         }
         let has_gong = s.context().map_or(false, |c| {
             c.composition
@@ -262,7 +326,7 @@ fn every_staged_schema_loads_types_and_yields_candidates() {
                 .flat_map(|m| m.all_candidates().into_iter().map(|c| c.text.clone()))
                 .any(|t| t == "工")
         });
-        assert!(has_gong, "wubi86: aaaa 应出「工」");
+        assert!(has_gong, "{wubi}: aaaa 应出「工」");
     }
 
     let _ = std::fs::remove_dir_all(&work);

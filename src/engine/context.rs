@@ -444,12 +444,36 @@ impl Context {
         if syllables.is_empty() {
             return;
         }
-        self.pending_commit_elements
-            .push(crate::dict::vocabulary::DictEntry {
-                text: text.to_string(),
-                code: crate::dict::vocabulary::Code::from_slice(&syllables),
-                ..Default::default()
-            });
+        let mut entry = crate::dict::vocabulary::DictEntry {
+            text: text.to_string(),
+            code: crate::dict::vocabulary::Code::from_slice(&syllables),
+            ..Default::default()
+        };
+        // **用户造词**：给这次临时拼出来的整串定个初始权重。
+        //
+        // 同一句话里 `伊布替尼` 和 `是地方的` 都是词典里没有的新词，但前者只是
+        // 不常见、后者根本不成词 —— 权重差会体现在下次的排序里。
+        if let Some(weight) = self.neural_weight(text) {
+            entry.weight = weight;
+        }
+        self.pending_commit_elements.push(entry);
+    }
+
+    /// 整串新词的初始权重：把模型「平均每字对数概率」映射到 `weight` 的量纲。
+    ///
+    /// `weight` 本身是 ln 尺度（`user_dictionary` 里写 `ln(freq) + credibility`），
+    /// 所以不能直接塞概率。这里把「每字 -12 ~ 0 nat」线性映到「0 ~ 12」：模型
+    /// 越觉得顺，这条自造词下次排得越前。模型不可用就返回 `None`，保持默认权重。
+    ///
+    /// 只在上屏时算一次（一次 forward），不在按键路径上。
+    fn neural_weight(&self, text: &str) -> Option<f64> {
+        let chars = text.chars().count();
+        if chars == 0 {
+            return None;
+        }
+        let context = self.commit_history.latest_text();
+        let score = crate::engine::gear::rescore::score_text(&context, text)?;
+        Some(((score / chars as f64) + 12.0).clamp(1.0, 12.0))
     }
 
     /// C++ `ConcreteEngine::OnCommit(ctx)` 的第一件事

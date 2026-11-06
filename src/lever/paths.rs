@@ -16,7 +16,7 @@
 //! 显式路径：id 含 '/' 或 '\' → <root>/<id><后缀>        （不套分类，import_tables 的相对路径写法）
 //! 扁平路径 = <root>/<prefix><id><suffix>          （prefix 恒空；仅未归类资源走这条）
 //! 分目录：① 后缀 .bin       → <root>/<系列…>/<id><后缀>     （staging 根，编译产物）
-//!         ② 后缀 .gram      → <root>/model/<id><后缀>       （语言模型按 id 平铺，不建系列夹）
+//!         ② 后缀 .gram      → <root>/model/<id><后缀>       （已无出厂 .gram，规则留作旧包兼容）
 //!         ③ id 以 .schema/.dict 结尾且后缀 .yaml
 //!              staging 根 → <root>/<系列…>/<id>.yaml
 //!              其它根      → <root>/schema/<系列…>/<id>.yaml

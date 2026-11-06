@@ -44,12 +44,54 @@ use crate::algo::dynamics::{formula_d, formula_p};
 use crate::algo::SpellingType;
 use crate::algo::syllabifier::SyllableGraph;
 
+/// 用户词学习模式（librime-evo `user_dict_mode`，2026-10 三模式架构）。
+///
+/// ```yaml
+/// translator:
+///   user_dict_mode: auto     # auto（默认）| manual | off
+/// ```
+///
+/// | 模式 | 自动学习 | 自动删除 | 手排 | 有用户词典 |
+/// |---|---|---|---|---|
+/// | `auto` | ✅ | ✅ | ✅ | ✅ |
+/// | `manual` | ❌ | ❌ | ✅ | ✅ |
+/// | `off` | ❌ | ❌ | ❌ | ❌（组件不创建） |
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UserDictMode {
+    /// 上游行为：选词即学，删词即删。
+    #[default]
+    Auto,
+    /// 只认手排：不自动学、不自动删，位置由用户拖动决定。
+    Manual,
+    /// 完全不建用户词典（`registry` 层就返回 `None`）。
+    Off,
+}
+
+impl UserDictMode {
+    /// 解析配置里的字符串；非法值返回 `None`（调用方负责报错）。
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "auto" => Some(Self::Auto),
+            "manual" => Some(Self::Manual),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Manual => "manual",
+            Self::Off => "off",
+        }
+    }
+}
+
 /// `UserDictionary` 需要从词典那边拿到的东西（C++ 靠 `Attach(table, prism)` 拿到两个指针）。
 ///
 /// 只要这两条：把音节 id 翻回拼写串（拼 userdb 的码串前缀）、以及整张音节表
 /// （"预测词"分支要把码串里没用到的音节也翻成 id）。
-pub trait UserDictSource {
-    /// `Table::GetSyllableById(id)`。未知 id 返回空串。
+pub trait UserDictSource {    /// `Table::GetSyllableById(id)`。未知 id 返回空串。
     fn syllable_by_id(&self, syllable_id: SyllableId) -> String;
     /// `Table::GetSyllabary(&out)`。
     fn syllabary(&self) -> Option<Syllabary>;
@@ -300,6 +342,14 @@ pub struct UserDictionary {
     /// 学词先写 db、再记这里；查询游标同时看 `cache` 与 `pending`，下次查询折叠回 `cache`。
     /// 用 `Arc` 共享：写覆盖层时若拿不到唯一引用（被某处借着）就 clone 一份，绝不丢词条。
     pending: PendingMap,
+    /// 学习模式（evo 三模式）：`auto` / `manual` / `off`。
+    ///
+    /// * `auto`   —— 上游行为：选词就学、删词就删、衰减按 tick 走；
+    /// * `manual` —— **只认手排**：自动学习与自动删除一律不写前三字段
+    ///   （`UpdateEntry` 只剩 `commits >= 0` 的放行判定），位置靠用户拖动；
+    /// * `off`    —— 组件压根不创建（`registry` 那边直接返回 `None`），
+    ///   引擎退化成"没有用户词典"。这里仍保留这个值，供诊断/测试表达意图。
+    mode: UserDictMode,
 }
 
 impl UserDictionary {
@@ -314,7 +364,22 @@ impl UserDictionary {
             cache_gen: 0,
             cache_drops: 0,
             pending: Arc::new(BTreeMap::new()),
+            mode: UserDictMode::Auto,
         }
+    }
+
+    /// 设置学习模式（`UserDictionary::SetUserDictMode`）。
+    pub fn set_mode(&mut self, mode: UserDictMode) {
+        self.mode = mode;
+    }
+
+    pub fn mode(&self) -> UserDictMode {
+        self.mode
+    }
+
+    /// `automatic_learning_enabled()`：只有 `auto` 模式才会自动学。
+    pub fn automatic_learning_enabled(&self) -> bool {
+        self.mode == UserDictMode::Auto
     }
 
     // ---- #1196：内存有序缓存 ----
@@ -822,6 +887,12 @@ impl UserDictionary {
         if entry.code.is_empty() && entry.custom_code.is_empty() {
             return false;
         }
+        // 手动模式只允许手排：自动学习（commits > 0）、自动加权（commits == 0）、
+        // 自动删除（commits < 0）都不能改动自动字段
+        // （`user_dictionary.cc:501`：`if (user_dict_mode_ != "auto") return commits >= 0;`）。
+        if self.mode != UserDictMode::Auto {
+            return commits >= 0;
+        }
         let code_str = if entry.custom_code.is_empty() {
             match self.translate_code_to_string(source, &entry.code) {
                 Some(code) => code,
@@ -864,6 +935,129 @@ impl UserDictionary {
         // #1196：db 写成功才更新镜像 —— 写失败不能让内存里多出一条 db 里没有的词。
         if ok {
             self.cache_update(&key, &packed);
+        }
+        ok
+    }
+
+    // ---- 手排（librime-evo 三模式架构） ----
+
+    /// `GetEntryCode(entry, &code)`：词条 → userdb 的码串（末尾带一个空格）。
+    fn entry_code(&mut self, source: &dyn UserDictSource, entry: &DictEntry) -> Option<String> {
+        let code = if entry.custom_code.is_empty() {
+            self.translate_code_to_string(source, &entry.code)?
+        } else {
+            entry.custom_code.clone()
+        };
+        if code.is_empty() {
+            return None;
+        }
+        Some(if code.ends_with(' ') { code } else { format!("{code} ") })
+    }
+
+    /// `GetUserState(entry, &state)`：读这条词条的完整五字段状态。
+    pub fn user_state(&mut self, source: &dyn UserDictSource, entry: &DictEntry) -> Option<UserDbValue> {
+        if !self.loaded() {
+            return None;
+        }
+        let code = self.entry_code(source, entry)?;
+        let raw = self.fetch_raw(&format!("{code}\t{}", entry.text))?;
+        UserDbValue::unpack(&raw)
+    }
+
+    /// `SetManualPosition(entry, position)`：把手排位置固定成 `position`（0 = 取消）。
+    ///
+    /// 手排**不受** `mode` 限制：`manual` 模式存在的意义正是只有手排生效。
+    pub fn set_manual_position(
+        &mut self,
+        source: &dyn UserDictSource,
+        entry: &DictEntry,
+        position: i32,
+    ) -> bool {
+        if !self.loaded() || self.readonly() || position < 0 {
+            return false;
+        }
+        let Some(code) = self.entry_code(source, entry) else {
+            return false;
+        };
+        let ok = super::user_manual_order::set_manual(&*self.db, &code, &entry.text, position);
+        if ok {
+            self.invalidate_cache();
+        }
+        ok
+    }
+
+    /// `MoveManualOneStep(selected, neighbor, source_position, direction, neighbor_visible)`。
+    pub fn move_manual_one_step(
+        &mut self,
+        source: &dyn UserDictSource,
+        selected: &DictEntry,
+        neighbor: &DictEntry,
+        source_position: i32,
+        direction: i32,
+        neighbor_visible: bool,
+    ) -> bool {
+        if !self.loaded() || self.readonly() {
+            return false;
+        }
+        let Some(code) = self.entry_code(source, selected) else {
+            return false;
+        };
+        // 邻词不属于本库也要允许移动（只是拿不到它的码串）
+        let adjacent_code = if neighbor.text.is_empty() {
+            String::new()
+        } else {
+            self.entry_code(source, neighbor).unwrap_or_default()
+        };
+        let ok = super::user_manual_order::move_adjacent(
+            &*self.db,
+            &code,
+            &selected.text,
+            &adjacent_code,
+            &neighbor.text,
+            source_position,
+            direction,
+            neighbor_visible,
+        );
+        if ok {
+            self.invalidate_cache();
+        }
+        ok
+    }
+
+    /// `ResetAutoLearning(entry)`：只抹自动学习，手排保留。
+    pub fn reset_auto_learning(
+        &mut self,
+        source: &dyn UserDictSource,
+        entry: &DictEntry,
+    ) -> bool {
+        if !self.loaded() || self.readonly() {
+            return false;
+        }
+        let Some(code) = self.entry_code(source, entry) else {
+            return false;
+        };
+        let ok = super::user_manual_order::reset_auto(&*self.db, &code, &entry.text);
+        if ok {
+            self.invalidate_cache();
+        }
+        ok
+    }
+
+    /// `ResetManualPosition(entry)`：只清手排，学习记录保留。
+    pub fn reset_manual_position(
+        &mut self,
+        source: &dyn UserDictSource,
+        entry: &DictEntry,
+    ) -> bool {
+        if !self.loaded() || self.readonly() {
+            return false;
+        }
+        let Some(code) = self.entry_code(source, entry) else {
+            return false;
+        };
+        let ok = super::user_manual_order::reset_manual(&*self.db, &code, &entry.text);
+        if ok {
+            self.invalidate_cache();
         }
         ok
     }
@@ -936,6 +1130,10 @@ impl UserDictionary {
         );
         entry.weight = (if weight > 0.0 { weight } else { f64::EPSILON }).ln() + credibility;
         entry.quality_len = quality_len;
+        // 手排位置随词条一路带到翻译器（`DictEntry::manual_position`）：
+        // 排序时它压过 weight，但**不参与**学习/衰减的任何计算。
+        entry.manual_position = v.position;
+        entry.manual_version = v.manual_stamp;
         if let Some(full_code) = full_code {
             *full_code = key[..separator_pos].to_string();
         }

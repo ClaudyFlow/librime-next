@@ -719,17 +719,64 @@ impl SentenceModel {
     }
 
     /// log P(下一个字符 | text),全词表分布,按 token id 下标。
-    /// 单步参考 API,一致性测试对照 Rust 参考实现用。
+    ///
+    /// **与 [`Self::score_sentences`] 走同一条实现**:最后一个 token 当"领队"、
+    /// 它之前的内容进前缀缓存。早先这里直接对整串做一次无 past 的 forward,
+    /// 实测两种路径给出的数值不一致(同一 `logP(们|我)` 差 5 个 nat),
+    /// 且无 past 那条几乎不随上文变化 —— 生成会因此全是噪声。
+    /// 统一到打分的路径后,`next_log_probabilities(ctx)[c]` 与
+    /// `score_sentences(ctx, [c])` 逐位对齐。
     pub fn next_log_probabilities(&self, text: &str) -> Vec<f32> {
-        let mut tokens = vec![BOS];
-        let encoded = self.encode(text);
-        let room = self.config.context - 1;
-        let start = encoded.len().saturating_sub(room);
-        tokens.extend_from_slice(&encoded[start..]);
-        let hidden = self.forward(&tokens, 1, tokens.len(), None, None);
-        let n_embd = self.config.n_embd;
-        let last = &hidden[hidden.len() - n_embd..];
-        self.distribution(last)
+        let limit = self.config.context;
+        let mut ids = vec![BOS];
+        ids.extend(self.encode(text));
+        // 超出窗口从左侧截断,给末 token 留一位。
+        let room = limit.saturating_sub(1);
+        let start = ids.len().saturating_sub(room + 1);
+        ids.drain(..start);
+        let Some(&last) = ids.last() else {
+            return Vec::new();
+        };
+        let head = &ids[..ids.len() - 1];
+        let prefix = self.build_prefix(head);
+        let hidden = self.forward(&[last], 1, 1, Some(&prefix), None);
+        self.distribution(&hidden[..self.config.n_embd])
+    }
+
+    /// 下一个字符概率最高的 `count` 个候选:`(字符, log P)`,按降序。
+    ///
+    /// 生成式预测的最小原语 —— 预测每走一步都调它一次。保留 token(`<bos>` 等)
+    /// 与未登录 id 不会出现在结果里;非有限值(理论上的 -inf)也丢掉。
+    ///
+    /// 代价:一次完整 forward + 一次全词表投影,与 [`Self::score_sentences`] 的
+    /// 单条候选相当(上下文长度相同时)。
+    pub fn top_next_chars(&self, text: &str, count: usize) -> Vec<(char, f32)> {
+        if count == 0 {
+            return Vec::new();
+        }
+        let log_probs = self.next_log_probabilities(text);
+        let mut best: Vec<(char, f32)> = Vec::with_capacity(count + 1);
+        for (id, &log_prob) in log_probs.iter().enumerate() {
+            if !log_prob.is_finite() {
+                continue;
+            }
+            let Some(character) = self.char_for_token(id) else {
+                continue;
+            };
+            if best.len() < count {
+                best.push((character, log_prob));
+                if best.len() == count {
+                    best.sort_by(|a, b| b.1.total_cmp(&a.1));
+                }
+            } else if log_prob > best[count - 1].1 {
+                best[count - 1] = (character, log_prob);
+                best.sort_by(|a, b| b.1.total_cmp(&a.1));
+            }
+        }
+        if best.len() < count {
+            best.sort_by(|a, b| b.1.total_cmp(&a.1));
+        }
+        best
     }
 
     /// 一次算一批句子的 log P(sentence | context)。

@@ -178,9 +178,10 @@ impl DoubleArray {
     /// `commonPrefixSearch(key, results, max, length, node_pos)`（`darts.h:441`）的
     /// **带起点**版本：从已经走到的 `node_pos` 继续往下搜。
     ///
-    /// 语法模型（`.gram`）靠这个做两级查询：先用 [`Self::traverse`] 把前文 context
-    /// 在 trie 里走一遍，再从那个节点搜当前词 word 的所有前缀键
-    /// （`gram_db.cc:105-116`）。
+    /// 原 octagram 语法模型（`.gram`，已于 2026-11-03 移除）靠这个做两级查询：
+    /// 先用 [`Self::traverse`] 把前文 context 在 trie 里走一遍，再从那个节点搜
+    /// 当前词 word 的所有前缀键（`gram_db.cc:105-116`）。模型移除后**暂无调用者**，
+    /// 保留是为了对齐 C++ `darts.h:441` 的通用接口。
     pub fn common_prefix_search_from(
         &self,
         key: &[u8],

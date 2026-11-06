@@ -118,8 +118,13 @@ impl UserNgram {
     }
 
     /// 用户删词：从统计里抹掉，并拉黑（打错一次就永远别再冒头）。
+    ///
+    /// ⚠️ 2026-11-06 修：**单字不拉黑**。这份 `blocked` 是全局黑名单
+    /// （`is_blocked_global` 在每个 translator 的 `peek()` 里都查一次），
+    /// 「是」「的」这类字来自系统词典，一次误删就会让它们从**所有方案**里永久消失。
+    /// 删词功能针对的是「造错的词」（≥2 字），不是系统词典里的基础单字。
     pub fn penalize(&mut self, word: &str) {
-        if word.is_empty() {
+        if word.chars().count() < 2 {
             return;
         }
         self.blocked.insert(word.to_string());
@@ -172,7 +177,11 @@ impl UserNgram {
             let parts: Vec<&str> = line.split('\t').collect();
             match parts.first().copied() {
                 Some("x") if parts.len() == 2 => {
-                    self.blocked.insert(parts[1].to_string());
+                    // 历史脏数据自愈：老版本可能把误删的单字写成 `x\t是`。
+                    // 不再加载它，下次 save() 会自然把这一行抹掉。
+                    if parts[1].chars().count() >= 2 {
+                        self.blocked.insert(parts[1].to_string());
+                    }
                 }
                 Some("u") if parts.len() == 3 => {
                     if let Ok(count) = parts[2].parse::<u32>() {
@@ -393,6 +402,40 @@ mod tests {
         assert!(twice > once, "{twice} vs {once}");
         assert_eq!(ngram.bigram_count("你", "好"), 2);
     }
+
+    /// 2026-11-06 回归（用户三问之一）：「为什么小鹤里面没有『是』这个字」。
+    ///
+    /// 根因是 `%APPDATA%/Rime-Next/user_ngram.tsv` 里有一条 `x\t是`：
+    /// `x` 行是**全局**黑名单，`ScriptWordsTranslation::peek()` 对每个候选都查一次，
+    /// 于是「是」在所有方案里被永久过滤。61 条 `x` 行里只有这一条是单字 ⇒ 误删。
+    /// 删词语义针对「造错的词」（≥2 字），单字不该进黑名单。
+    #[test]
+    fn single_character_words_are_never_blocked() {
+        let mut ngram = UserNgram::new();
+        ngram.penalize("是");
+        assert!(!ngram.is_blocked("是"), "单字不进黑名单");
+        ngram.penalize("是后");
+        assert!(ngram.is_blocked("是后"), "多字删词照旧拉黑");
+        assert!(!is_blocked_global("是"), "全局查询也对单字兜底");
+    }
+
+    /// 不改用户数据文件：加载侧跳过单字 `x` 行，让历史脏数据自愈。
+    #[test]
+    fn load_self_heals_legacy_single_char_block_rows() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "lrn_ngram_block_{}_{}.tsv",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, "x\t是\nx\t海市\nu\t就是\t9\n").unwrap();
+        let mut ngram = UserNgram::new();
+        ngram.load(&path);
+        assert!(!ngram.is_blocked("是"), "历史单字 x 行不再生效");
+        assert!(ngram.is_blocked("海市"), "多字 x 行照旧生效");
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// 进程级个人 n-gram 表（本进程学习、本进程使用——青简边界：不跨应用）。
@@ -420,7 +463,9 @@ pub fn store_path() -> std::path::PathBuf {
 /// 放在这里而不是让各处自己 `global().lock()`，是为了避免把锁的生命周期
 /// 拖进候选构造（容易和 `bonus` 撞成死锁）。
 pub fn is_blocked_global(word: &str) -> bool {
-    if word.is_empty() {
+    // 单字候选来自系统词典，不归用户删词管（见 `penalize` / `load` 的说明）。
+    // 这一层是兜底：即便有别处往 `blocked` 里塞了单字，也不该过滤它。
+    if word.chars().count() < 2 {
         return false;
     }
     global()

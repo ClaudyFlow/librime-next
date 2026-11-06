@@ -616,9 +616,10 @@ pub(crate) fn log_warn(message: &str) {
 }
 
 pub(crate) fn log_error(message: &str) {
-    if std::env::var_os("RIME_CONFIG_VERBOSE").is_some() {
-        eprintln!("[config] error: {message}");
-    }
+    // 对应 C++ 的 `LOG(ERROR)`：**错误无条件可见**（2026-11-05 定）。
+    // 此前和 INFO/WARNING 一样被 `RIME_CONFIG_VERBOSE` 挡着，于是 `deploy_workspace()` 返回
+    // false 时宿主/测试一个字都看不到——`all_schemas_e2e` 排查时整整 143 s 只得一句断言失败。
+    eprintln!("[config] error: {message}");
 }
 
 /// `std::strtoul` 的前缀解析（跳过空白、可选正负号、十进制数字），饱和到 usize。

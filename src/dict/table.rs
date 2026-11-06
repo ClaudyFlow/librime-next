@@ -490,8 +490,8 @@ impl Table {
         let estimated_file_size = K_RESERVED_SIZE + 32 * num_syllables + 64 * num_entries;
         let mut table = Self::with_file(MappedFile::create(path, estimated_file_size)?);
         table.build_in_place(syllabary, vocabulary, num_entries, dict_file_checksum)?;
-        // builder 只在建树/回填时有用；keys 是 12 万级字符串，留着纯占内存。
-        table.string_table_builder = None;
+        // builder 的释放在 `on_build_finish` 里做（dump 完立刻放，PR #1265），
+        // 这里不再重复置 None —— 直接调 `build_in_place` 的路径也能享受到。
         table.load()?;
         Ok(table)
     }
@@ -795,6 +795,12 @@ impl Table {
             metadata_pos + metadata_layout::STRING_TABLE_SIZE_POS,
             image_size as u32,
         );
+        // PR #1265（rime/librime，fxliang）：字符串表镜像已经 dump 进文件，这个 builder
+        // 里还压着整份 key 列表 + trie 编码器（几十 MB 量级），构建完立刻释放。
+        // C++ 是 `string_table_builder_.reset()`；这里 Option 置 None 等价。
+        // 注意只在**成功路径**释放：`Build` 失败重试还要接着用（PR 的
+        // `BuilderReleasedAfterSuccessfulRetry` 就是钉这个行为的）。
+        self.string_table_builder = None;
         Ok(())
     }
 
@@ -3168,6 +3174,30 @@ mod tests {
             .into_iter()
             .map(|(code, entry)| (code.to_string(), table.entry_text(&entry), entry.weight))
             .collect()
+    }
+
+    /// PR #1265（rime/librime，fxliang）：字符串表镜像 dump 完就把 builder 放掉。
+    ///
+    /// builder 里压着整份 key 列表 + trie 编码器（keys 是十几万级字符串），
+    /// 和文件镜像同时挂在内存里正是构建期的峰值。`load()` 之后也不可能再需要它。
+    #[test]
+    fn builder_is_released_after_build() {
+        let (syllabary, vocabulary) = cc_vocabulary();
+        let table = Table::build(
+            "unused",
+            &syllabary,
+            &vocabulary,
+            CC_NUM_ENTRIES as usize,
+            0xcafe_0002,
+        )
+        .expect("Table::build");
+        assert!(
+            table.string_table_builder.is_none(),
+            "构建成功后 builder 必须已释放"
+        );
+        // 表本身照常可读（释放的是构建中间态，不是产物）
+        assert_eq!(table.format(), 4.0);
+        assert_eq!(table.metadata().unwrap().num_entries, CC_NUM_ENTRIES);
     }
 
     /// `Table::build` 建出来的表与 `Table::Build` 的手写对照物（`cc_table_file`）

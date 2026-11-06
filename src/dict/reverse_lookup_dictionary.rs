@@ -49,6 +49,12 @@ pub const K_REVERSE_FORMAT_PREFIX: &str = "Rime::Reverse/";
 /// `kStemKeySuffix`（`reverse_lookup_dictionary.cc:28`）：词根键的后缀。
 pub const K_STEM_KEY_SUFFIX: &str = "\x1fstem";
 
+/// 辅助码表的前缀（librime-evo `kAuxiliaryKeyPrefix = "\x1faux"`）。
+///
+/// `\x1f`（单元分隔符）不会出现在正常字形里，所以字形键与辅助码键共用一张
+/// trie 也不会撞车 —— 这也是 evo 不另开文件的原因。
+pub const K_AUXILIARY_KEY_PREFIX: &str = "\x1faux";
+
 /// `reverse::Metadata` 的字段偏移（布局见模块文档）。
 mod metadata_layout {
     pub const SIZE: usize = 64;
@@ -150,6 +156,10 @@ impl ReverseDb {
                 None,
             );
         }
+        // PR #1265（rime/librime，fxliang）：反查表只是喂给两个 trie 的中间产物，
+        // 喂完立刻释放，别让它陪跑到函数结束和 trie 镜像叠加成峰值。
+        // C++ 那边是 `ReverseLookupTable().swap(rev_table);`。
+        drop(rev_table);
         key_builder
             .build()
             .map_err(|e| std::io::Error::other(format!("key trie: {e}")))?;
@@ -346,6 +356,20 @@ impl ReverseDb {
     pub fn lookup_stems(&self, text: &str) -> Option<String> {
         let mut key = text.to_string();
         key.push_str(K_STEM_KEY_SUFFIX);
+        self.lookup(&key)
+    }
+
+    /// `ReverseLookupDictionary::LookupAuxiliary(text)`：字形 → **辅助码表**。
+    ///
+    /// 键是 `"\x1faux" + 字形`，值是空格分隔的辅助码序列（`"m mq"`）。
+    /// 后置辅助码靠它判断"候选里的这个字能不能被用户敲的 aux 串命中"。
+    ///
+    /// 这份数据由**编译期**写进 `.reverse.bin`（librime-evo 的 `dict_compiler`
+    /// 在收到 `auxiliary:` 定义时追加 `\x1faux*` 键）。用上游 librime 编出来的
+    /// 词库没有这些键 —— 此时返回 `None`，后置辅助码在这本词典上静默失效。
+    pub fn lookup_auxiliary(&self, text: &str) -> Option<String> {
+        let mut key = String::from(K_AUXILIARY_KEY_PREFIX);
+        key.push_str(text);
         self.lookup(&key)
     }
 

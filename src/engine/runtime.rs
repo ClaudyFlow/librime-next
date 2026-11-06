@@ -53,8 +53,8 @@ pub struct Engine {
     /// 数据根列表，按 **C++ `ResourceResolver` 的查找顺序**：用户目录优先、共享目录其次。
     ///
     /// 为什么不能只留 `build_dir.parent()`：生产环境里 `build_dir` 是 `<用户目录>/build`
-    /// （`Deployer::staging_dir`），而 `model/<语言>.gram` 在用户目录、`opencc/` 在共享目录
-    /// —— 两东西不在同一个根下，必须两个都查。
+    /// （`Deployer::staging_dir`），而 `model/` 在共享目录、`opencc/` 也可能在别处
+    /// —— 两者不在同一个根下，必须都查。
     data_roots: Vec<std::path::PathBuf>,
     /// `default.yaml` 的配置树：switcher 的方案清单与菜单设置都在里面。
     ///
@@ -252,18 +252,6 @@ impl Engine {
         // 正确做法：**照常过处理器链**（让 ascii_composer 切中英），只在"没被任何人吃掉"
         // 时**不记历史、不上屏**，那串乱码就没了。
         let is_lock_key = matches!(key.keycode, 0x14 | 0x90 | 0x91 | 0xFFE5);
-        // 临时探针（2026-11-01 19:1x，排查中英切换）：确认 Shift / CapsLock 到底有没有进引擎。
-        // 定位完**必须删掉**。
-        if matches!(key.keycode, 0x14 | 0x10 | 0x11 | 0xFFE1 | 0xFFE2 | 0xFFE5 | 0x90 | 0x91) {
-            use std::io::Write as _;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(r"C:\Code\_keyprobe.txt")
-            {
-                let _ = writeln!(f, "keycode=0x{:x} modifier=0x{:x}", key.keycode, key.modifier);
-            }
-        }
         let input_before = self.context.input.clone();
         let mut result = self.run_processor_chain(key);
         // `ConcreteEngine::ProcessKey`（`engine.cc:180-182`）：**没被任何 processor
@@ -406,7 +394,42 @@ impl Engine {
         self.rescore_seen_generation = generation;
         // 正在组字才值得重算;空输入重 compose 无害但浪费。
         if self.context.is_composing() && !self.context.input.is_empty() {
+            // ⚠️ 2026-11-03：**必须先让末段重新翻译**。
+            // `translate_segments` 会跳过「Guess 且有菜单」的段（那是正常路径：不重复翻译），
+            // 于是直接 `compose()` 时这段根本不重译，而 `apply_filters` 又只作用在
+            // 空转的旧菜单上 —— 滤镜看到的是已被 `prepare()` 消费过的流，头部逐轮被啃，
+            // 批次键永远对不上，`order_for` 一次都不命中（探针实测 11 次 compose 全 MISS）。
+            // 清掉末段菜单 ⇒ compose 重译 ⇒ 滤镜套在新流上 ⇒ 结果表才可能命中。
+            // 高亮位置（`selected_index`）先存后补，避免重排落地把光标弹回第一页。
+            let keep = self
+                .context
+                .composition
+                .segmentation
+                .segments
+                .last()
+                .map(|s| s.selected_index);
+            // 只对**还没被确认**的末段重译：`Selected/Confirmed` 段是用户已经选定的，
+            // 清掉菜单会把确认结果重算掉（那是 `compose` 另一条路的语义）。
+            let reopen = self
+                .context
+                .composition
+                .segmentation
+                .segments
+                .last()
+                .map(|s| s.status <= SegStatus::Guess)
+                .unwrap_or(false);
+            if reopen {
+                if let Some(seg) = self.context.composition.segmentation.segments.last_mut() {
+                    seg.menu = None;
+                }
+            }
             self.compose();
+            if let Some(idx) = keep
+                && let Some(seg) = self.context.composition.segmentation.segments.last_mut()
+            {
+                let n = seg.menu.as_ref().map(|m| m.prepare(idx + 1)).unwrap_or(0);
+                seg.selected_index = idx.min(n.saturating_sub(1));
+            }
         }
     }
 
@@ -716,6 +739,15 @@ impl Engine {
             else {
                 continue;
             };
+            // 2026-11-03：菜单一旦套过滤镜链就不再套第二遍。
+            // 没有这条时，同一段在 re-compose 时会于**已被 `prepare()` 消费过的**流上
+            // 再包一层滤镜（`Menu::add_filter` 就是把 `result` 换成新包装），头部逐轮
+            // 被啃：探针实测同一输入连续 compose，重排批次 6→3→2→1 条，批次键因此
+            // 永远对不上，`order_for` 一次都没命中（神经重排等于全程空转）。
+            if menu.filters_ready() {
+                self.context.composition.segmentation.segments[i].menu = Some(menu);
+                continue;
+            }
             // 这一段该套哪些 filter
             // `apply` 取 `&mut self`：`Context` 不可变借用与 `filters` 可变借用是
             // 不同字段，分开绑一次就能同时用。
@@ -743,7 +775,17 @@ impl Engine {
                 ) {
                     menu.add_filter(context, &mut neural_filter);
                 }
+                // 续写预测:后挂 ⇒ 包在重排外面，拿到的是重排后的顺序。
+                // 只在候选稀薄时才真出手(见 neural/predict_filter.rs)。
+                let mut predict_filter = crate::engine::gear::neural::NeuralPredictFilter;
+                if predict_filter.applies_to_segment(
+                    context,
+                    &context.composition.segmentation.segments[i],
+                ) {
+                    menu.add_filter(context, &mut predict_filter);
+                }
             }
+            menu.mark_filters_ready();
             self.context.composition.segmentation.segments[i].menu = Some(menu);
         }
     }

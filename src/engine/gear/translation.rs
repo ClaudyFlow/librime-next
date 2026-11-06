@@ -130,6 +130,9 @@ pub struct ScriptWordsTranslation {
     /// `Projection`(规则链非 Clone),由翻译器在装配期对**去重后的 end**
     /// 各算一次(≤8 个),流内查表挂上。
     preedit_by_end: std::collections::HashMap<usize, String>,
+    /// 预计算好的音节顶点(`绝对 end → 绝对顶点`)。与 `preedit_by_end` 同一趟算出,
+    /// 供 `partial_commit` 的「前 N 个音节」定位切点。
+    spans_by_end: std::collections::HashMap<usize, Vec<usize>>,
     /// 个人 n-gram 上下文(青简回传进神经体系的一环):`(上上个, 上一个)`
     /// 词样记录。流内给系统词层候选加 bonus——个人历史影响 n-best 排序,
     /// 从而影响神经重排看到的候选批次。
@@ -140,7 +143,6 @@ impl ScriptWordsTranslation {
     /// `seg_start` 是段的**绝对**起点(候选跨度 = `seg_start + 桶键`);
     /// 收集器键是**段内相对**的 end(词图 0 基,见 `ScriptTranslator::query`)。
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         collector: crate::dict::dictionary::DictEntryCollector,
         seg_start: usize,
@@ -149,6 +151,7 @@ impl ScriptWordsTranslation {
         initial_quality: f64,
         convert: Option<Opencc>,
         preedit_by_end: std::collections::HashMap<usize, String>,
+        spans_by_end: std::collections::HashMap<usize, Vec<usize>>,
         ngram_context: Option<(Option<String>, Option<String>)>,
     ) -> Self {
         // collector 键 = 段内相对 end(字节);直接当码长用。降序排。
@@ -166,6 +169,7 @@ impl ScriptWordsTranslation {
             initial_quality,
             convert,
             preedit_by_end,
+            spans_by_end,
             ngram_context,
         }
     }
@@ -220,6 +224,10 @@ impl Translation for ScriptWordsTranslation {
             // preedit 表按**绝对 end**键(与翻译器侧 build_preedit 的坐标一致)。
             if let Some(preedit) = self.preedit_by_end.get(&(self.start + code_len)) {
                 c = c.with_preedit(preedit.clone());
+            }
+            // 音节顶点同样按绝对 end 查表(partial_commit 按需提交用)。
+            if let Some(spans) = self.spans_by_end.get(&(self.start + code_len)) {
+                c = c.with_spans(spans.clone());
             }
             if !entry.comment.is_empty() {
                 c = c.with_comment(entry.comment.clone());

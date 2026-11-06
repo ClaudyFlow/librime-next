@@ -10,7 +10,7 @@ use std::time::Instant;
 fn main() {
     let path = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "test-data/neural/sentence-model.safetensors".to_string());
+        .unwrap_or_else(|| "test-data/model/sentence-model.safetensors".to_string());
     let path = std::path::PathBuf::from(&path);
     if !path.is_file() {
         eprintln!(

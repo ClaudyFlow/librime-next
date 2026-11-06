@@ -285,6 +285,10 @@ impl EntryCollector {
             return;
         }
         let mut enable_comment = true;
+        // PR #1265（rime/librime，fxliang）：`collection` 只在**启用预设词库**时才有用
+        // ——`Finish()` 里它是「这个词已经在表里收集过、别再补录一次」的过滤器。
+        // 没开预设词库时它纯粹是上百万个词串的重复副本，构建期峰值内存的一大块。
+        let has_preset = self.data.borrow().preset_vocabulary.is_some();
         for line in rest.lines() {
             let line = line.trim_end_matches([' ', '\t', '\x0b', '\x0c', '\r']);
             self.data.borrow_mut().line_number += 1;
@@ -331,7 +335,9 @@ impl EntryCollector {
                     stem_str = value.clone();
                 }
             }
-            self.data.borrow_mut().collection.insert(word.clone());
+            if has_preset {
+                self.data.borrow_mut().collection.insert(word.clone());
+            }
             if !code_str.is_empty() {
                 self.data
                     .borrow_mut()
@@ -405,11 +411,18 @@ impl EntryCollector {
                 }
             }
         }
-        // 释放中间状态（C++ 的三个 swap(empty)）
+        // 释放中间状态。C++ 是 `decltype(collection)().swap(collection)` —— swap 一个空
+        // 临时对象，**容量一起还给系统**。Rust 的 `clear()` 只清元素、容量仍攥着，
+        // 对「几十万词的 HashSet/HashMap」等于没释放，所以这里必须 `mem::take` 换出旧容器
+        // 再让它 drop（PR #1265 想省的就是这块峰值）。
         let mut data = self.data.borrow_mut();
-        data.collection.clear();
-        data.words.clear();
-        data.total_weight.clear();
+        let _ = std::mem::take(&mut data.collection);
+        let _ = std::mem::take(&mut data.words);
+        let _ = std::mem::take(&mut data.total_weight);
+        // 预设词库（词 → 权重，几十万条）在补录完之后再没人查它。
+        // C++ `preset_vocabulary.reset()` 是 `of<PresetVocabulary>`（shared_ptr）的 reset，
+        // 即**释放对象**；`PresetVocabulary::Reset()`（回到文件开头）是另一件事，上面已经用过。
+        data.preset_vocabulary = None;
     }
 
     // ---------------------------------------------------------------- 产物出口
@@ -489,6 +502,80 @@ sort: original
         assert_eq!(strings::join(composed.raw_code.iter(), " "), "ni hao");
         assert_eq!(composed.weight, 0.0, "无权重列 → 0");
         std::fs::remove_file(&path).ok();
+    }
+
+    /// PR #1265（rime/librime，fxliang）：没启用预设词库时，`collection` 不该被填。
+    ///
+    /// 它就是「这个词收集过没有」的去重集合，只服务于 `Finish()` 里的预设词库补录；
+    /// 不开预设词库却把每个词都塞一遍，等于给几十万词串白留一份副本。
+    #[test]
+    fn collection_stays_empty_without_preset_vocabulary() {
+        let path = write_temp("no-preset", PINYIN_DICT);
+        let mut collector = EntryCollector::new();
+        let (settings, _) = DictSettings::load_dict_header(PINYIN_DICT).unwrap();
+        assert!(!settings.use_preset_vocabulary(), "样例词典没开预设词库");
+        collector.configure(&settings);
+        collector.collect_file(&path);
+
+        let data = collector.data.borrow();
+        assert_eq!(data.collection.len(), 0, "没开预设词库就不该复制词串");
+        // 第一遍只建了带 code 的两条；"你好" 还在 encode_queue 里等第二遍
+        assert_eq!(data.num_entries, 2, "词条本身照常收集");
+        drop(data);
+        collector.finish();
+        assert_eq!(collector.num_entries(), 3, "第二遍补出「你好」");
+        assert_eq!(
+            collector.data.borrow().collection.len(),
+            0,
+            "Finish 之后也不该留下词串副本"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 启用预设词库时仍要收集（补录要靠它去重），但 `Finish()` 之后必须释放：
+    /// 词→权重那张表几十万条，留着就是白占（PR #1265 的 `preset_vocabulary.reset()`）。
+    #[test]
+    fn preset_vocabulary_collects_then_releases() {
+        let dir = std::env::temp_dir().join("librime-entry-collector-preset");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("vocab.txt"), "你\t10\n好\t20\n你好\t30\n").unwrap();
+        const DICT: &str = "\
+---
+name: preset_dict
+version: \"1.0\"
+sort: original
+use_preset_vocabulary: true
+vocabulary: vocab.txt
+...
+你\tni
+好\thao
+你好\t
+";
+        let path = write_temp("preset", DICT);
+        let mut collector = EntryCollector::new();
+        collector.set_data_roots(vec![dir.clone()]);
+        let (settings, _) = DictSettings::load_dict_header(DICT).unwrap();
+        assert!(settings.use_preset_vocabulary());
+        collector.configure(&settings);
+        collector.collect_file(&path);
+
+        assert!(
+            collector.data.borrow().preset_vocabulary.is_some(),
+            "收集阶段要留着预设词库查权重"
+        );
+        assert_eq!(collector.data.borrow().collection.len(), 3);
+
+        collector.finish();
+        let data = collector.data.borrow();
+        assert!(
+            data.preset_vocabulary.is_none(),
+            "Finish 之后预设词库必须释放"
+        );
+        assert_eq!(data.collection.len(), 0, "Finish 之后去重集合必须清空");
+        assert_eq!(data.num_entries, 3, "词条数不受释放影响");
+        drop(data);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

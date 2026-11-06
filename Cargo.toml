@@ -200,7 +200,7 @@ rusty-leveldb = "4.0.2"
 # send = 让 `Lua`/`Function`/`Table` 满足 Send+Sync —— 组件要装进
 # `Box<dyn Filter + Send + Sync>`(引擎挂在 static 背后),没有它 lua 组件根本
 # 塞不进注册表。代价是 VM 内部加锁,单线程使用没有实际开销。
-mlua = { version = "0.10", features = ["luajit", "vendored", "send"] }
+mlua = { version = "0.10", features = ["lua54", "vendored", "send"] }
 # 真内存映射(2026-11-01):词典/模型大文件不再 fs::read 全量堆驻
 windows = { version = "0.62", features = [
     "Win32_Foundation",

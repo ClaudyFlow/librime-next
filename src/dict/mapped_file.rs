@@ -44,8 +44,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-// ── 真 mmap(2026-11-01):gram 模型 473MB 不再全量堆驻 ──────────────────
-// 旧注释说"这些文件最大 6MB"——gram 时代(单本 206MB)假设已破。
+// ── 真 mmap(2026-11-01):大词典不再全量堆驻 ────────────────────────────
+// 起因是当年单本 206MB 的 octagram 模型(已于 2026-11-03 移除);如今最大
+// 的消费者是 `build/**/*.bin` 词典,机制不变、照旧生效。
 // 只读模式用 CreateFileMappingW + MapViewOfFile:按需换页、进程内共享
 // 页缓存、繁体页在简体模式下永不触碰。
 
@@ -190,7 +191,7 @@ impl MappedFile {
     /// `MappedFile::OpenReadOnly()`（`mapped_file.cc:73`）。
     pub fn open_read_only(path: impl Into<PathBuf>) -> io::Result<Self> {
         let path = path.into();
-        // 真 mmap:gram 模型(单本 206MB)按需换页,不全量堆驻。
+        // 真 mmap:大词典按需换页,不全量堆驻。
         // 映射失败(跨盘/权限/文件系统)退回 fs::read,语义不变。
         if let Ok(mmap) = MmapView::open(&path) {
             let used = mmap.len;

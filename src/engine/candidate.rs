@@ -29,6 +29,15 @@ pub struct Candidate {
     /// 没有它就无法在提交时知道"用户选的到底是哪条词条"。
     /// 组句候选 / 标点候选这类没有词条的，保持 `None`。
     pub entry: Option<DictEntry>,
+    /// 音节边界顶点（C++ `Phrase::spans().vertices()`）。
+    ///
+    /// **绝对字节偏移**、升序、首元素 = `start`、末元素 = `end`。
+    /// `partial_commit` 用它把「前 N 个音节」翻译成输入串上的切点：
+    /// `Ctrl+3` 提交通道就靠 `spans[3]` 找到该从哪里断开剩余输入。
+    ///
+    /// 没有音节结构的候选（标点、单独字符兜底）留空 —— 空表示
+    /// 「不知道音节边界」，`partial_commit` 会因此放行给其它处理器。
+    pub spans: Vec<usize>,
 }
 
 impl Candidate {
@@ -43,6 +52,7 @@ impl Candidate {
             preedit: String::new(),
             components: Vec::new(),
             entry: None,
+            spans: Vec::new(),
         }
     }
 
@@ -66,6 +76,17 @@ impl Candidate {
     pub fn with_entry(mut self, entry: DictEntry) -> Self {
         self.entry = Some(entry);
         self
+    }
+
+    /// 挂音节边界顶点（绝对字节偏移，升序，首 = start、末 = end）。
+    pub fn with_spans(mut self, spans: Vec<usize>) -> Self {
+        self.spans = spans;
+        self
+    }
+
+    /// 候选覆盖的音节数（`spans.len() - 1`；无 spans 时为 0）。
+    pub fn syllable_count(&self) -> usize {
+        self.spans.len().saturating_sub(1)
     }
 }
 

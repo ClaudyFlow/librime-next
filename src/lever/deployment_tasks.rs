@@ -818,10 +818,7 @@ fn run_schema_update(deployer: &mut Deployer, source_path: &Path, verbose: bool)
     let has_dictionary = load_file(&staged)
         .ok()
         .and_then(|value| {
-            let main = value
-                .pointer("/translator/dict")
-                .and_then(|name| name.as_str())
-                .map(str::to_string)
+            let main = dict_name_in(value.pointer("/translator"))
                 .is_some_and(|name| !name.is_empty());
             // 变体节只认 `translator` 下的子项
             let variants = value
@@ -829,9 +826,7 @@ fn run_schema_update(deployer: &mut Deployer, source_path: &Path, verbose: bool)
                 .and_then(serde_json::Value::as_object)
                 .is_some_and(|tr| {
                     tr.iter().any(|(_, node)| {
-                        node.get("dict")
-                            .and_then(|v| v.as_str())
-                            .is_some_and(|name| !name.is_empty())
+                        dict_name_in(Some(node)).is_some_and(|name| !name.is_empty())
                     })
                 });
             Some(main || variants)
@@ -846,6 +841,18 @@ fn run_schema_update(deployer: &mut Deployer, source_path: &Path, verbose: bool)
         log_info(&format!("schema '{schema_id}': not requiring a dictionary"));
         true
     }
+}
+
+/// 从 `translator` 节点读词典名：正式键 `dict`，兼容上游标准键 `dictionary`。
+///
+/// 上游 librime 的方案（以及几乎所有第三方/老方案）一律写 `dictionary:`，
+/// `dict:` 是 Rime-Next 的简写。**两个都得认**——只认 `dict` 会让这些方案被判成
+/// 「不需要词典」，`.bin` 永远编不出来，表现为部署成功、候选全空（巧码 2026-11-03 实测）。
+fn dict_name_in(node: Option<&serde_json::Value>) -> Option<&str> {
+    let node = node?;
+    node.get("dict")
+        .or_else(|| node.get("dictionary"))
+        .and_then(|v| v.as_str())
 }
 
 /// `DictionaryComponent::Create` + `DictCompiler::Compile`
@@ -875,11 +882,7 @@ fn compile_dictionary(deployer: &mut Deployer, schema_id: &str, verbose: bool) -
 
     // 词典清单:主 `translator/dict` + 变体节(`simp:` / `trad:` …)
     let mut entries: Vec<(String, String, String, bool)> = Vec::new(); // (节名, dict, prism, 可跳过)
-    if let Some(dict_name) = config
-        .pointer("/translator/dict")
-        .and_then(|name| name.as_str())
-        .map(str::to_string)
-    {
+    if let Some(dict_name) = dict_name_in(config.pointer("/translator")).map(str::to_string) {
         if dict_name.is_empty() {
             // not requiring a dictionary（C++ Create 直接返回 nullptr 前的早退）
             return true;
@@ -895,11 +898,7 @@ fn compile_dictionary(deployer: &mut Deployer, schema_id: &str, verbose: bool) -
     // 旧式顶层 `simp:` / `trad:` 不再识别。
     if let Some(translator) = config.pointer("/translator").and_then(|t| t.as_object()) {
         for (key, node) in translator {
-            let Some(dict_name) = node
-                .get("dict")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-            else {
+            let Some(dict_name) = dict_name_in(Some(node)).map(str::to_string) else {
                 continue;
             };
             if dict_name.is_empty() {

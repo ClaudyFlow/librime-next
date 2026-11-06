@@ -48,12 +48,27 @@ use crate::algo::dynamics::formula_d;
 /// `UserDb::snapshot_extension()`：可读快照的后缀（`user_db.cc:58`）。
 pub const SNAPSHOT_EXTENSION: &str = ".userdb.txt";
 
-/// `struct UserDbValue`：一条用户词典记录的三个字段。
+/// `struct UserDbState`：一条用户词典记录（evo 起是**五个**字段）。
+///
+/// | 字段 | 含义 |
+/// |---|---|
+/// | `c` | 累计选词次数。**负数 = 已被用户删除**（`CreateDictEntry` 见到负值直接丢弃） |
+/// | `d` | 衰减后的词频权重（`algo::dynamics::formula_d` 迭代出来的），上限 10000 |
+/// | `t` | 最后一次改动的 tick（`UserDictionary::tick_` 的快照），用来算衰减量 |
+/// | `p` | **手排位置**（1 基，0 = 没手排过）。用户把候选拖到固定位置时写 |
+/// | `m` | **手排名次戳**（`manual_stamp`）。两处手排冲突时"新的覆盖旧的" |
+///
+/// 上游 librime 只有前三字段（`UserDbValue`）。evo 把 `p`/`m` **追加**在后面而不是
+/// 换格式：旧库照样能读（缺的字段按 0 处理），新库被旧版读也只是丢掉手排信息。
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct UserDbValue {
     pub commits: i32,
     pub dee: f64,
     pub tick: u64,
+    /// 手排位置（1 基）；0 = 自动排序。
+    pub position: i32,
+    /// 手排时间戳（用于合并时定胜负；0 = 没有手排过）。
+    pub manual_stamp: u64,
 }
 
 /// `d` 字段的上限（`user_db.cc:42` 的 `std::min(10000.0, ...)`）。
@@ -106,21 +121,78 @@ fn trim_fraction_zeros(text: &str) -> String {
 
 impl UserDbValue {
     pub fn new(commits: i32, dee: f64, tick: u64) -> Self {
-        Self { commits, dee, tick }
+        Self {
+            commits,
+            dee,
+            tick,
+            position: 0,
+            manual_stamp: 0,
+        }
+    }
+
+    /// 手排过（位置 > 0 且有时间戳）。
+    pub fn has_manual_position(&self) -> bool {
+        self.manual_stamp != 0 && self.position > 0
+    }
+
+    /// `SetManualVersion(position, version)`：写手排位置 + 戳。
+    pub fn set_manual_version(&mut self, position: i32, version: u64) {
+        self.position = position.max(0);
+        self.manual_stamp = version;
+    }
+
+    /// 清手排（位置归 0，但**保留戳**——清空本身也要参与合并的"新覆盖旧"判定）。
+    pub fn reset_manual_position(&mut self, version: u64) {
+        self.position = 0;
+        self.manual_stamp = version;
+    }
+
+    /// `ResetAutoLearning`：只抹掉自动学习（`c`/`d`），保留手排与 tick。
+    pub fn reset_auto_learning(&mut self) {
+        self.commits = -1;
+        self.dee = 0.0;
     }
 
     /// `UserDbValue::Pack()`。
+    ///
+    /// **格式（librime-evo）**：五个字段、**逗号**分隔、无键名：
+    ///
+    /// ```text
+    /// 之前（上游 librime）: c=21 d=3.50902 t=3402
+    /// 之后（五字段 CSV）  : 21,3.50902,3402,2,6fn3k
+    /// ```
+    ///
+    /// 末尾的 `m` 是 36 进制短码（[`crate::dict::manual_stamp`]）。
+    /// 手排字段没设也照样写出 `,0,0`：同步时要能表达"我把它清空了"，
+    /// 省掉字段只会被读成 0，读不出"是谁清的"。
     pub fn pack(&self) -> String {
-        format!("c={} d={} t={}", self.commits, format_g6(self.dee), self.tick)
+        format!(
+            "{},{},{},{},{}",
+            self.commits,
+            format_g6(self.dee),
+            self.tick,
+            self.position,
+            crate::dict::manual_stamp::format(self.manual_stamp)
+        )
     }
 
-    /// `UserDbValue::Unpack(value)`。
+    /// `UserDbValue::Unpack(value)`：两种格式都能读。
     ///
-    /// 与 C++ 的两处细节差异（都是"把异常变成返回值"）：
-    /// * `c` / `t` 解析失败 → `None`（C++ 抛异常被外层 catch 吞掉后返回 false）；
-    /// * `d` 解析失败 → `0.0`（C++ 只对 `out_of_range` 这么做，`invalid_argument`
-    ///   会走到外层。实际落盘数据里不会出现非数字，这里取更宽松的一支）。
+    /// * **旧格式**（上游三字段 `c=1 d=2 t=3`）→ 手排字段按 0；
+    /// * **新格式**（五字段 CSV）→ 严格校验，任何字段非法都返回 `None`
+    ///   （evo 的 `UserDbState::Unpack` 就是这么判的；宽松解析会让一条坏记录
+    ///   污染整个词的排序）。
+    ///
+    /// 与 C++ 的细节差异：`d` 解析失败取 `0.0`（C++ 只对 `out_of_range` 这么做）。
+    /// 实际落盘数据里不会出现非数字，这里取更宽松的一支。
     pub fn unpack(value: &str) -> Option<Self> {
+        if let Some(five) = Self::unpack_compact(value) {
+            return Some(five);
+        }
+        if Self::looks_compact(value) {
+            // 看起来是五字段格式但解析失败 —— 不能退回键值解析（那会读出全 0）
+            return None;
+        }
         let mut result = Self::default();
         for token in value.split(' ') {
             let Some((key, raw)) = token.split_once('=') else {
@@ -135,10 +207,57 @@ impl UserDbValue {
                         .unwrap_or(0.0);
                 }
                 "t" => result.tick = raw.parse::<u64>().ok()?,
+                // 兼容"半个升级"的库：键值形式带上了 p / m
+                "p" => result.position = raw.parse::<i32>().unwrap_or(0).max(0),
+                "m" => result.manual_stamp = crate::dict::manual_stamp::parse(raw).unwrap_or(0),
                 _ => {}
             }
         }
         Some(result)
+    }
+
+    /// 五字段 CSV 的解析（evo `UserDbState::Unpack`）。
+    fn unpack_compact(value: &str) -> Option<Self> {
+        // 长度上限照抄 C++（120），挡住整段乱码被逐字段解析
+        if value.is_empty() || value.len() > 120 || !value.contains(',') {
+            return None;
+        }
+        let fields: Vec<&str> = value.split(',').collect();
+        if fields.len() != 5 {
+            return None;
+        }
+        let commits = fields[0].parse::<i32>().ok()?;
+        let dee = fields[1].parse::<f64>().ok()?;
+        if !dee.is_finite() || dee < 0.0 || dee > K_MAX_DEE {
+            return None;
+        }
+        let tick = fields[2].parse::<u64>().ok()?;
+        let position = fields[3].parse::<i32>().ok()?;
+        if position < 0 {
+            return None;
+        }
+        let manual_stamp = crate::dict::manual_stamp::parse(fields[4])?;
+        // 有位置必须有版本（否则合并时无从比较）
+        if manual_stamp == 0 && position != 0 {
+            return None;
+        }
+        Some(Self {
+            commits,
+            dee,
+            tick,
+            position,
+            manual_stamp,
+        })
+    }
+
+    /// 是否"看起来是"五字段格式（用于区分"坏的五字段"和"三字段键值"）。
+    fn looks_compact(value: &str) -> bool {
+        value.contains(',') && !value.contains('=')
+    }
+
+    /// 是否为上游三字段格式（键值 `c= d= t=`，不含逗号）。
+    pub fn is_legacy_format(value: &str) -> bool {
+        !value.contains(',')
     }
 }
 
@@ -430,8 +549,49 @@ mod tests {
     #[test]
     fn pack_unpack_round_trip() {
         let value = UserDbValue::new(3, 12.5, 42);
-        assert_eq!(value.pack(), "c=3 d=12.5 t=42");
-        assert_eq!(UserDbValue::unpack("c=3 d=12.5 t=42"), Some(value));
+        // 五字段 CSV（librime-evo）：手排字段没设也照常写出 ",0,0"
+        assert_eq!(value.pack(), "3,12.5,42,0,0");
+        assert_eq!(UserDbValue::unpack("3,12.5,42,0,0"), Some(value));
+    }
+
+    /// 旧库（上游三字段）照样读得出来，手排字段按 0 处理。
+    #[test]
+    fn legacy_three_field_values_still_parse() {
+        let value = UserDbValue::unpack("c=21 d=3.50902 t=3402").unwrap();
+        assert_eq!(value.commits, 21);
+        assert!((value.dee - 3.50902).abs() < 1e-9);
+        assert_eq!(value.tick, 3402);
+        assert_eq!(value.position, 0, "三字段没有手排信息");
+        assert_eq!(value.manual_stamp, 0);
+        assert!(UserDbValue::is_legacy_format("c=21 d=3.50902 t=3402"));
+        assert!(!UserDbValue::is_legacy_format("21,3.50902,3402,2,6fn3k"));
+    }
+
+    /// 手排记录：位置与 36 进制短码都读得回来。
+    #[test]
+    fn manual_fields_round_trip() {
+        let raw = "5,2.5,900,2,6fn3k";
+        let value = UserDbValue::unpack(raw).unwrap();
+        assert_eq!(value.position, 2);
+        assert_eq!(
+            value.manual_stamp,
+            crate::dict::manual_stamp::parse("6fn3k").unwrap()
+        );
+        assert!(value.has_manual_position());
+        assert_eq!(value.pack(), raw);
+    }
+
+    /// 坏的新格式**不能**退化成键值解析（否则读出一堆 0 把词顶到后面）。
+    #[test]
+    fn broken_compact_format_is_rejected() {
+        // 有逗号没有等号 ⇒ 想写新格式但字段数不对
+        assert_eq!(UserDbValue::unpack("1,2,3"), None);
+        // 位置非零却没有版本戳
+        assert_eq!(UserDbValue::unpack("1,2,3,2,0"), None);
+        // 版本戳不是 36 进制短码
+        assert_eq!(UserDbValue::unpack("1,2,3,0,ZZZ"), None);
+        // 词频超上限
+        assert_eq!(UserDbValue::unpack("1,99999,3,0,0"), None);
     }
 
     /// `format_g6` 必须逐字节对齐 C++ `ostream <<`（`%g`，精度 6）。

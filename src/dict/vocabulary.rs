@@ -265,6 +265,14 @@ pub struct DictEntry {
     pub commit_count: i32,
     pub remaining_code_length: i32,
     pub matching_code_size: i32,
+    /// **手排位置**（librime-evo）：1 基，0 = 没手排过。
+    ///
+    /// 从 userdb 的 `p` 字段读出来挂在这里，一路带到翻译器排序里
+    /// （`UserDictionary::CreateDictEntry` 的 `manual_position`）。
+    /// 只影响排序，**不参与** weight 计算 —— 手排是"钉住位置"，不是"加权重"。
+    pub manual_position: i32,
+    /// 手排版本戳（合并时的胜负依据；排序不看它）。
+    pub manual_version: u64,
 }
 
 impl DictEntry {

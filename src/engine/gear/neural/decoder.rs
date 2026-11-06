@@ -127,6 +127,115 @@ pub fn rerank_order(
     order
 }
 
+/// 续写预测的选项。
+#[derive(Clone, Debug)]
+pub struct PredictOptions {
+    /// 最多续写几个字符。
+    pub max_new: usize,
+    /// 每步保留几条假设。
+    pub beam: usize,
+    /// 平均每字符对数概率的下限(低于它视为"模型也没把握")。
+    pub min_avg_score: f64,
+    /// 最多返回几条预测。
+    pub max_results: usize,
+    /// 送去打分的上下文长度。
+    pub context_chars: usize,
+}
+
+impl Default for PredictOptions {
+    fn default() -> Self {
+        Self {
+            // 只补 1~2 字:输入法的"预测"是补全,不是自由写作。
+            max_new: 2,
+            beam: 3,
+            // 实测（6 层键盘版，2026-11-03 探针）：像样的续写平均分落在
+            // -1.2 ~ -3.5；-5.0 之前基本还是人话，再往后就开始出"师主"这类
+            // 纯噪声。注意判据是**候选稀薄**（见 predict_filter），这一条只是
+            // 兜底的第二道闸。
+            min_avg_score: -5.0,
+            max_results: 3,
+            context_chars: 64,
+        }
+    }
+}
+
+/// 续写时不该出现的字符:空白、控制符、ASCII 标点。
+///
+/// 中文标点没被排掉 —— 模型偶尔会正确预言"的话"这类带虚词的续写,
+/// 逗号句号则几乎总是噪声,所以只滤 ASCII。
+fn predictable(character: char) -> bool {
+    !character.is_whitespace()
+        && !character.is_control()
+        && !(character.is_ascii_punctuation())
+}
+
+/// 从 `prefix` 往后做短续写,返回 `(续出来的文本, 平均每字符 log P)`。
+///
+/// 小束搜索:`max_new` 步、每步留 `beam` 条,按**平均**对数概率裁剪 ——
+/// 平均是为了让不同长度的假设可比。只用 `prefix` 当锚点,不负责从零造整句。
+pub fn predict_extensions(
+    model: &SentenceModel,
+    context: &str,
+    prefix: &str,
+    options: &PredictOptions,
+) -> Vec<(String, f64)> {
+    if options.max_new == 0 || options.beam == 0 || prefix.is_empty() {
+        return Vec::new();
+    }
+    let context = last_characters(context, options.context_chars);
+    let prefix_chars = prefix.chars().count();
+
+    // (续写中的完整文本, 累计 log P, 已续写的字符数)
+    let mut hypotheses: Vec<(String, f64, usize)> = vec![(prefix.to_string(), 0.0, 0)];
+
+    for _ in 0..options.max_new {
+        let mut next: Vec<(String, f64, usize)> = Vec::with_capacity(hypotheses.len() * options.beam);
+        for (text, sum, generated) in &hypotheses {
+            let probe = format!("{context}{text}");
+            for (character, log_prob) in model.top_next_chars(&probe, options.beam) {
+                if !predictable(character) {
+                    continue;
+                }
+                let mut extended = String::with_capacity(text.len() + 3);
+                extended.push_str(text);
+                extended.push(character);
+                next.push((extended, sum + log_prob as f64, generated + 1));
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        // 平均分排序:同一批假设长度相同,但裁剪标准要统一 —— 之后若
+        // 允许变长续写,这里不必再改。
+        next.sort_by(|a, b| {
+            (b.1 / b.2 as f64)
+                .partial_cmp(&(a.1 / a.2 as f64))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        next.truncate(options.beam);
+        hypotheses = next;
+    }
+
+    let mut out: Vec<(String, f64)> = Vec::new();
+    for (text, sum, generated) in hypotheses {
+        if generated == 0 {
+            continue;
+        }
+        let avg = sum / generated as f64;
+        if avg < options.min_avg_score {
+            continue;
+        }
+        let extension: String = text.chars().skip(prefix_chars).collect();
+        if extension.is_empty() || out.iter().any(|(existing, _)| *existing == extension) {
+            continue;
+        }
+        out.push((extension, avg));
+    }
+    out.sort_by(|a, b| b.1.total_cmp(&a.1));
+    out.truncate(options.max_results);
+    out
+}
+
 /// [`SentenceModel`] 打分器的惰性句柄——第一次被问才解析模型文件。
 /// 两个模型加起来 ~28MB 堆内存;关着神经重排的用户不该白付这笔钱。
 pub struct LazySentenceModel {

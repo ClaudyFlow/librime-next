@@ -22,9 +22,14 @@
 pub mod decoder;
 pub mod matrix;
 pub mod model;
+pub mod predict_filter;
 pub mod rescore_filter;
 pub mod safetensors;
 
-pub use decoder::{rerank_order, shared_sentence_model, LazySentenceModel, RerankOptions};
+pub use decoder::{
+    predict_extensions, rerank_order, shared_sentence_model, LazySentenceModel, PredictOptions,
+    RerankOptions,
+};
 pub use model::SentenceModel;
+pub use predict_filter::NeuralPredictFilter;
 pub use rescore_filter::NeuralRescoreFilter;

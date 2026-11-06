@@ -38,10 +38,17 @@ pub struct DictEntry {
 }
 
 /// 词典（对照 C++ `Dictionary`）：持有 Prism（拼写→音节）+ Table（音节码→词条）。
+///
+/// `packs` 对应 C++ 的 `tables_[1..]`（`dictionary.cc:395-399` `loaded pack:`）：
+/// `translator/packs` 列的附加表，**与主表同码不同权**。查询必须遍历所有表
+/// （`dictionary.cc:279` / `:332` 的两处 `for (const auto& table : tables_)`）。
 pub struct Dictionary {
     pub name: String,
     pub prism: Prism,
     pub table: Table,
+    /// 附加表。典型用法是「主表给码、分包给权」：巧码的 `qiaoma.dict.yaml`
+    /// 只有 `columns: [text, code]`，权重全在 `qiaoma.base` / `.ext` / `.user` 里。
+    pub packs: Vec<Table>,
     pub reverse: Option<ReverseDb>,
 }
 
@@ -100,15 +107,45 @@ impl Dictionary {
     /// `<dict_name>.table.bin` / `<dict_name>.reverse.bin` + `<prism_name>.prism.bin`
     /// （拼音方案的 table 与 prism 往往不同名，如 `luna_pinyin` vs `luna_pinyin_simp`）。
     pub fn open(build_dir: &Path, dict_name: &str, prism_name: &str) -> Option<Dictionary> {
+        Self::open_with_packs(build_dir, dict_name, prism_name, &[])
+    }
+
+    /// 带 `translator/packs` 的打开方式（C++ `Dictionary::Load` 的 `tables_[1..]`）。
+    ///
+    /// 分包**缺了不算失败**：C++ 只是 `table->Exists() && table->Load()` 才记一条
+    /// `loaded pack:`，缺了静默跳过。这里同样只跳过，不影响主表可用。
+    pub fn open_with_packs(
+        build_dir: &Path,
+        dict_name: &str,
+        prism_name: &str,
+        packs: &[String],
+    ) -> Option<Dictionary> {
         let table = Table::open(bin_resource_path(build_dir, dict_name, ".table")).ok()?;
         let prism = Prism::open(bin_resource_path(build_dir, prism_name, ".prism")).ok()?;
         let reverse = ReverseDb::open(bin_resource_path(build_dir, dict_name, ".reverse")).ok();
+        let mut pack_tables = Vec::with_capacity(packs.len());
+        for name in packs {
+            let path = bin_resource_path(build_dir, name, ".table");
+            if !path.is_file() {
+                continue;
+            }
+            match Table::open(&path) {
+                Ok(pack) => pack_tables.push(pack),
+                Err(e) => eprintln!("[dictionary] failed to load pack '{name}': {e}"),
+            }
+        }
         Some(Dictionary {
             name: dict_name.to_string(),
             prism,
             table,
+            packs: pack_tables,
             reverse,
         })
+    }
+
+    /// 主表 + 全部分包，查询要遍历它们（C++ `for (const auto& table : tables_)`）。
+    pub fn tables(&self) -> impl Iterator<Item = &Table> {
+        std::iter::once(&self.table).chain(self.packs.iter())
     }
 
     /// 翻译整段输入，返回所有候选词条（含各自覆盖的 `end`）。
@@ -137,7 +174,7 @@ impl Dictionary {
             n: usize,
             acc: &mut Vec<SyllableId>,
             match_at: &[Vec<(SyllableId, usize)>],
-            table: &Table,
+            tables: &[&Table],
             out: &mut Vec<DictEntry>,
         ) {
             if acc.len() > 12 {
@@ -145,28 +182,31 @@ impl Dictionary {
             }
             if start > 0 && !acc.is_empty() {
                 let code = Code::from_slice(&acc[..]);
-                let mut accessor = table.query_phrases(&code);
                 let syllables = acc.len() as f64;
-                while !accessor.exhausted() {
-                    if let Some(entry) = accessor.entry() {
-                        let text = table.entry_text(&entry);
-                        if !text.is_empty() {
-                            let weight = entry.weight as f64;
-                            // 质量尺度:码长(音节数)是主台阶——C++ 的
-                            // DictEntryCollector 按 code_length 分桶、rbegin()
-                            // 最长码先消费(`script_translator.cc:479`);同码长内
-                            // 才比 weight(对数尺度)。1e12 台阶远超任何 weight 摆动。
-                            out.push(DictEntry {
-                                text,
-                                weight,
-                                quality: syllables * 1.0e12 + weight,
-                                end: start,
-                                comment: String::new(),
-                                code: code.clone(),
-                            });
+                // 主表 + 分包：同码不同权，都要查（C++ `tables_` 全遍历）
+                for table in tables {
+                    let mut accessor = table.query_phrases(&code);
+                    while !accessor.exhausted() {
+                        if let Some(entry) = accessor.entry() {
+                            let text = table.entry_text(&entry);
+                            if !text.is_empty() {
+                                let weight = entry.weight as f64;
+                                // 质量尺度:码长(音节数)是主台阶——C++ 的
+                                // DictEntryCollector 按 code_length 分桶、rbegin()
+                                // 最长码先消费(`script_translator.cc:479`);同码长内
+                                // 才比 weight(对数尺度)。1e12 台阶远超任何 weight 摆动。
+                                out.push(DictEntry {
+                                    text,
+                                    weight,
+                                    quality: syllables * 1.0e12 + weight,
+                                    end: start,
+                                    comment: String::new(),
+                                    code: code.clone(),
+                                });
+                            }
                         }
+                        accessor.next();
                     }
-                    accessor.next();
                 }
             }
             if start >= n {
@@ -174,11 +214,12 @@ impl Dictionary {
             }
             for &(id, end) in &match_at[start] {
                 acc.push(id);
-                dfs(end, n, acc, match_at, table, out);
+                dfs(end, n, acc, match_at, tables, out);
                 acc.pop();
             }
         }
-        dfs(0, n, &mut acc, &match_at, &self.table, &mut entries);
+        let tables: Vec<&Table> = self.tables().collect();
+        dfs(0, n, &mut acc, &match_at, &tables, &mut entries);
         entries
     }
 
@@ -218,64 +259,67 @@ impl Dictionary {
 
         let cap_opt = bucket_cap();
         let mut collector = DictEntryCollector::new();
-        for (end_pos, pages) in self.table.query(graph, start_pos) {
-            for page in pages {
-                let mut accessor = page;
-                let index_code = accessor.index_code().clone();
-                let credibility = accessor.credibility();
-                let quality_len = accessor.quality_len();
-                while !accessor.exhausted() {
-                    let Some(entry) = accessor.entry() else {
-                        break;
-                    };
-                    // 桶已满且这条进不了前 N：直接跳过，**别去取文本** ——
-                    // `entry_text` 要解字符串再分配一份 String，是采集阶段的大头。
-                    // 权重是取文本前就能拿到的，所以这个判断是安全的。
-                    if let Some(cap) = cap_opt {
-                        if collector.get(&end_pos).is_some_and(|b| b.len() >= cap) {
-                            let w = entry.weight as f64 - K_WEIGHT_OFFSET + credibility;
-                            let worst = collector[&end_pos]
-                                .iter()
-                                .map(|e| e.weight)
-                                .fold(f64::INFINITY, f64::min);
-                            if w <= worst {
-                                accessor.next();
-                                continue;
-                            }
-                        }
-                    }
-                    let text = self.table.entry_text(&entry);
-                    let excluded = blacklist.is_some_and(|b| b.contains(&text));
-                    if text.is_empty() || excluded {
-                        accessor.next();
-                        continue;
-                    }
-                    // `dictionary.cc:255-262`：长词（tail 层）带着 `extra_code`，
-                    // 要在图上再走一遍才能知道它真正覆盖到哪里。
-                    let target_end = match accessor.extra_code() {
-                        None => Some(end_pos),
-                        Some(extra) => {
-                            let m = match_extra_code(&extra, 0, graph, end_pos, predict_word);
-                            m.success.then_some(m.end_pos)
-                        }
-                    };
-                    if let Some(target_end) = target_end {
-                        let bucket = collector.entry(target_end).or_default();
-                        bucket.push(VocabularyEntry {
-                            text,
-                            weight: entry.weight as f64 - K_WEIGHT_OFFSET + credibility,
-                            code: index_code.clone(),
-                            quality_len,
-                            ..Default::default()
-                        });
+        // 主表 + 分包都要走（C++ `for (const auto& table : tables_)`）
+        for table in self.tables() {
+            for (end_pos, pages) in table.query(graph, start_pos) {
+                for page in pages {
+                    let mut accessor = page;
+                    let index_code = accessor.index_code().clone();
+                    let credibility = accessor.credibility();
+                    let quality_len = accessor.quality_len();
+                    while !accessor.exhausted() {
+                        let Some(entry) = accessor.entry() else {
+                            break;
+                        };
+                        // 桶已满且这条进不了前 N：直接跳过，**别去取文本** ——
+                        // `entry_text` 要解字符串再分配一份 String，是采集阶段的大头。
+                        // 权重是取文本前就能拿到的，所以这个判断是安全的。
                         if let Some(cap) = cap_opt {
-                            if bucket.len() > cap {
-                                bucket.sort_by(|a, b| a.cmp_weight_desc(b));
-                                bucket.truncate(cap);
+                            if collector.get(&end_pos).is_some_and(|b| b.len() >= cap) {
+                                let w = entry.weight as f64 - K_WEIGHT_OFFSET + credibility;
+                                let worst = collector[&end_pos]
+                                    .iter()
+                                    .map(|e| e.weight)
+                                    .fold(f64::INFINITY, f64::min);
+                                if w <= worst {
+                                    accessor.next();
+                                    continue;
+                                }
                             }
                         }
+                        let text = table.entry_text(&entry);
+                        let excluded = blacklist.is_some_and(|b| b.contains(&text));
+                        if text.is_empty() || excluded {
+                            accessor.next();
+                            continue;
+                        }
+                        // `dictionary.cc:255-262`：长词（tail 层）带着 `extra_code`，
+                        // 要在图上再走一遍才能知道它真正覆盖到哪里。
+                        let target_end = match accessor.extra_code() {
+                            None => Some(end_pos),
+                            Some(extra) => {
+                                let m = match_extra_code(&extra, 0, graph, end_pos, predict_word);
+                                m.success.then_some(m.end_pos)
+                            }
+                        };
+                        if let Some(target_end) = target_end {
+                            let bucket = collector.entry(target_end).or_default();
+                            bucket.push(VocabularyEntry {
+                                text,
+                                weight: entry.weight as f64 - K_WEIGHT_OFFSET + credibility,
+                                code: index_code.clone(),
+                                quality_len,
+                                ..Default::default()
+                            });
+                            if let Some(cap) = cap_opt {
+                                if bucket.len() > cap {
+                                    bucket.sort_by(|a, b| a.cmp_weight_desc(b));
+                                    bucket.truncate(cap);
+                                }
+                            }
+                        }
+                        accessor.next();
                     }
-                    accessor.next();
                 }
             }
         }
@@ -332,7 +376,8 @@ impl Dictionary {
                 None => Vec::new(),
             }
         };
-        add_chunks_for_keys(result, &self.table, &self.prism, &keys, str_code.len());
+        let tables: Vec<&Table> = self.tables().collect();
+        add_chunks_for_keys(result, &tables, &self.prism, &keys, str_code.len());
         if let Some(blacklist) = blacklist.filter(|blacklist| !blacklist.is_empty()) {
             // C++ 的 filter 闭包捕的是 `const hash_set*`（指针活到迭代器析构）；
             // Rust 侧 Box<dyn Fn> 要求 'static，只能把集合搬进去。黑名单通常只有几条，
@@ -423,4 +468,128 @@ impl CodeMatch {
         depth: 0,
         end_pos: 0,
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dict::dict_compiler::DictCompiler;
+
+    /// 造一个「主表给码、分包给词」的两级目录，编译出主表 + 一张分包。
+    ///
+    /// 布局按系列恒等式：`schema/demo/demo.dict.yaml`、`schema/demo/pack/demo.pack.dict.yaml`，
+    /// 产物落在 `staging/demo/demo.table.bin` 与 `staging/demo/pack/demo.pack.table.bin`。
+    fn build_two_level(root: &Path) -> PathBuf {
+        let user = root.join("user");
+        let shared = root.join("shared");
+        let staging = user.join("build");
+        for dir in [&user, &shared, &staging] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        // 词库源在 `dict/<id 分段…>/`（`classified_dict_source`），
+        // 方案源在 `schema/<id 分段…>/` —— 两者根目录不同，别搞混。
+        let dict_dir = shared.join("dict/demo");
+        std::fs::create_dir_all(dict_dir.join("pack")).unwrap();
+        let schema = shared.join("schema/demo");
+        std::fs::create_dir_all(&schema).unwrap();
+
+        // 主表：只有码，没有权（巧码就是这样）
+        std::fs::write(
+            dict_dir.join("demo.dict.yaml"),
+            "\
+---
+name: demo
+version: \"1.0\"
+sort: by_weight
+columns:
+  - text
+  - code
+...
+甲\tab
+乙\tcd
+",
+        )
+        .unwrap();
+        // 分包：同码表的另一批词，带权重
+        std::fs::write(
+            dict_dir.join("pack/demo.pack.dict.yaml"),
+            "\
+---
+name: demo.pack
+version: \"1.0\"
+sort: by_weight
+columns:
+  - text
+  - code
+  - weight
+...
+丙\tab\t1000
+",
+        )
+        .unwrap();
+        let schema_src = schema.join("demo.schema.yaml");
+        std::fs::write(
+            &schema_src,
+            "\
+schema:
+  schema_id: demo
+translator:
+  dictionary: demo
+",
+        )
+        .unwrap();
+
+        for (name, packs) in [("demo", Vec::new()), ("demo.pack", Vec::new())] {
+            let mut compiler = DictCompiler::new(
+                name,
+                "",
+                packs,
+                &user,
+                &shared,
+                &staging,
+                shared.join("prebuilt"),
+            );
+            compiler
+                .compile(Some(&schema_src))
+                .unwrap_or_else(|e| panic!("compile {name}: {e}"));
+        }
+        staging
+    }
+
+    fn texts(dict: &Dictionary, code: &str) -> Vec<String> {
+        let mut iter = DictEntryIterator::new();
+        dict.lookup_words(&mut iter, code, false, 0, None);
+        iter.collect_entries().into_iter().map(|e| e.text).collect()
+    }
+
+    /// `translator/packs` 必须真的参与查询：主表只给出「甲」，分包补出「丙」。
+    /// 以前 `Dictionary` 只开主表，分包编出来了却从不读 —— 巧码这类
+    /// 「主表给码、分包给权」的方案会整份权重丢失（2026-11-03 实测）。
+    #[test]
+    fn packs_are_queried_alongside_primary_table() {
+        let root = std::env::temp_dir().join("librime-dictionary-packs");
+        let _ = std::fs::remove_dir_all(&root);
+        let staging = build_two_level(&root);
+
+        let without = Dictionary::open(&staging, "demo", "demo").expect("open 主表");
+        assert_eq!(texts(&without, "ab"), vec!["甲".to_string()], "没分包时只有主表词条");
+
+        let packs = vec!["demo.pack".to_string()];
+        let with = Dictionary::open_with_packs(&staging, "demo", "demo", &packs).expect("open");
+        assert_eq!(with.packs.len(), 1, "分包应当被打开");
+        let mut got = texts(&with, "ab");
+        got.sort();
+        assert_eq!(got, vec!["丙".to_string(), "甲".to_string()], "主表 + 分包都要出词");
+
+        // 分包缺失只跳过，不影响主表可用（C++ `table->Exists()` 同语义）
+        let missing = Dictionary::open_with_packs(
+            &staging,
+            "demo",
+            "demo",
+            &["demo.nothere".to_string()],
+        )
+        .expect("缺分包不该让字典打不开");
+        assert!(missing.packs.is_empty());
+        assert_eq!(texts(&missing, "ab"), vec!["甲".to_string()]);
+    }
 }
