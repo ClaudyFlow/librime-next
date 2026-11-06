@@ -78,6 +78,10 @@ name = "rime_next_dialect"
 path = "test/rime_next_dialect.rs"
 
 [[example]]
+name = "eassy_match_bench"
+path = "example/eassy_match_bench.rs"
+
+[[example]]
 name = "algo_real"
 path = "example/algo_real.rs"
 
@@ -110,6 +114,10 @@ name = "probe_trace"
 path = "example/probe_trace.rs"
 
 [[example]]
+name = "probe_recompose"
+path = "example/probe_recompose.rs"
+
+[[example]]
 name = "probe_weight"
 path = "example/probe_weight.rs"
 
@@ -120,6 +128,10 @@ path = "example/probe_yuling2.rs"
 [[example]]
 name = "probe_userdb"
 path = "example/probe_userdb.rs"
+
+[[example]]
+name = "export_user_words"
+path = "example/export_user_words.rs"
 
 [[example]]
 name = "seed_phrase"
@@ -185,20 +197,20 @@ rsmarisa = "0.4"
 rusty-leveldb = "4.0.2"
 # Lua 兼容层(2026-11-01):巧码等社区方案的 lua_processor/translator/filter。
 # vendored = 自带 Lua 5.4 源码编译,不依赖系统 lua。
-mlua = { version = "0.10", features = ["lua54", "vendored"] }
-# 真内存映射(2026-11-01):gram 模型 473MB 不再 fs::read 全量堆驻
+# send = 让 `Lua`/`Function`/`Table` 满足 Send+Sync —— 组件要装进
+# `Box<dyn Filter + Send + Sync>`(引擎挂在 static 背后),没有它 lua 组件根本
+# 塞不进注册表。代价是 VM 内部加锁,单线程使用没有实际开销。
+mlua = { version = "0.10", features = ["luajit", "vendored", "send"] }
+# 真内存映射(2026-11-01):词典/模型大文件不再 fs::read 全量堆驻
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Memory",
     "Win32_System_Threading",
     "Win32_Security",
     "Win32_Storage_FileSystem",
+    "Win32_System_LibraryLoader",
 ] }
 fancy-regex = "0.20.0"
-
-[[example]]
-name = "gram_ab_test"
-path = "example/gram_ab_test.rs"
 
 [[example]]
 name = "lua_host_test"
@@ -222,6 +234,10 @@ path = "example/probe_fanjian.rs"
 
 # 候选/切分探针（2026-10-31）：同一组输入打印「切分 + 每段候选 + 空格提交」，
 # 用于「原版 librime vs 自研」与「改前 vs 改后」的对照。
+[[example]]
+name = "probe_rescore_ab"
+path = "example/probe_rescore_ab.rs"
+
 [[example]]
 name = "probe_candidates"
 path = "example/probe_candidates.rs"
@@ -248,3 +264,25 @@ path = "example/e2e_learn.rs"
 name = "e2e_multi_session"
 path = "example/e2e_multi_session.rs"
 
+# 预测探针(2026-11-03):用真模型看 top-k 下一字符与续写结果,
+# 给 `PredictOptions::min_avg_score` 定标。模型的阈值不能拍脑袋。
+[[example]]
+name = "neural_predict_probe"
+path = "example/neural_predict_probe.rs"
+
+# 两组对照(2026-11-03):只有 transformer / 全无 —— 准确率与按键耗时。
+# gram 组已随 octagram 移除而取消。每组独立进程(开关是进程级 static),见文件头注释。
+[[example]]
+name = "bench_three_ways"
+path = "example/bench_three_ways.rs"
+
+[[example]]
+name = "bench_two_engines"
+path = "example/bench_two_engines.rs"
+
+
+# 社区方案 lua 组件探针(2026-11-03):看 lua_processor/translator/filter
+# 到底挂上几个、脚本有没有真的产候选。
+[[example]]
+name = "probe_lua_schema"
+path = "example/probe_lua_schema.rs"
