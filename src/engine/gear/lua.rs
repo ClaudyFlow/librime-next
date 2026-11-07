@@ -471,22 +471,38 @@ impl LuaHost {
 
         // rime_api：引导脚本靠它拿目录（旧 rime.lua 里写死了这两个函数名）
         let api = lua.create_table()?;
-        for (index, name) in ["get_user_data_dir", "get_shared_data_dir", "get_config_dir"]
-            .iter()
-            .enumerate()
-        {
-            let Some(dir) = data_roots.get(index).or_else(|| data_roots.first()) else {
-                continue;
-            };
-            let dir = to_lua_path(dir);
+        let mut names: Vec<(&str, Option<String>)> = vec![
+            ("get_user_data_dir", data_roots.first().map(|p| to_lua_path(p))),
+            ("get_shared_data_dir", data_roots.get(1).map(|p| to_lua_path(p))),
+            ("get_config_dir", data_roots.first().map(|p| to_lua_path(p))),
+        ];
+        for (name, dir) in names.drain(..) {
+            let Some(dir) = dir else { continue };
             api.set(
-                (*name).to_string(),
+                name.to_string(),
                 lua.create_function(move |_, ()| Ok(dir.clone()))?,
             )?;
         }
+        // 上游 types.cc 的 rime_api 全家桶：社区脚本（input_statistics）真会调
+        api.set(
+            "get_distribution_code_name",
+            lua.create_function(|_, ()| Ok("Weasel-Next".to_string()))?,
+        )?;
+        api.set(
+            "get_distribution_name",
+            lua.create_function(|_, ()| Ok("Weasel-Next".to_string()))?,
+        )?;
+        api.set(
+            "get_distribution_version",
+            lua.create_function(|_, ()| Ok("0.0.0".to_string()))?,
+        )?;
         api.set(
             "get_version",
             lua.create_function(|_, ()| Ok("librime-next".to_string()))?,
+        )?;
+        api.set(
+            "get_rime_version",
+            lua.create_function(|_, ()| Ok("1.0.0-next".to_string()))?,
         )?;
         globals.set("rime_api", api)?;
 
