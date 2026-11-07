@@ -1,20 +1,21 @@
 //! rime-lua 兼容层：脚本发现 → 引导 → 组件解析 → 三类组件（processor /
 //! translator / filter）真正挂进引擎。
 //!
-//! # 目录与脚本发现
-//!
-//! 同时接受三种布局（社区方案各用各的，缺一种就有方案"插件凭空消失"）：
+//! # 目录与脚本发现（2026-11-07 拍板：恒等式，无扁平）
 //!
 //! ```text
-//! <root>/lua/<脚本>.lua              平铺脚本（巧码、大多数 rime-lua 方案）
-//! <root>/lua/<插件>/rime.lua         套文件夹（用户 2026-11-01 的硬规矩）
-//! <root>/plugin/<插件>/<脚本>.lua    本仓的插件布局（宇浩 / tiger / input_statistics）
-//! <root>/plugin/rime.lua             引导脚本（单文件，不是文件夹）
+//! <root>/plugin/rime.lua             引导脚本（plugin 根下唯一允许的单文件）
+//! <root>/plugin/a/b/c/a.b.c.lua      模块恒等式：id 按 '.' 分段，每段一级目录，
+//!                                     文件名 = 完整 id
 //! ```
 //!
-//! 全部加进 `package.path`，所以脚本里的 `require("utf8")`、`require("tiger_sentence")`
-//! 都能解析；引导脚本（`rime.lua`）按「共享目录先、用户目录后」执行，用户那份
-//! 可以覆盖官方注册。
+//! `lua/` 目录与一切扁平形态（`plugin/x.lua`、`plugin/x/init.lua`、
+//! `plugin/<插件>/<其它>.lua`）**不再解析**。实现：自装 searcher **替换**
+//! `package.searchers[2]`（package.path 搜寻器）—— 引导脚本往 package.path
+//! 里写的扁平模式也找不到，布局规则在引擎层强制，不靠自觉。
+//! 用户目录在前（可覆盖），共享目录在后。
+//! 引导脚本（`rime.lua`）按「共享目录先、用户目录后」执行，用户那份可以
+//! 覆盖官方注册。
 //!
 //! # 组件解析（`lua_translator@…` 的 `@` 后面那截）
 //!
@@ -50,76 +51,6 @@ use crate::engine::runtime::Engine;
 use crate::engine::segmentation::Segment;
 
 // ---------------------------------------------------------------- 插件发现
-
-/// 一个已发现的 lua 插件目录。
-#[derive(Debug, Clone)]
-pub struct LuaPlugin {
-    /// 插件名 = 文件夹名。
-    pub name: String,
-    /// 插件文件夹绝对路径。
-    pub folder: PathBuf,
-    /// 主脚本（`rime.lua`）是否存在。
-    pub has_entry: bool,
-    /// 文件夹里的全部 `.lua` 脚本名（诊断用）。
-    pub scripts: Vec<String>,
-}
-
-/// 发现 `<root>/lua/<插件>/` 与 `<root>/plugin/<插件>/` 两种套文件夹布局。
-///
-/// 平铺脚本（`<root>/lua/x.lua`）不算"插件"（它没有文件夹），但会在
-/// [`LuaHost::boot`] 里进 `package.path`，照样能 `require`。
-pub fn discover_plugins(data_roots: &[PathBuf]) -> Vec<LuaPlugin> {
-    let mut out: Vec<LuaPlugin> = Vec::new();
-    for root in data_roots {
-        for base in ["lua", "plugin"] {
-            let dir = root.join(base);
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let folder = entry.path();
-                if !folder.is_dir() {
-                    continue;
-                }
-                let name = folder
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                if name.is_empty() {
-                    continue;
-                }
-                let mut scripts = Vec::new();
-                let mut has_entry = false;
-                if let Ok(files) = std::fs::read_dir(&folder) {
-                    for file in files.flatten() {
-                        let path = file.path();
-                        if path.extension().and_then(|e| e.to_str()) == Some("lua") {
-                            let file_name = path
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                            if file_name == "rime.lua" {
-                                has_entry = true;
-                            }
-                            scripts.push(file_name);
-                        }
-                    }
-                }
-                scripts.sort();
-                if !out.iter().any(|p| p.name == name) {
-                    out.push(LuaPlugin {
-                        name,
-                        folder,
-                        has_entry,
-                        scripts,
-                    });
-                }
-            }
-        }
-    }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
-}
 
 /// 从方案 engine 段收集 lua 组件需求：`(组件类型, 组件名)`。
 ///
@@ -482,29 +413,47 @@ end
 "#;
 
 impl LuaHost {
-    /// 启动 VM：设搜索路径、注册 `rime_api`、执行引导脚本。
+    /// 启动 VM：装恒等式 searcher、注册 `rime_api`、执行引导脚本。
     pub fn boot(data_roots: &[PathBuf]) -> mlua::Result<Self> {
         let lua = Lua::new();
-        let plugins = discover_plugins(data_roots);
-        // package.path：用户目录在前（可覆盖），共享目录在后
-        let mut paths: Vec<String> = Vec::new();
-        for root in data_roots {
-            let root_str = to_lua_path(root);
-            for rel in ["lua", "plugin"] {
-                paths.push(format!("{root_str}/{rel}/?.lua"));
-                paths.push(format!("{root_str}/{rel}/?/init.lua"));
-                paths.push(format!("{root_str}/{rel}/?/?.lua"));
-            }
-        }
-        for plugin in &plugins {
-            let folder = to_lua_path(&plugin.folder);
-            paths.push(format!("{folder}/?.lua"));
-            paths.push(format!("{folder}/?/init.lua"));
-        }
         let globals = lua.globals();
         let package: Table = globals.get("package")?;
-        let existing: String = package.get("path")?;
-        package.set("path", format!("{};{}", paths.join(";"), existing))?;
+
+        // 模块恒等式 searcher（2026-11-07）：`require("a.b.c")` →
+        // `<root>/plugin/a/b/c/a.b.c.lua`。替换 `package.searchers[2]`
+        // （package.path 搜寻器）⇒ 扁平 / `lua/` 布局在引擎层无法解析，
+        // 引导脚本往 package.path 里加什么模式都无效。
+        let roots = data_roots.to_vec();
+        let searcher = lua.create_function(move |lua, module: String| {
+            let segments = module.replace('.', "/");
+            for root in &roots {
+                let path = root
+                    .join("plugin")
+                    .join(&segments)
+                    .join(format!("{module}.lua"));
+                if path.is_file() {
+                    let mut source = std::fs::read_to_string(&path)
+                        .map_err(|error| mlua::Error::runtime(error.to_string()))?;
+                    // `loadfile` 会跳过 UTF-8 BOM，`load(字符串)` 不会 ——
+                    // 社区脚本（super_calculator）里真有带 BOM 的，这里对齐。
+                    if source.starts_with('\u{feff}') {
+                        source.remove(0);
+                    }
+                    let chunk = lua
+                        .load(source)
+                        .set_name(format!("@{}", path.display()))
+                        .into_function()?;
+                    return Ok((
+                        Value::Function(chunk),
+                        Value::String(lua.create_string(path.display().to_string())?),
+                    ));
+                }
+            }
+            let msg = format!("\n\tno file plugin/{segments}/{module}.lua（恒等式布局）");
+            Ok((Value::Nil, Value::String(lua.create_string(msg)?)))
+        })?;
+        let searchers: Table = package.get("searchers")?;
+        searchers.set(2, searcher)?;
 
         lua.load(LUA_PRELUDE).set_name("@prelude").exec()?;
 
@@ -552,14 +501,13 @@ impl LuaHost {
     }
 
     /// 执行引导脚本：共享目录先、用户目录后（后者覆盖前者）。
+    /// 只认 `<root>/plugin/rime.lua`（2026-11-07：plugin 根下唯一的单文件）。
     fn run_bootstrap(&mut self) {
         let mut scripts: Vec<PathBuf> = Vec::new();
         for root in self.roots.iter().rev() {
-            for rel in ["plugin/rime.lua", "lua/rime.lua", "rime.lua"] {
-                let path = root.join(rel);
-                if path.is_file() {
-                    scripts.push(path);
-                }
+            let path = root.join("plugin").join("rime.lua");
+            if path.is_file() {
+                scripts.push(path);
             }
         }
         for path in scripts {
@@ -1668,28 +1616,57 @@ mod tests {
     fn temp_root(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("lrn_lua_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("lua")).unwrap();
+        std::fs::create_dir_all(dir.join("plugin")).unwrap();
         dir
     }
 
+    /// 恒等式 searcher：无点 id → plugin/x/x.lua；点分 id → plugin/a/b/a.b.lua；
+    /// 扁平 / `lua/` 布局不再解析。
     #[test]
-    fn discovers_folder_plugins_and_ignores_loose_files() {
-        let dir = temp_root("discover");
-        let plugins = dir.join("lua");
-        std::fs::create_dir_all(plugins.join("qiaoma")).unwrap();
-        std::fs::write(plugins.join("qiaoma").join("rime.lua"), "-- entry").unwrap();
-        std::fs::write(plugins.join("qiaoma").join("calc.lua"), "-- x").unwrap();
-        std::fs::create_dir_all(plugins.join("tools")).unwrap();
-        std::fs::write(plugins.join("tools").join("main.lua"), "-- t").unwrap();
-        std::fs::write(plugins.join("loose.lua"), "-- loose script").unwrap();
+    fn identity_searcher_resolves_series_layout_only() {
+        let dir = temp_root("identity");
+        std::fs::create_dir_all(dir.join("plugin").join("foo")).unwrap();
+        std::fs::write(
+            dir.join("plugin").join("foo").join("foo.lua"),
+            "return { tag = 'flat-name' }",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("plugin").join("a").join("b")).unwrap();
+        std::fs::write(
+            dir.join("plugin").join("a").join("b").join("a.b.lua"),
+            "return { tag = 'dotted' }",
+        )
+        .unwrap();
+        // 旧布局故意留着：不应被解析
+        std::fs::write(dir.join("plugin").join("flat.lua"), "return {}").unwrap();
+        std::fs::create_dir_all(dir.join("lua")).unwrap();
+        std::fs::write(dir.join("lua").join("legacy.lua"), "return {}").unwrap();
 
-        let found = discover_plugins(&[dir.clone()]);
-        assert_eq!(found.len(), 2, "{found:?}");
-        assert_eq!(found[0].name, "qiaoma");
-        assert!(found[0].has_entry);
-        assert_eq!(found[0].scripts, vec!["calc.lua", "rime.lua"]);
-        assert_eq!(found[1].name, "tools");
-        assert!(!found[1].has_entry);
+        let host = LuaHost::boot(&[dir.clone()]).expect("boot");
+        let foo: String = host
+            .lua
+            .load("return require('foo').tag")
+            .eval()
+            .expect("require foo");
+        assert_eq!(foo, "flat-name");
+        let dotted: String = host
+            .lua
+            .load("return require('a.b').tag")
+            .eval()
+            .expect("require a.b");
+        assert_eq!(dotted, "dotted");
+        let flat: bool = host
+            .lua
+            .load("local ok = pcall(require, 'flat'); return not ok")
+            .eval()
+            .expect("扁平应失败");
+        assert!(flat, "plugin/flat.lua 扁平形态不应被 require 到");
+        let legacy: bool = host
+            .lua
+            .load("local ok = pcall(require, 'legacy'); return not ok")
+            .eval()
+            .expect("lua/ 目录应失效");
+        assert!(legacy, "lua/legacy.lua 不应被 require 到");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1717,12 +1694,13 @@ mod tests {
         assert!(collect_required_components(&none).is_empty());
     }
 
-    /// 平铺脚本 + `@*名字`：`require` 解析 + 协程 yield。
+    /// 脚本返回函数 + `@*名字`：`require` 解析（恒等式布局）+ 协程 yield。
     #[test]
-    fn flat_script_translator_yields_candidates() {
+    fn script_translator_yields_candidates() {
         let dir = temp_root("flat");
+        std::fs::create_dir_all(dir.join("plugin").join("demo")).unwrap();
         std::fs::write(
-            dir.join("lua").join("demo.lua"),
+            dir.join("plugin").join("demo").join("demo.lua"),
             r#"
 local function translator(input, seg, env)
   yield(Candidate("demo", seg.start, seg._end, "你好", "你好吗"))
@@ -1752,8 +1730,9 @@ return translator
     #[test]
     fn module_table_with_init_reads_config() {
         let dir = temp_root("module");
+        std::fs::create_dir_all(dir.join("plugin").join("mod")).unwrap();
         std::fs::write(
-            dir.join("lua").join("mod.lua"),
+            dir.join("plugin").join("mod").join("mod.lua"),
             r#"
 local M = {}
 function M.init(env)
@@ -1787,8 +1766,9 @@ return M
     #[test]
     fn filter_iterates_and_rewrites_comment() {
         let dir = temp_root("filter");
+        std::fs::create_dir_all(dir.join("plugin").join("annotate")).unwrap();
         std::fs::write(
-            dir.join("lua").join("annotate.lua"),
+            dir.join("plugin").join("annotate").join("annotate.lua"),
             r#"
 return function(input, env)
   local n = 0
@@ -1821,8 +1801,9 @@ end
     #[test]
     fn processor_commits_text_from_script() {
         let dir = temp_root("processor");
+        std::fs::create_dir_all(dir.join("plugin").join("enter")).unwrap();
         std::fs::write(
-            dir.join("lua").join("enter.lua"),
+            dir.join("plugin").join("enter").join("enter.lua"),
             r#"
 local function processor(key, env)
   local ctx = env.engine.context
@@ -1854,6 +1835,29 @@ return processor
             .join(".tmp_qiaoma")
             .join("shared");
         dir.is_dir().then_some(dir)
+    }
+
+    /// 实机用户目录的宇浩数据：恒等式布局 + 点分 require
+    /// （plugin/yuhao/<名字>/yuhao.<名字>.lua）。机器上没有就跳过。
+    #[test]
+    fn live_yuhao_modules_require_under_identity_layout() {
+        let Some(root) = std::env::var_os("APPDATA").map(|appdata| {
+            PathBuf::from(appdata).join("Rime-Next")
+        }) else {
+            eprintln!("跳过:没有 APPDATA");
+            return;
+        };
+        if !root.join("plugin/yuhao/yuhao_core/yuhao.yuhao_core.lua").is_file() {
+            eprintln!("跳过:宇浩未迁移到恒等式布局");
+            return;
+        }
+        let host = LuaHost::boot(&[root]).expect("boot");
+        let ok: bool = host
+            .lua
+            .load(r#"local ok = pcall(require, "yuhao.yuhao_core"); return ok"#)
+            .eval()
+            .expect("eval");
+        assert!(ok, "yuhao.yuhao_core 应能 require（恒等式布局）");
     }
 
     /// 真脚本 1：`number_translator`（大写金额）。输入 `R123` → 壹佰贰拾叁。
@@ -2014,13 +2018,14 @@ return processor
     #[test]
     fn bootstrap_registers_globals_for_star_components() {
         let dir = temp_root("bootstrap");
+        std::fs::create_dir_all(dir.join("plugin").join("helper")).unwrap();
         std::fs::write(
-            dir.join("lua").join("helper.lua"),
+            dir.join("plugin").join("helper").join("helper.lua"),
             "return { translator = function(input, seg, env) yield(Candidate('h', seg.start, seg._end, 'H'..input, '')) end }",
         )
         .unwrap();
         std::fs::write(
-            dir.join("lua").join("rime.lua"),
+            dir.join("plugin").join("rime.lua"),
             "helper = require('helper')\nhelper_translator = helper.translator\n",
         )
         .unwrap();
@@ -2105,7 +2110,7 @@ return a, b, c, utf8.offset(s, 2, 1)
     fn star_submodule_path_resolves_like_upstream() {
         let dir = temp_root("submod");
         std::fs::write(
-            dir.join("lua").join("rime.lua"),
+            dir.join("plugin").join("rime.lua"),
             "yuhao = { core = { filter = function(input, env) return input end } }\n",
         )
         .unwrap();
