@@ -121,6 +121,14 @@ enum Command {
     CommitText(String),
     ClearInput,
     SetOption(String, bool),
+    /// `Context:set_property` —— 跨组件共享的组合属性（虎整句的已上屏/缓冲状态靠它）。
+    SetProperty(String, String),
+    PushInput(String),
+    SetInput(String),
+    ConfirmSelection,
+    Select(usize),
+    Highlight(usize),
+    RefreshNonConfirmed,
 }
 
 /// 一次调用内共享的桥接状态（回调闭包通过 `Arc` 访问）。
@@ -134,10 +142,17 @@ struct Bridge {
     options: Mutex<HashMap<String, bool>>,
     /// filter 输入候选的原件（回写时取回 `entry`，学词不能丢）。
     candidates: Arc<Mutex<Vec<Candidate>>>,
-    /// `commit_notifier` 的回调。
-    commit_hooks: Mutex<Vec<Function>>,
+    /// 通知器回调：id / 类型（0=commit, 1=update, 2=option_update）/ 函数。
+    /// 用 id 是为了 `connection:disconnect()` 能精确摘掉自己那一条。
+    hooks: Mutex<Vec<(u64, u8, Function)>>,
+    next_hook_id: Mutex<u64>,
     /// 上次观察到的提交条数（用于触发 `commit_notifier`）。
     commit_epoch: Mutex<u64>,
+    /// `ctx:get_property` / `set_property` 的后端（每次 refresh_env 从 Context 同步）。
+    properties: Mutex<HashMap<String, String>>,
+    is_composing: Mutex<bool>,
+    has_menu: Mutex<bool>,
+    commit_text: Mutex<String>,
 }
 
 // ---------------------------------------------------------------- Lua 运行时
@@ -704,21 +719,122 @@ impl LuaHost {
                 Ok(())
             })?,
         )?;
-        // commit_notifier：脚本 connect 一个回调，提交发生时调用
-        let notifier = lua.create_table()?;
+        // ---- Context 属性与编辑 API（虎整句 1.6 依赖；C++ librime-lua 同名） ----
         let link = self.link.clone();
-        notifier.set(
-            "connect",
-            lua.create_function(move |_, (_this, func): (Value, Function)| {
-                if let Ok(mut hooks) = link.commit_hooks.lock() {
-                    hooks.push(func);
-                }
-                Ok(0i64)
+        context.set(
+            "get_property",
+            lua.create_function(move |_, (_this, name): (Value, String)| {
+                Ok(link
+                    .properties
+                    .lock()
+                    .ok()
+                    .and_then(|props| props.get(&name).cloned())
+                    .unwrap_or_default())
             })?,
         )?;
-        context.set("commit_notifier", notifier)?;
-        context.set("update_notifier", lua.create_table()?)?;
-        context.set("option_update_notifier", lua.create_table()?)?;
+        let link = self.link.clone();
+        context.set(
+            "set_property",
+            lua.create_function(move |_, (_this, name, value): (Value, String, String)| {
+                if let Ok(mut props) = link.properties.lock() {
+                    props.insert(name.clone(), value.clone());
+                }
+                if let Ok(mut queue) = link.commands.lock() {
+                    queue.push(Command::SetProperty(name, value));
+                }
+                Ok(())
+            })?,
+        )?;
+        let link = self.link.clone();
+        context.set(
+            "is_composing",
+            lua.create_function(move |_, _this: Value| {
+                Ok(link.is_composing.lock().map(|v| *v).unwrap_or(false))
+            })?,
+        )?;
+        let link = self.link.clone();
+        context.set(
+            "has_menu",
+            lua.create_function(move |_, _this: Value| {
+                Ok(link.has_menu.lock().map(|v| *v).unwrap_or(false))
+            })?,
+        )?;
+        let link = self.link.clone();
+        context.set(
+            "get_commit_text",
+            lua.create_function(move |_, _this: Value| {
+                Ok(link
+                    .commit_text
+                    .lock()
+                    .map(|v| v.clone())
+                    .unwrap_or_default())
+            })?,
+        )?;
+        let link = self.link.clone();
+        context.set(
+            "push_input",
+            lua.create_function(move |_, (_this, text): (Value, String)| {
+                if let Ok(mut queue) = link.commands.lock() {
+                    queue.push(Command::PushInput(text));
+                }
+                Ok(())
+            })?,
+        )?;
+        let link = self.link.clone();
+        context.set(
+            "set_input",
+            lua.create_function(move |_, (_this, text): (Value, String)| {
+                if let Ok(mut queue) = link.commands.lock() {
+                    queue.push(Command::SetInput(text));
+                }
+                Ok(())
+            })?,
+        )?;
+        let link = self.link.clone();
+        context.set(
+            "confirm_current_selection",
+            lua.create_function(move |_, _this: Value| {
+                if let Ok(mut queue) = link.commands.lock() {
+                    queue.push(Command::ConfirmSelection);
+                }
+                Ok(true)
+            })?,
+        )?;
+        let link = self.link.clone();
+        context.set(
+            "select",
+            lua.create_function(move |_, (_this, index): (Value, usize)| {
+                if let Ok(mut queue) = link.commands.lock() {
+                    queue.push(Command::Select(index));
+                }
+                Ok(true)
+            })?,
+        )?;
+        let link = self.link.clone();
+        context.set(
+            "highlight",
+            lua.create_function(move |_, (_this, index): (Value, usize)| {
+                if let Ok(mut queue) = link.commands.lock() {
+                    queue.push(Command::Highlight(index));
+                }
+                Ok(true)
+            })?,
+        )?;
+        let link = self.link.clone();
+        context.set(
+            "refresh_non_confirmed_composition",
+            lua.create_function(move |_, _this: Value| {
+                if let Ok(mut queue) = link.commands.lock() {
+                    queue.push(Command::RefreshNonConfirmed);
+                }
+                Ok(true)
+            })?,
+        )?;
+        // 三个通知器：connect 返回带 `disconnect` 的连接对象（librime-lua 语义）。
+        // 虎整句 1.6 的 prepare_learning 会依次 connect 四个回调、重连前先 disconnect。
+        context.set("commit_notifier", self.make_notifier(0)?)?;
+        context.set("update_notifier", self.make_notifier(1)?)?;
+        context.set("option_update_notifier", self.make_notifier(2)?)?;
         engine.set("context", context)?;
 
         // ---- schema.config ----
@@ -833,6 +949,43 @@ impl LuaHost {
         Ok(env)
     }
 
+    /// 建一个通知器：`connect(func)` → 连接对象，`connection:disconnect()` 摘掉回调。
+    /// `kind`：0=commit（会在 [`LuaHost::fire_commit_hooks`] 里触发）／1=update／2=option_update。
+    fn make_notifier(&self, kind: u8) -> mlua::Result<Table> {
+        let lua = &self.lua;
+        let table = lua.create_table()?;
+        let link = self.link.clone();
+        table.set(
+            "connect",
+            lua.create_function(move |lua, (_this, func): (Value, Function)| {
+                let id = link
+                    .next_hook_id
+                    .lock()
+                    .map(|mut next| {
+                        *next += 1;
+                        *next
+                    })
+                    .unwrap_or(1);
+                if let Ok(mut hooks) = link.hooks.lock() {
+                    hooks.push((id, kind, func));
+                }
+                let conn = lua.create_table()?;
+                let link2 = link.clone();
+                conn.set(
+                    "disconnect",
+                    lua.create_function(move |_, _this: Value| {
+                        if let Ok(mut hooks) = link2.hooks.lock() {
+                            hooks.retain(|(hook_id, _, _)| *hook_id != id);
+                        }
+                        Ok(())
+                    })?,
+                )?;
+                Ok(conn)
+            })?,
+        )?;
+        Ok(table)
+    }
+
     /// 每次调用前刷新 env 里的"快照"字段（input / options / schema_id）。
     fn refresh_env(&self, env: &Table, ctx: &CtxSnapshot, config: &serde_json::Value) {
         if let Ok(mut slot) = self.link.config.lock() {
@@ -840,6 +993,18 @@ impl LuaHost {
         }
         if let Ok(mut options) = self.link.options.lock() {
             *options = ctx.options.clone();
+        }
+        if let Ok(mut props) = self.link.properties.lock() {
+            *props = ctx.properties.clone();
+        }
+        if let Ok(mut flag) = self.link.is_composing.lock() {
+            *flag = ctx.is_composing;
+        }
+        if let Ok(mut flag) = self.link.has_menu.lock() {
+            *flag = ctx.has_menu;
+        }
+        if let Ok(mut text) = self.link.commit_text.lock() {
+            *text = ctx.commit_text.clone();
         }
         let Ok(engine) = env.get::<Table>("engine") else {
             return;
@@ -918,13 +1083,48 @@ impl LuaHost {
                         engine.context.set_option(name, *value);
                     }
                 }
+                Command::SetProperty(name, value) => {
+                    if let Some(engine) = engine.as_deref_mut() {
+                        engine.context.set_property(name, value);
+                    }
+                }
+                Command::PushInput(text) => {
+                    if let Some(engine) = engine.as_deref_mut() {
+                        engine.context.push_input_str(text);
+                    }
+                }
+                Command::SetInput(text) => {
+                    if let Some(engine) = engine.as_deref_mut() {
+                        engine.context.set_input(text);
+                    }
+                }
+                Command::ConfirmSelection => {
+                    if let Some(engine) = engine.as_deref_mut() {
+                        engine.context.confirm_current_selection();
+                    }
+                }
+                Command::Select(index) => {
+                    if let Some(engine) = engine.as_deref_mut() {
+                        engine.context.select(*index);
+                    }
+                }
+                Command::Highlight(index) => {
+                    if let Some(engine) = engine.as_deref_mut() {
+                        engine.context.highlight(*index);
+                    }
+                }
+                Command::RefreshNonConfirmed => {
+                    if let Some(engine) = engine.as_deref_mut() {
+                        engine.context.refresh_non_confirmed_composition();
+                    }
+                }
             }
         }
         commands
     }
 
     /// `commit_notifier` 的触发：提交条数变了就回调一遍。
-    fn fire_commit_hooks(&self, commit_len: usize) {
+    fn fire_commit_hooks(&self, commit_len: usize, env: &Table) {
         let epoch = commit_len as u64;
         let changed = self
             .link
@@ -942,11 +1142,24 @@ impl LuaHost {
         if !changed {
             return;
         }
-        let Ok(hooks) = self.link.commit_hooks.lock() else {
-            return;
+        // 回调签名是 `function(ctx)`：把 env.engine.context 传进去，
+        // 虎整句的学习回调会调 ctx:is_composing() / ctx:get_commit_text()。
+        // 先复制一份函数列表再调用，避免回调里 connect/disconnect 与这里的锁打架。
+        let ctx_value = env
+            .get::<Table>("engine")
+            .and_then(|engine| engine.get::<Table>("context"))
+            .map(Value::Table)
+            .unwrap_or(Value::Nil);
+        let callbacks: Vec<Function> = match self.link.hooks.lock() {
+            Ok(hooks) => hooks
+                .iter()
+                .filter(|(_, kind, _)| *kind == 0)
+                .map(|(_, _, func)| func.clone())
+                .collect(),
+            Err(_) => return,
         };
-        for hook in hooks.iter() {
-            if let Err(error) = hook.call::<()>(()) {
+        for hook in callbacks {
+            if let Err(error) = hook.call::<()>(ctx_value.clone()) {
                 eprintln!("[lua] commit_notifier 回调失败: {error}");
             }
         }
@@ -1086,6 +1299,10 @@ struct CtxSnapshot {
     input: String,
     caret_pos: usize,
     options: HashMap<String, bool>,
+    properties: HashMap<String, String>,
+    is_composing: bool,
+    has_menu: bool,
+    commit_text: String,
     /// `composition:back()` 对应的最后一段。
     segment: Option<SegmentView>,
     /// 提交历史条数（`commit_notifier` 靠它判断"有没有新提交"）。
@@ -1098,6 +1315,10 @@ impl CtxSnapshot {
             input: ctx.input.clone(),
             caret_pos: ctx.caret_pos,
             options: ctx.options.clone(),
+            properties: ctx.properties.clone(),
+            is_composing: ctx.is_composing(),
+            has_menu: ctx.has_menu(),
+            commit_text: ctx.get_commit_text(),
             segment: ctx.composition.segmentation.segments.last().map(segment_view),
             commit_len: ctx.commit_history.len(),
         }
@@ -1399,7 +1620,7 @@ impl Translator for LuaTranslator {
         if !tags.is_empty() {
             segment.tags = tags;
         }
-        self.host.fire_commit_hooks(ctx.commit_len);
+        self.host.fire_commit_hooks(ctx.commit_len, &self.env);
         Some(Box::new(VecTranslation::new(items)))
     }
 }
@@ -1526,7 +1747,7 @@ impl LuaFilter {
             eprintln!("[lua] filter `{}` 失败: {error}", self.name_space);
             return items;
         }
-        self.host.fire_commit_hooks(snapshot.commit_len);
+        self.host.fire_commit_hooks(snapshot.commit_len, &self.env);
         items_out
     }
 }
@@ -1603,6 +1824,19 @@ impl Processor for LuaProcessor {
         }
         let _ = key_table.set("keycode", key.keycode as i64);
         let _ = key_table.set("modifier", key.modifier as i64);
+        // 修饰键/松键判断：C++ `KeyEvent::release/shift/ctrl/alt/super`。
+        // 虎整句 1.6 的 processor 与 backspace 观察器都靠 `key:release()` 区分按键与抬键。
+        for (name, value) in [
+            ("release", key.release()),
+            ("shift", key.shift()),
+            ("ctrl", key.ctrl()),
+            ("alt", key.alt()),
+            ("super", key.super_key()),
+        ] {
+            if let Ok(func) = lua.create_function(move |_, _this: Value| Ok(value)) {
+                let _ = key_table.set(name, func);
+            }
+        }
 
         let result = self
             .func
@@ -2136,6 +2370,62 @@ return a, b, c, utf8.offset(s, 2, 1)
             "`*` 分层应能解析到 _G.yuhao.core"
         );
         assert!(host.resolve_component("filter", "*yuhao.core").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 虎整句 1.6 依赖的 Context 属性与通知器：`set_property`/`get_property` 同次调用可见，
+    /// `connect` 返回的连接对象能 `disconnect`，命令会排进 flush 队列。
+    #[test]
+    fn context_properties_and_notifier_connections() {
+        let dir = temp_root("ctxapi");
+        let host = LuaHost::boot(&[dir.clone()]).expect("boot");
+        let env = host.make_env("ctxapi").expect("env");
+        let snapshot = CtxSnapshot {
+            input: String::new(),
+            caret_pos: 0,
+            options: HashMap::new(),
+            properties: HashMap::new(),
+            is_composing: false,
+            has_menu: false,
+            commit_text: String::new(),
+            segment: None,
+            commit_len: 0,
+        };
+        host.refresh_env(&env, &snapshot, &serde_json::json!({}));
+        host.lua.globals().set("test_env", env).unwrap();
+        let ok: bool = host
+            .lua
+            .load(
+                r#"
+                local c = test_env.engine.context
+                c:set_property("tiger_sentence.buffered", "zhhbi")
+                if c:get_property("tiger_sentence.buffered") ~= "zhhbi" then return false end
+                if c:get_property("missing") ~= "" then return false end
+                if c:is_composing() ~= false or c:has_menu() ~= false then return false end
+                if c:get_commit_text() ~= "" then return false end
+                local conn = c.commit_notifier:connect(function() end)
+                if type(conn.disconnect) ~= "function" then return false end
+                conn:disconnect()
+                local update_conn = c.update_notifier:connect(function() end)
+                update_conn:disconnect()
+                c:push_input("a")
+                return true
+                "#,
+            )
+            .eval()
+            .expect("Context API 全部可用");
+        assert!(ok);
+        let commands = host.link.commands.lock().unwrap();
+        assert!(commands
+            .iter()
+            .any(|c| matches!(c, Command::SetProperty(n, v) if n == "tiger_sentence.buffered" && v == "zhhbi")));
+        assert!(commands
+            .iter()
+            .any(|c| matches!(c, Command::PushInput(v) if v == "a")));
+        assert!(
+            host.link.hooks.lock().unwrap().is_empty(),
+            "disconnect 后不应残留回调"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
