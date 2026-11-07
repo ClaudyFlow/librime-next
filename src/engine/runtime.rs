@@ -383,14 +383,6 @@ impl Engine {
                 crate::engine::user_ngram::learn_and_maybe_flush(&words);
             }
         }
-        // 上屏后联想（2026-11-07 用户口径「预测一些上屏十次以上的用户词」）。
-        //
-        // 这一步是 `5e32988` 只写了提交说明、一直没写的那半：预测**必须放在学习之后**，
-        // 本次提交学到的二元/三元先落进统计，才可能当场给出"下一个词"。
-        // 过滤口径在 `user_ngram::predict_frequent`（只留上屏 ≥10 次的多字中文词），
-        // 由 c_api 在无组字时经 `RimeContext.predictions` 交给宿主画联想条。
-        self.context.predictions =
-            crate::engine::user_ngram::predictions_for_context(&self.context);
         // 同样的借用规避：`memorize` 要 `&mut self`，先把列表取到局部
         let mut translators = std::mem::take(&mut self.translators);
         // 提交历史按值拷一份（≤20 条）：`translators` 已经移出 `self`，
