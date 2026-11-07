@@ -474,6 +474,9 @@ impl Switcher {
     fn deactivate(&mut self, engine: &mut Engine) {
         self.active = false;
         engine.context.set_option("dumb", false);
+        // 折叠态是菜单内部状态，收起后别留在 context 里（下次 activate 会按
+        // `switcher/fold_options` 重新置位）。
+        engine.context.set_option("_fold_options", false);
         self.items.clear();
         engine.context.clear();
         engine.context.composition.segmentation.segments.clear();
@@ -527,18 +530,28 @@ impl Switcher {
 
     /// 执行一条命令。
     ///
-    /// 两种命令**不关菜单**（C++ 里它们的 `Apply` 只是重刷）：
-    /// 展开折叠的开关、以及折叠状态下选中"当前方案"。
+    /// `UnfoldOptions` 不关菜单（C++ 里它的 `Apply` 只是重刷）。
+    ///
+    /// ⚠️ 2026-11-08：`SchemaWithUnfold` 原本也走「先展开开关、菜单不关」，
+    /// 但 `fold_options: true` 时第 0 条（当前方案）正是它 —— 用户按一下空格
+    /// 只展开、再按一下才关菜单，就是「选方案要按两下」。现按 `Schema` 同样处理：
+    /// 一次确认直接选中并收起菜单。展开开关列表的入口另议，不再占用空格。
     fn apply_command(&mut self, engine: &mut Engine, command: SwitcherCommand) {
         match command {
-            SwitcherCommand::UnfoldOptions | SwitcherCommand::SchemaWithUnfold(_) => {
+            SwitcherCommand::UnfoldOptions => {
                 engine.context.set_option("_fold_options", false);
                 self.refresh_menu(engine);
             }
-            SwitcherCommand::Schema(schema_id) => {
+            SwitcherCommand::Schema(schema_id)
+            | SwitcherCommand::SchemaWithUnfold(schema_id) => {
                 self.deactivate(engine);
                 // 登记，不直接切：处理器链跑完后由 `Engine::process_key` 执行
                 engine.request_schema(schema_id);
+                // 切方案会推高 context 代次，TSF 的 `tested_key` 缓存失效后
+                // `OnKeyDown` 会把同一次物理空格再送一遍。那时 switcher 已退出，
+                // 空格 `eaten=false` 透传给应用 = 上屏空格。标记让引擎吞掉它。
+                // 只在「切方案」时置：Esc / 开关 / 单选关菜单不该吞后续空格。
+                engine.swallow_next_space = true;
             }
             SwitcherCommand::Toggle {
                 option,
@@ -573,6 +586,8 @@ impl Switcher {
             self.deactivate(engine);
             return;
         };
+        // 切方案分支会在 `apply_command` 里置 `swallow_next_space`；
+        // 其余命令（开关 / 单选 / 收起）不置，避免误吞用户后续输入的空格。
         self.apply_command(engine, command);
     }
 }
@@ -816,5 +831,79 @@ mod tests {
             .unwrap();
         assert_eq!(first, "stroke", "用户目录优先于共享目录");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 2026-11-08 用户报障：Ctrl+` 选单里按空格「要按两下才选方案，按完还上屏空格」。
+    /// 回归两件事：① `fold_options` 下第 0 条 `SchemaWithUnfold` 一次确认就收菜单；
+    /// ② 菜单收起后宿主重复投递的那一下空格被吞，不进 commit_text。
+    #[test]
+    fn folded_schema_confirms_in_one_space_and_swallows_replayed_space() {
+        let config = json!({
+            "switcher": {
+                "caption": "〔方案選單〕",
+                "hotkeys": ["Control+grave"],
+                "fold_options": true
+            },
+            "schema_list": [{ "schema": "luna_pinyin" }, { "schema": "cangjie.5" }]
+        });
+        let mut s = Switcher::new(config.clone(), Path::new("."), None);
+        let mut engine = Engine::empty_for_test();
+        s.activate(&mut engine);
+        assert!(s.is_active());
+
+        // 模拟折叠状态下第 0 条（当前方案）被改写成 SchemaWithUnfold
+        let mut items = schema_list_translator::build_items(
+            "luna_pinyin",
+            &config,
+            Path::new("."),
+            &HashMap::new(),
+            false,
+        );
+        assert!(!items.is_empty(), "方案清单至少要有当前方案这一条");
+        items[0].command = SwitcherCommand::SchemaWithUnfold("luna_pinyin".to_string());
+        s.items = items;
+        engine
+            .context
+            .composition
+            .segmentation
+            .segments
+            .last_mut()
+            .unwrap()
+            .selected_index = 0;
+
+        // ① 一下空格（confirm）就该收菜单
+        s.confirm(&mut engine);
+        assert!(!s.is_active(), "一次确认必须关掉菜单，不能只展开开关列表");
+        assert!(engine.swallow_next_space, "菜单收起后要防宿主重复投递空格");
+
+        // ② 宿主重复投递的那一下空格：吞掉、不上屏
+        let eaten = engine.process_key(&KeyEvent::new(XK_SPACE, 0));
+        assert!(eaten, "重复投递的空格必须被吞（eaten=true）");
+        assert!(!engine.swallow_next_space, "标记只能用一次");
+        assert!(engine.context.commit_text.is_none(), "不能有空格上屏");
+        assert!(engine.context.input.is_empty(), "不能进输入串");
+    }
+
+    /// 吞空格标记只在「切方案」时置：Esc / 开关 / 单选收起菜单后，用户紧接着
+    /// 按的空格必须照常处理，不能被悄悄吃掉。
+    #[test]
+    fn escape_closing_menu_does_not_swallow_following_space() {
+        let mut s = Switcher::new(
+            json!({
+                "switcher": { "hotkeys": ["Control+grave"] },
+                "schema_list": [{ "schema": "luna_pinyin" }]
+            }),
+            Path::new("."),
+            None,
+        );
+        let mut engine = Engine::empty_for_test();
+        s.activate(&mut engine);
+        assert!(s.is_active());
+        s.deactivate(&mut engine);
+        assert!(!engine.swallow_next_space, "Esc 关菜单不置吞空格标记");
+        assert!(
+            !engine.process_key(&KeyEvent::new(XK_SPACE, 0)),
+            "后续空格应照常走处理器链，不能被吞"
+        );
     }
 }

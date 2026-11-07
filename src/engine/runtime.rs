@@ -26,7 +26,7 @@ use crate::engine::gear::segmentor::{Segmentor, SegmentorView};
 use crate::engine::gear::selector::Selector;
 use crate::engine::gear::speller::Speller;
 use crate::engine::gear::translator::{ScriptTranslator, Translator};
-use crate::engine::key_event::KeyEvent;
+use crate::engine::key_event::{KeyEvent, XK_SPACE};
 use crate::engine::menu::Menu;
 use crate::engine::schema::Schema;
 use crate::engine::segmentation::{SegStatus, Segmentation};
@@ -72,6 +72,15 @@ pub struct Engine {
     pending_schema: Option<String>,
     /// 上次见过的神经重排结果代数(见 [`Self::poll_rescore_landing`])。
     rescore_seen_generation: u64,
+    /// 方案选单刚被确认关闭时置位：吞掉宿主紧接着重复投递的那一下空格。
+    ///
+    /// TSF 的 `OnTestKeyDown` 会真的把按键送进引擎，`OnKeyDown` 靠 `tested_key`
+    /// 缓存复用结果。但选中方案会 `request_schema → apply_schema`，推高 context
+    /// 代次，缓存可能失效 —— 同一次物理空格于是被送进引擎两次。第二次 switcher
+    /// 已退出，空格 `eaten=false` 被宿主透传给应用，表现就是「选完方案上屏一个空格」。
+    /// 这里在菜单关闭后吞掉紧随的**一次**空格（不上屏、不进 commit_history）。
+    /// 放在 Engine 而不是 Switcher 上，是因为 `apply_schema` 会重建整个组件链。
+    pub(crate) swallow_next_space: bool,
 }
 
 impl Engine {
@@ -121,6 +130,7 @@ impl Engine {
             user_dir,
             pending_schema: None,
             rescore_seen_generation: 0,
+            swallow_next_space: false,
         };
         engine.initialize_components();
         Some(engine)
@@ -244,6 +254,15 @@ impl Engine {
     /// `Highlight` 虽也发 update，但高亮导航不改变输入串，因此这里只在**输入串真的变了**
     /// 时重算 —— 与 C++ 行为一致。
     pub fn process_key(&mut self, key: &KeyEvent) -> bool {
+        // 方案选单确认后，宿主可能把同一次物理空格再投递一次（见字段注释）。
+        // 这次空格必须吞掉：否则 switcher 已退出，`express_editor` 在空闲态不接，
+        // `eaten=false` 会让宿主把空格透传给应用 ——「选完方案多出一个空格」。
+        if self.swallow_next_space {
+            self.swallow_next_space = false;
+            if key.keycode == XK_SPACE && !key.release() {
+                return true;
+            }
+        }
         // CapsLock / NumLock / ScrollLock：**不能拦在处理器链之前**。
         // 2026-11-01 早先为治"CapsLock 按一下吐一串 `yinamiao.........,......`"，
         // 这里直接 `return false` —— 结果 `ascii_composer` 再也看不到 CapsLock，
@@ -364,6 +383,14 @@ impl Engine {
                 crate::engine::user_ngram::learn_and_maybe_flush(&words);
             }
         }
+        // 上屏后联想（2026-11-07 用户口径「预测一些上屏十次以上的用户词」）。
+        //
+        // 这一步是 `5e32988` 只写了提交说明、一直没写的那半：预测**必须放在学习之后**，
+        // 本次提交学到的二元/三元先落进统计，才可能当场给出"下一个词"。
+        // 过滤口径在 `user_ngram::predict_frequent`（只留上屏 ≥10 次的多字中文词），
+        // 由 c_api 在无组字时经 `RimeContext.predictions` 交给宿主画联想条。
+        self.context.predictions =
+            crate::engine::user_ngram::predictions_for_context(&self.context);
         // 同样的借用规避：`memorize` 要 `&mut self`，先把列表取到局部
         let mut translators = std::mem::take(&mut self.translators);
         // 提交历史按值拷一份（≤20 条）：`translators` 已经移出 `self`，
@@ -839,6 +866,7 @@ impl Engine {
             user_dir: None,
             pending_schema: None,
             rescore_seen_generation: 0,
+            swallow_next_space: false,
         }
     }
 }

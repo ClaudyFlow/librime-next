@@ -164,6 +164,10 @@ name = "probe_menu"
 path = "example/probe_menu.rs"
 
 [[example]]
+name = "probe_switcher_space"
+path = "example/probe_switcher_space.rs"
+
+[[example]]
 name = "probe_sp_step"
 path = "example/probe_sp_step.rs"
 
