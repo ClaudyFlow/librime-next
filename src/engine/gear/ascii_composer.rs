@@ -77,7 +77,9 @@ impl AsciiComposer {
         let mut c = AsciiComposer {
             keymap: KeyBindingMap::new(),
             switch_key: std::collections::HashMap::new(),
-            inline_uppercase: true,
+            // C++ `inline_uppercase_ = false`：配置未显式打开时，中文态的大写字母
+            // 不进临时西文，放行给下游（matcher 才能按 recognizer/patterns 打标签）。
+            inline_uppercase: false,
             good_old_caps_lock: false,
             modifier_down: None,
             toggle_deadline: None,
@@ -322,10 +324,22 @@ impl Processor for AsciiComposer {
 
         let print_ch = key.printable_char();
 
-        // 7. 中文态遇大写字母 ⇒ 进入临时西文
+        // C++ 8 前置：若当前不在输入中，且账本末尾不是字母（如单敲的空格已独立
+        // 上屏），出清历史残账。
+        if !ctx.is_composing()
+            && self.raw_keys.bytes().last().map_or(false, |c| !c.is_ascii_alphabetic())
+        {
+            self.raw_keys.clear();
+        }
+        let starts_with_alpha =
+            self.raw_keys.bytes().next().map_or(true, |c| c.is_ascii_alphabetic());
+
+        // 8. 中文态下遇大写字母：切换为临时西文（受 inline_uppercase 开关保护，
+        // 且要求账本以字母开头——与 C++ `starts_with_alpha` 一致）。
         if self.inline_uppercase
             && !ascii_mode
             && print_ch.map_or(false, |c| c.is_ascii_uppercase())
+            && starts_with_alpha
         {
             self.enter_inline_ascii(ctx, print_ch.expect("checked above"));
             return ProcessResult::Accepted;
@@ -448,7 +462,8 @@ mod tests {
     #[test]
     fn inline_ascii_return_commits_raw_keys_and_returns_to_chinese() {
         // 中文态敲大写字母进入临时西文，再敲小写、回车结算 —— C++ `CommitAndReset`
-        let mut composer = AsciiComposer::new(&json!({}));
+        // （inline_uppercase 默认关，与 C++ 一致；测该特性需显式打开）
+        let mut composer = AsciiComposer::new(&json!({"ascii_composer": {"inline_uppercase": true}}));
         let mut engine = engine_with("", false);
         composer.process_key_event(&mut engine, &KeyEvent::new(b'H' as u32, 0));
         assert_eq!(engine.context.input, "H");
@@ -468,7 +483,7 @@ mod tests {
 
     #[test]
     fn uppercase_enters_inline_ascii() {
-        let mut composer = AsciiComposer::new(&json!({}));
+        let mut composer = AsciiComposer::new(&json!({"ascii_composer": {"inline_uppercase": true}}));
         let mut engine = engine_with("", false);
         assert_eq!(
             composer.process_key_event(&mut engine, &KeyEvent::new(b'N' as u32, 0)),
@@ -482,6 +497,22 @@ mod tests {
             ProcessResult::Accepted
         );
         assert_eq!(engine.context.input, "Ni");
+    }
+
+    #[test]
+    fn uppercase_passthrough_by_default() {
+        // C++ `inline_uppercase_ = false`：配置未打开时，中文态的大写字母
+        // 不进临时西文，放行给下游（matcher 才能按 recognizer/patterns 打标签，
+        // 巧码 U4e2d→中 依赖此语义）
+        let mut composer = AsciiComposer::new(&json!({}));
+        let mut engine = engine_with("", false);
+        assert_eq!(
+            composer.process_key_event(&mut engine, &KeyEvent::new(b'U' as u32, 0)),
+            ProcessResult::Noop
+        );
+        assert!(!engine.context.get_option("ascii_mode"));
+        // 记账照旧发生（C++ 第 10 步）
+        assert_eq!(composer.raw_keys, "U");
     }
 
     #[test]
