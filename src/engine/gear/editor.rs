@@ -81,6 +81,9 @@ impl Editor {
         m.bind(KeyEvent::new(XK_DELETE, 0), "delete");
         m.bind(KeyEvent::new(XK_DELETE, K_CONTROL_MASK), "delete_candidate");
         m.bind(KeyEvent::new(XK_ESCAPE, 0), "cancel");
+        // 逗号:高亮在首位→上屏,否则向前翻页;句号:只向后翻页(用户 2026-11-07)。
+        m.bind(KeyEvent::new(0x2c, 0), "smart_comma"); // XK_comma
+        m.bind(KeyEvent::new(0x2e, 0), "page_next"); // XK_period
     }
 
     /// FluidEditor 的默认绑定（`editor.cc:FluidEditor::FluidEditor`）。
@@ -99,6 +102,8 @@ impl Editor {
         m.bind(KeyEvent::new(XK_DELETE, 0), "delete");
         m.bind(KeyEvent::new(XK_DELETE, K_CONTROL_MASK), "delete_candidate");
         m.bind(KeyEvent::new(XK_ESCAPE, 0), "cancel");
+        m.bind(KeyEvent::new(0x2c, 0), "smart_comma"); // XK_comma
+        m.bind(KeyEvent::new(0x2e, 0), "page_next"); // XK_period
     }
 
     /// `Editor::LoadConfig`：`<path>/bindings` + `<path>/char_handler`。
@@ -147,6 +152,28 @@ impl Editor {
                 }
                 true
             }
+            "smart_comma" => {
+                // 逗号(用户 2026-11-07):当前高亮是第一个候选 → 上屏;
+                // 否则向前翻一页。无候选时返回 false 让标点冒泡(正常打逗号)。
+                if !ctx.has_menu() {
+                    return false;
+                }
+                if ctx.highlight_index() == 0 {
+                    let index = ctx.highlight_index();
+                    let _ = ctx.select(index);
+                } else {
+                    ctx.move_highlight(-(ctx.page_size as isize));
+                }
+                true
+            }
+            "page_next" => {
+                // 句号:只向后翻页,不上屏。无候选时冒泡为正常句号。
+                if !ctx.has_menu() {
+                    return false;
+                }
+                ctx.move_highlight(ctx.page_size as isize);
+                true
+            }
             "toggle_selection" => {
                 let _ = ctx.reopen_previous_segment() || ctx.confirm_current_selection();
                 true
@@ -182,7 +209,9 @@ impl Editor {
             }
             // C++ `RevertLastEdit`：`ReopenPreviousSelection() || (PopInput() && ReopenPreviousSegment())`
             "revert" => {
-                let _ = ctx.reopen_previous_selection()
+                // BackSpace:先删剩余编码;删空后回退最近一次部分确认(改前面的字)。
+                let _ = ctx.revert_last_partial()
+                    || ctx.reopen_previous_selection()
                     || (ctx.pop_input(1) && ctx.reopen_previous_segment());
                 true
             }
@@ -375,6 +404,11 @@ mod tests {
         assert_eq!(engine.context.commit_text, None);
         assert_eq!(engine.context.committed_prefix, "一");
         assert_eq!(engine.context.input, "ge");
+        // 编码框必须显示「已确认汉字+剩余编码」(用户 2026-11-07 长编码需求 A)。
+        // 生产路径在 select 后由 runtime compose() 重切分;测试里手动补一次。
+        engine.compose();
+        let pre = engine.context.get_preedit();
+        assert_eq!(pre.text, "一ge", "preedit 缺已确认前缀!");
 
         // 再按一次空格、换成覆盖整段的候选 ⇒ 整段提交，preedit 里两截一起出去
         let menu = Menu::new();

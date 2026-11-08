@@ -25,3 +25,7 @@
 .DS_Store
 test-data/neural/
 test/e2e/build/userdb/
+
+# 2026-11-08：示例目录一律单数 example/（项目命名规范，Cargo.toml 手写 [[example]]）。
+# 复数 examples/ 是本地临时 bench 脚本，不入库。
+/examples/

@@ -46,9 +46,17 @@ pub struct Context {
     /// 取走并分发给各 translator 学词。放在 `Context` 里而不是直接回调 Engine，
     /// 是因为 processor（editor）只拿得到 `&mut Context`。
     pub pending_commit_elements: Vec<crate::dict::vocabulary::DictEntry>,
-    /// 预测候选(2026-11-01):上次提交后按个人 n-gram 给的"下一个词",
-    /// 供宿主在无组字状态显示(上屏后联想)。
+    /// 预测候选(2026-11-01):上次提交后给的"下一个词",
+    /// 供宿主在无组字状态显示(上屏后联想)。2026-11-08 起优先双神经模型
+    /// (联想条 4 条 = key2 + desk2),神经不可用时回退个人 n-gram。
     pub predictions: Vec<String>,
+    /// 提交这一帧**之前**的已上屏文本（2026-11-08 双神经模型联想条）。
+    ///
+    /// 上屏联想要把「提交前的上文 + 刚上屏的词」一起喂神经模型：提交之后
+    /// `commit_history.latest_text()` 已经变成新词，而且相邻同 kind 记录会被合并
+    /// （「你」+「好」→「你好」），提交后无法可靠反推"提交前"到哪为止。
+    /// 由 [`Self::collect_commit_history`] 在 push 之前抢存。
+    pub pre_commit_context: String,
     /// 最近 20 条上屏记录（C++ `Context::commit_history_`）。
     ///
     /// `history_translator` 出"最近输入"、`punctuator` 判数字串、
@@ -59,6 +67,9 @@ pub struct Context {
     /// 背景：`Engine::process_key` 只在 `input` 变化时 `compose()`，而删词不改变
     /// 输入 —— 用户按 Ctrl+Delete 后菜单纹丝不动，看着像没删掉（2026-11-01）。
     pub needs_recompose: bool,
+    /// 部分确认历史栈：(已确认文本字符数, 用户实际敲的编码切片)。
+    /// 回退时编码原样放回——不用 entry.code(整句/词组候选可能为空)。
+    pub partial_history: Vec<(usize, String)>,
 }
 
 impl Context {
@@ -150,6 +161,7 @@ impl Context {
         self.caret_pos = 0;
         self.committed_prefix.clear();
         self.committed_code.clear();
+        self.partial_history.clear();
         self.composition.segmentation.segments.clear();
         self.composition.segmentation.input.clear();
     }
@@ -197,8 +209,17 @@ impl Context {
             if let Some(entry) = &cand.entry {
                 self.committed_code.extend_from_slice(&entry.code);
             }
+            // 记**用户实际敲的输入切片**——词条 entry.code 对整句候选可能为空,
+            // 输入切片永远精确(用户 2026-11-07:难道编码上屏前不记录吗?记,记这个)。
+            let typed_code = self.input[..cand.end].to_string();
+            self.partial_history
+                .push((cand.text.chars().count(), typed_code));
             self.input.drain(..cand.end);
             self.caret_pos = self.input.len();
+            // 部分确认后必须重算:旧段还挂在组合里(Selected+旧菜单),不重算的话
+            // 剩余输入看不见候选、退格也没有目标(用户 2026-11-07 长编码bug)。
+            // runtime 在按键处理完看到此标记会 compose() 重切分剩余输入。
+            self.needs_recompose = true;
             Some(SelectResult::Continued)
         }
     }
@@ -236,6 +257,16 @@ impl Context {
 
     /// 移动高亮候选（箭头/翻页导航，不直接提交）。返回高亮是否有变化。
     pub fn move_highlight(&mut self, delta: isize) -> bool {
+        {
+            // 懒流菜单的 candidate_count 是"已物化条数"——不全量物化,
+            // 翻页/移高亮在未拉取区全部失效(用户 2026-11-07 逗号翻页实测)。
+            let Some(seg) = self.composition.back_mut() else {
+                return false;
+            };
+            if let Some(menu) = seg.menu.as_ref() {
+                menu.prepare(usize::MAX);
+            }
+        }
         let n = self.menu_candidate_count();
         if n == 0 {
             return false;
@@ -321,6 +352,30 @@ impl Context {
                 return;
             }
         }
+    }
+
+    /// 回退最近一次部分确认（BackSpace 在剩余编码删空后触发）：
+    /// 从 committed_prefix/committed_code 摘掉末段，把它的编码放回输入，
+    /// 重切分后候选重现——用户就能改前面已确认的汉字。
+    pub fn revert_last_partial(&mut self) -> bool {
+        // 用户 2026-11-07 定版:退格**立即**回退上一个确认词,把词变回编码
+        // (拼在剩余输入前面),不等剩余编码删空。
+        let Some((text_chars, code_bytes)) = self.partial_history.pop() else {
+            return false;
+        };
+        let chars: Vec<char> = self.committed_prefix.chars().collect();
+        let start = chars.len().saturating_sub(text_chars);
+        self.committed_prefix = chars[..start].iter().collect();
+        // 回退的编码 = 用户当时敲的输入切片,原样放回剩余输入前面,整段重切分。
+        let mut reverted = code_bytes;
+        reverted.push_str(&self.input);
+        self.input = reverted;
+        // 光标必须落到**串尾**:compose 只切分 caret 之前的输入,停在接缝处
+        // 会让回退的编码只切出一小截(用户 2026-11-07 "oguo" 现象)。
+        self.caret_pos = self.input.len();
+        self.caret_pos = self.input.len();
+        self.needs_recompose = true;
+        true
     }
 
     pub fn reopen_previous_segment(&mut self) -> bool {
@@ -482,6 +537,10 @@ impl Context {
     /// 必须在 `clear()` **之前**调用 —— 记录来自各段的选中候选和 `input`，
     /// 清场后两者都没了。三个字段互不重叠，所以可以直接分开借。
     pub fn collect_commit_history(&mut self) {
+        // 上屏联想要用"提交前"的上文：必须抢在 push_composition 之前取 ——
+        // push 之后 latest_text 已是新词，相邻同 kind 记录还可能被合并成一条
+        // （「你」+「好」→「你好」），事后反推不出来（2026-11-08 双神经模型）。
+        self.pre_commit_context = self.commit_history.latest_text();
         self.commit_history
             .push_composition(&self.composition, &self.input);
     }
@@ -583,7 +642,18 @@ impl Context {
         } else {
             ""
         };
-        self.composition.get_preedit(&self.input, self.caret_pos, soft)
+        // 编码框显示「已确认汉字 + 剩余编码」（用户 2026-11-07 长编码需求 A）。
+        // composition.get_preedit 按段切片只认自己的 input——在外层拼最终文本,
+        // 光标/选区偏移整体前移前缀宽度。
+        let mut pre = self.composition.get_preedit(&self.input, self.caret_pos, soft);
+        if !self.committed_prefix.is_empty() {
+            let n = self.committed_prefix.len();
+            pre.text = format!("{}{}", self.committed_prefix, pre.text);
+            pre.caret_pos += n;
+            pre.sel_start += n;
+            pre.sel_end += n;
+        }
+        pre
     }
 
     // ---- options / properties ----
@@ -615,5 +685,65 @@ impl crate::engine::segmentation::Segmentation {
     /// 构造覆盖整段输入的单个段（`Engine::compose` 的简化单段模型用）。
     pub fn segment_zero(len: usize) -> crate::engine::segmentation::Segment {
         crate::engine::segmentation::Segment::new(0, len)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::candidate::Candidate;
+    use crate::engine::commit_history::CommitRecord;
+    use crate::engine::gear::translation::VecTranslation;
+    use crate::engine::menu::Menu;
+    use crate::engine::segmentation::Segment;
+
+    /// 造一个「按给定段位/文本已选中候选」的组合（`collect_commit_history` 只看选中候选）。
+    fn composition_with_selected(kind: &str, spans: &[(&str, usize, usize)], input: &str) -> Composition {
+        let mut comp = Composition::new();
+        comp.segmentation.input = input.to_string();
+        for (text, start, end) in spans {
+            let menu = Menu::new();
+            menu.add_translation(Box::new(VecTranslation::new(vec![Candidate::new(
+                kind, *start, *end, *text, 1.0,
+            )])));
+            let mut seg = Segment::new(*start, *end);
+            seg.status = SegStatus::Selected;
+            seg.menu = Some(menu);
+            seg.selected_index = 0;
+            comp.segmentation.segments.push(seg);
+        }
+        comp
+    }
+
+    /// `pre_commit_context` 必须是「这一帧提交之前」的上文。
+    ///
+    /// 提交后 `latest_text()` 已是新词，而且同帧相邻同 kind 的段会被合并成一条
+    /// （「你」+「好」→「你好」）—— 事后再也反推不出"提交前"在哪结束。
+    #[test]
+    fn pre_commit_context_captures_text_before_this_commit() {
+        let mut ctx = Context::new();
+        // 上一次提交已经上屏「今天」。
+        ctx.commit_history.push(CommitRecord::new("script", "今天"));
+        // 本帧提交「你」「好」两段（同 kind ⇒ 记录成一条「你好」）。
+        ctx.composition = composition_with_selected("script", &[("你", 0, 2), ("好", 2, 5)], "nihao");
+        ctx.input = "nihao".to_string();
+
+        ctx.collect_commit_history();
+        assert_eq!(ctx.pre_commit_context, "今天", "取的是 push 之前的末条文本");
+        assert_eq!(ctx.commit_history.latest_text(), "你好", "同帧同类段合并成一条");
+        assert_eq!(ctx.commit_history.len(), 2, "原有 1 条 + 本次合并出的 1 条");
+    }
+
+    /// 首次提交（历史为空）：`pre_commit_context` 是空串，不 panic、也不留旧值。
+    #[test]
+    fn pre_commit_context_is_empty_for_the_first_commit() {
+        let mut ctx = Context::new();
+        ctx.composition = composition_with_selected("script", &[("好", 0, 3)], "hao");
+        ctx.input = "hao".to_string();
+
+        ctx.collect_commit_history();
+        assert_eq!(ctx.pre_commit_context, "");
+        assert_eq!(ctx.commit_history.latest_text(), "好");
+        assert_eq!(ctx.commit_history.len(), 1);
     }
 }

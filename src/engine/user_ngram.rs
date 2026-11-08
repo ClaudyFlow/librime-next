@@ -317,6 +317,39 @@ impl UserNgram {
         ranked.into_iter().map(|(word, _)| word).collect()
     }
 
+    /// 单个词被上屏的总次数（0 = 没学过）。
+    pub fn unigram_count(&self, word: &str) -> u32 {
+        self.unigram.get(word).map(|entry| entry.count).unwrap_or(0)
+    }
+
+    /// 预测候选的「用户口径」版：`predict` 按转移计数排序后，只留
+    /// **上屏 ≥ `min_count` 次**的多字中文词，并跳过用户删过的词。
+    ///
+    /// 2026-11-07 用户口径：「可以预测一些上屏十次以上的用户词」。
+    /// `predict` 会先截断，所以这里要给它一个够大的池子（64）再按门槛筛。
+    pub fn predict_frequent(
+        &self,
+        before_last: Option<&str>,
+        prev: Option<&str>,
+        limit: usize,
+        min_count: u32,
+    ) -> Vec<String> {
+        let mut out = Vec::with_capacity(limit);
+        for word in self.predict(before_last, prev, 64) {
+            if out.len() >= limit {
+                break;
+            }
+            if word.chars().count() < 2 || !word.chars().any(is_cjk_char) {
+                continue;
+            }
+            if self.is_blocked(&word) || self.unigram_count(&word) < min_count {
+                continue;
+            }
+            out.push(word);
+        }
+        out
+    }
+
     /// 超上限时按最久未用淘汰，直到回到上限以内。
     fn evict_if_needed(&mut self) {
         while self.bigram.len() > MAX_PAIRS {
@@ -419,7 +452,63 @@ mod tests {
         assert!(!is_blocked_global("是"), "全局查询也对单字兜底");
     }
 
-    /// 不改用户数据文件：加载侧跳过单字 `x` 行，让历史脏数据自愈。
+    /// 选哪个词作下文「预测候选」：只放上屏 ≥10 次的词（插进 `unigram`/`bigram` 造统计）。
+    ///
+    /// 必须同时有正负样本：只测「9 次不出」会让门槛写坏（比如恒返回空）也全绿。
+    #[test]
+    fn predict_frequent_requires_ten_commits() {
+        fn seed(ngram: &mut UserNgram, word: &str, count: u32, transition: u32) {
+            ngram.unigram.insert(
+                word.to_string(),
+                PairCount { count, last_used: 0 },
+            );
+            ngram.bigram.insert(
+                ("然后".to_string(), word.to_string()),
+                PairCount { count: transition, last_used: 0 },
+            );
+        }
+        let mut ngram = UserNgram::new();
+        seed(&mut ngram, "现在", 9, 50); // 差一次：不推
+        seed(&mut ngram, "这个", 10, 5); // 正好到门槛：推
+        seed(&mut ngram, "单", 30, 60); // 单字：不推
+        seed(&mut ngram, "hello", 30, 60); // 非中文：不推
+        let got = ngram.predict_frequent(None, Some("然后"), PREDICT_LIMIT, PREDICT_MIN_COUNT);
+        assert_eq!(
+            got,
+            vec!["这个".to_string()],
+            "9 次不出、10 次出、单字与非中文不出；实际 {got:?}"
+        );
+        // 用户删过的词（黑名单）即使次数够也不推。
+        ngram.penalize("这个");
+        assert!(
+            ngram
+                .predict_frequent(None, Some("然后"), PREDICT_LIMIT, PREDICT_MIN_COUNT)
+                .is_empty(),
+            "黑名单词不进预测"
+        );
+    }
+
+    /// 没有上文（历史不足）时宁可空着，也不做无约束瞎猜。
+    #[test]
+    fn predictions_without_context_are_empty() {
+        let context = crate::engine::context::Context::new();
+        assert!(predictions_for_context(&context).is_empty());
+    }
+
+    /// 提交历史的接线：`predictions_for_context` 读的就是 `last_two_words` 那套口径
+    /// （raw/单字不进上下文）。这里只钉住取词，不依赖进程级全局表。
+    #[test]
+    fn prediction_context_uses_last_two_menu_words() {
+        let mut history = CommitHistory::new();
+        history.push(CommitRecord::new("raw", "hello"));
+        history.push(CommitRecord::new("test", "的"));
+        history.push(CommitRecord::new("test", "天气"));
+        history.push(CommitRecord::new("test", "很好"));
+        let (before, prev) = last_two_words(&history);
+        assert_eq!(prev.as_deref(), Some("很好"));
+        assert_eq!(before.as_deref(), Some("天气"));
+    }
+
     #[test]
     fn load_self_heals_legacy_single_char_block_rows() {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -481,6 +570,38 @@ pub fn learn_and_maybe_flush(words: &[String]) {
         if ngram.should_flush() {
             let _ = ngram.save(&store_path());
         }
+    }
+}
+
+/// 预测候选的门槛：只推**用户已经上屏 ≥10 次**的多字词（2026-11-07 用户口径）。
+pub const PREDICT_MIN_COUNT: u32 = 10;
+
+/// 一次最多推几条（联想条一行放得下；2026-11-08 双神经模型对齐成 4 条）。
+pub const PREDICT_LIMIT: usize = 4;
+
+/// 判断一个字符是不是 CJK 统一汉字（预测候选只收中文词）。
+fn is_cjk_char(c: char) -> bool {
+    ('\u{4E00}'..='\u{9FFF}').contains(&c)
+}
+
+/// `apply_commit` 用：按提交历史最后两个词预测下一个词，套用户门槛（上屏 ≥10 次）。
+///
+/// 2026-11-07 用户原话：「学习得还是很慢，可以预测一些上屏十次以上的用户词」。
+/// 没上文（历史不足一个词）时不做无约束瞎猜，返回空——青简删掉「上屏后联想」
+/// 的理由就是没有拼音约束的纯猜；加上上文约束后才是这条链路成立的边界。
+pub fn predictions_for_context(context: &crate::engine::context::Context) -> Vec<String> {
+    let (before_last, prev) = last_two_words(&context.commit_history);
+    let Some(prev) = prev else {
+        return Vec::new();
+    };
+    match global().lock() {
+        Ok(ngram) => ngram.predict_frequent(
+            before_last.as_deref(),
+            Some(prev.as_str()),
+            PREDICT_LIMIT,
+            PREDICT_MIN_COUNT,
+        ),
+        Err(_) => Vec::new(),
     }
 }
 

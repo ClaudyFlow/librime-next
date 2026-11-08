@@ -383,6 +383,45 @@ impl Engine {
                 crate::engine::user_ngram::learn_and_maybe_flush(&words);
             }
         }
+        // 上屏后联想（2026-11-07 口径「预测一些上屏十次以上的用户词」；
+        // 2026-11-08 双神经模型：联想条 4 条 = key2 + desk2，kkdd 分块）。
+        //
+        // 神经预测**同步**算（上一棒实测 key 17ms + desk 71ms ≈ 77ms/次提交，
+        // 用户认可）——联想条必须和上屏同一帧出现，异步重绘方案已被否。
+        // 神经不可用/给不出结果时回退个人 n-gram（口径在 `predict_frequent`：
+        // 只留上屏 ≥10 次的多字中文词），由 c_api 经 `RimeContext.predictions`
+        // 交给宿主画联想条。
+        //
+        // 神经的输入是「提交前的上文 + 刚上屏的词」拼成的一整段**已上屏文本**：
+        // * 词取**提交历史**末条 —— 那才是真正上屏的中文；`take_commit_elements`
+        //   的词条对整句/部分确认可能给原始编码（2026-11-01 踩过）。
+        // * 上文取 `pre_commit_context`（`collect_commit_history` 在 push 之前
+        //   抢存：提交后 latest_text 已是新词，相邻同类段还会合并成一条）。
+        // 2026-11-08 修「预测重复刚上屏的文字」：旧实现把 word 当续写 prefix，
+        // 结果每条都是「word + 续写」（「你好」→「你好像是」）。现在 prefix 留空、
+        // 整段文本当 context，模型直接生成**下一个词**；合并层再把 word 本身剔掉。
+        // 空词/非中文/单字不跑神经（单字联想噪声大，且每次要付 ~77ms）。
+        let word = self
+            .context
+            .commit_history
+            .last()
+            .map(|record| record.text.clone())
+            .unwrap_or_default();
+        let neural = if is_neural_predict_word(&word) {
+            let context = format!("{}{}", self.context.pre_commit_context, word);
+            crate::engine::gear::rescore::predict_sync(&context, &word, 4)
+        } else {
+            Vec::new()
+        };
+        self.context.predictions = if neural.is_empty() {
+            crate::engine::user_ngram::predictions_for_context(&self.context)
+        } else {
+            neural
+                .into_iter()
+                .map(|(text, _score)| text)
+                .take(4)
+                .collect()
+        };
         // 同样的借用规避：`memorize` 要 `&mut self`，先把列表取到局部
         let mut translators = std::mem::take(&mut self.translators);
         // 提交历史按值拷一份（≤20 条）：`translators` 已经移出 `self`，
@@ -861,4 +900,13 @@ impl Engine {
             swallow_next_space: false,
         }
     }
+}
+
+/// 上屏联想条的神经预测只对「多字中文词」出手：单字/纯西文/标点没有"下一个词"
+/// 的语境，而且提交路径上每次要付 ~77ms（见 [`Engine::apply_commit`]），不值得。
+fn is_neural_predict_word(word: &str) -> bool {
+    word.chars().count() > 1
+        && word
+            .chars()
+            .any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c))
 }

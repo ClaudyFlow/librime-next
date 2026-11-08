@@ -22,7 +22,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
-use super::neural::{predict_extensions, rerank_order, LazySentenceModel, PredictOptions, RerankOptions};
+use super::neural::{
+    predict_extensions, rerank_order, LazySentenceModel, PredictOptions, RerankOptions,
+    SentenceModel,
+};
 
 /// 结果表只是给「同一次输入被重查一遍」兜底的,不是长期缓存:装满就整张丢掉,
 /// 比维护 LRU 简单,代价也只是重算一次。
@@ -82,36 +85,134 @@ pub struct RescoreWorker {
     generation: std::sync::atomic::AtomicU64,
 }
 
-/// 神经打分器:模型 + 重排选项。`SentenceModel` 自身线程安全
-/// (内部 prefix 缓存有锁),所以一个打分器跨线程共享。
+/// 神经打分器：双模型 + 两套选项。`SentenceModel` 自身线程安全
+/// （内部 prefix 缓存有锁），所以一个打分器跨线程共享。
+///
+/// # 双模型（2026-11-08 用户口径）
+///
+/// 同时启用两个大小不同的模型：
+///
+/// * key —— 小号键盘模型（`model/sentence-model.safetensors`，6 层 4.5MB）。
+///   提交路径要快，所以 `score_text` 用它；打字预测它是主力。
+/// * desk —— 大号桌面模型（`model/sentence-model-desktop.safetensors`，8 层 25MB）。
+///   质量更好但一轮几十到几百毫秒，只放在**异步**重排上（不挡按键）；预测也掺一半。
+///
+/// 只有 desk、没有 key 时退化成单模型（与旧版一致）：desk 装进 key 槽，
+/// `desk_model` 留空，重排/打分/预测全走它。
 pub struct NeuralScorer {
-    model: LazySentenceModel,
+    /// 小号键盘模型（主模型）。单模型退化时这里装的可能是 desktop。
+    key_model: Option<LazySentenceModel>,
+    /// 大号桌面模型；`None` = 数据根里没有，重排回退 key。
+    desk_model: Option<LazySentenceModel>,
     pub options: RerankOptions,
     /// 续写预测的参数(与重排各管一套:一个决定"排哪条",一个决定"续什么")。
     pub predict_options: PredictOptions,
 }
 
 impl NeuralScorer {
+    /// 单模型构造（旧行为）：一个模型管打分/重排/预测，`desk` 槽留空。
     pub fn new(model_path: impl Into<std::path::PathBuf>) -> Self {
         Self {
-            model: LazySentenceModel::new(model_path),
+            key_model: Some(LazySentenceModel::new(model_path)),
+            desk_model: None,
             options: RerankOptions::default(),
             predict_options: PredictOptions::default(),
         }
     }
 
-    /// 对每个前缀做短续写,返回 `(完整文本 = 前缀 + 续写, 平均对数概率)`。
+    /// 双模型构造：key/desk 各自可以为 `None`（缺哪个就少哪条腿）。
+    fn from_paths(
+        key: Option<std::path::PathBuf>,
+        desk: Option<std::path::PathBuf>,
+    ) -> Self {
+        Self {
+            key_model: key.map(LazySentenceModel::new),
+            desk_model: desk.map(LazySentenceModel::new),
+            options: RerankOptions::default(),
+            predict_options: PredictOptions::default(),
+        }
+    }
+
+    /// 打分用的模型：key 优先；key 缺失时退到 desk（只有 desk 的单模型退化）。
+    fn score_model(&self) -> Option<Arc<SentenceModel>> {
+        self.key_model
+            .as_ref()
+            .and_then(|model| model.get())
+            .or_else(|| self.desk_model.as_ref().and_then(|model| model.get()))
+            .cloned()
+    }
+
+    /// 重排用的模型：desk 优先（质量高），desk 缺失/加载失败回退 key。
+    fn rerank_model(&self) -> Option<Arc<SentenceModel>> {
+        self.desk_model
+            .as_ref()
+            .and_then(|model| model.get())
+            .or_else(|| self.key_model.as_ref().and_then(|model| model.get()))
+            .cloned()
+    }
+
+    /// 对每个前缀做短续写，返回 `(完整文本 = 前缀 + 续写, 平均对数概率)`。
     ///
     /// 模型缺失时返回空表 —— 调用方按"没有预测"处理,不影响原有候选。
+    /// 双模型各跑一遍，再按 [`merge_predictions`] 的配额合并。
     fn predict(&self, context: &str, prefixes: &[String]) -> Vec<(String, f64)> {
-        let Some(model) = self.model.get() else {
+        self.predict_merged(context, prefixes, self.predict_options.max_results, "")
+    }
+
+    /// 上屏联想条专用同步预测（对外入口见 [`predict_sync`]）。
+    ///
+    /// `context` 是**已上屏文本**（提交前上文 + 刚上屏的词），`excluded` 是
+    /// 刚上屏的词本身。prefix 留空让模型从 context 末尾直接生成「下一个词」，
+    /// 再由合并层把 `excluded` 从结果里剔掉 —— 联想条不再重复刚上屏的文字
+    /// （2026-11-08 用户反馈）。打字时候选窗的预测仍走 `predict` + 非空 anchors。
+    fn predict_sync(&self, context: &str, excluded: &str, total: usize) -> Vec<(String, f64)> {
+        if context.is_empty() || total == 0 {
+            return Vec::new();
+        }
+        self.predict_merged(context, &[String::new()], total, excluded)
+    }
+
+    /// 双模型合并预测的公共路径。
+    ///
+    /// 两个模型各跑 `predict_extensions`（**多要一点**：去重与"配额不足换另一个
+    /// 模型补齐"都需要余量），再把完整词条交给 [`merge_predictions`] 按配额排。
+    /// `excluded` 非空时走 [`merge_predictions_excluding`]（上屏联想条用）。
+    fn predict_merged(
+        &self,
+        context: &str,
+        prefixes: &[String],
+        total: usize,
+        excluded: &str,
+    ) -> Vec<(String, f64)> {
+        if prefixes.is_empty() || total == 0 {
+            return Vec::new();
+        }
+        // 每个模型先按 2*total 收：够"各模型配额 + 去重损耗 + 补齐"用。
+        let want = total.saturating_mul(2);
+        let key = self.predict_with(self.key_model.as_ref(), context, prefixes, want);
+        let desk = self.predict_with(self.desk_model.as_ref(), context, prefixes, want);
+        merge_predictions_excluding(&key, &desk, total, excluded)
+    }
+
+    /// 一个模型对所有前缀做续写，拼成完整词条、去重、按平均分排序后截断。
+    ///
+    /// 返回的是**完整文本**（前缀 + 续出的那段）：`predict_extensions` 只给续出的
+    /// 部分，联想条/候选窗要的是整词。
+    fn predict_with(
+        &self,
+        model: Option<&LazySentenceModel>,
+        context: &str,
+        prefixes: &[String],
+        max_results: usize,
+    ) -> Vec<(String, f64)> {
+        let Some(model) = model.and_then(|model| model.get()).cloned() else {
             return Vec::new();
         };
+        let mut options = self.predict_options.clone();
+        options.max_results = max_results;
         let mut out: Vec<(String, f64)> = Vec::new();
         for prefix in prefixes {
-            for (extension, score) in
-                predict_extensions(model, context, prefix, &self.predict_options)
-            {
+            for (extension, score) in predict_extensions(&model, context, prefix, &options) {
                 let text = format!("{prefix}{extension}");
                 if text == *prefix || out.iter().any(|(existing, _)| *existing == text) {
                     continue;
@@ -120,7 +221,7 @@ impl NeuralScorer {
             }
         }
         out.sort_by(|a, b| b.1.total_cmp(&a.1));
-        out.truncate(self.predict_options.max_results);
+        out.truncate(max_results);
         out
     }
 
@@ -132,11 +233,111 @@ impl NeuralScorer {
         sentences: &[String],
         static_scores: &[f64],
     ) -> Vec<usize> {
-        let Some(model) = self.model.get() else {
+        let Some(model) = self.rerank_model() else {
             return Vec::new();
         };
-        rerank_order(model, context, sentences, static_scores, &self.options)
+        rerank_order(&model, context, sentences, static_scores, &self.options)
     }
+}
+
+/// 双模型预测结果的配额合并（纯函数，便于单测）。
+///
+/// 用户 2026-11-08 拍板（"kkdd"）：**先 key 后 desk 分块**，不再交替。
+/// * 打字时的预测条（总数 3）= key 2 + desk 1，顺序 `k0,k1,d0`；
+/// * 上屏后联想条（总数 4）= key 2 + desk 2，顺序 `k0,k1,d0,d1`；
+/// * 一般规则：key 拿 `ceil(total/2)`（**奇数余数给 key**），desk 拿 `floor(total/2)`。
+///
+/// 补充规则：
+/// * 同文本去重，保留**第一次出现**（key 段先到先得，desk 段遇重复顺延）；
+/// * 配额内某个模型凑不够时，用另一个模型的剩余结果补齐，最多 `total` 条；
+/// * 只有 key / 只有 desk 时等价于单模型截断；两个都空就返回空表。
+pub(crate) fn merge_predictions(
+    key: &[(String, f64)],
+    desk: &[(String, f64)],
+    total: usize,
+) -> Vec<(String, f64)> {
+    if total == 0 {
+        return Vec::new();
+    }
+    let key_quota = total.div_ceil(2);
+    let desk_quota = total / 2;
+    let mut out: Vec<(String, f64)> = Vec::with_capacity(total);
+    let mut key_cursor = 0usize;
+    let mut desk_cursor = 0usize;
+
+    // 第一段：key 先占满自己的配额（奇数余数也归它）。
+    // out 这一段全来自 key，故 out.len() 就等于已取的 key 条数。
+    while out.len() < key_quota {
+        match take_next(key, &mut key_cursor, &out) {
+            Some(item) => out.push(item),
+            // key 料用完：剩下的位子交给 desk 段与补齐阶段。
+            None => break,
+        }
+    }
+    // 第二段：desk 占自己的配额（key 段已定序，desk 只往后排）。
+    let mut desk_taken = 0usize;
+    while desk_taken < desk_quota && out.len() < total {
+        match take_next(desk, &mut desk_cursor, &out) {
+            Some(item) => {
+                out.push(item);
+                desk_taken += 1;
+            }
+            None => break,
+        }
+    }
+    // 配额内不足：用剩余结果补齐（key 优先，与"奇数余数给 key"的口径一致）。
+    while out.len() < total {
+        if let Some(item) = take_next(key, &mut key_cursor, &out) {
+            out.push(item);
+            continue;
+        }
+        match take_next(desk, &mut desk_cursor, &out) {
+            Some(item) => out.push(item),
+            None => break,
+        }
+    }
+    out
+}
+
+/// 上屏联想条专用合并：额外把「刚上屏的词」本身排除掉。
+///
+/// 2026-11-08 用户反馈「预测怎么还会重复刚上屏的文字」。根因是旧实现把
+/// 刚上屏词当 prefix 续写，结果每条都是「上屏词 + 续写」（「你好」→「你好像是」）。
+/// 现在 prefix 留空、上屏词并入 context，模型直接生成下一词；这里再兜一道底，
+/// 把模型偶尔又生成的上屏词本身剔掉，**且不占 `total` 配额**（kkdd 仍严格 2+2）。
+pub(crate) fn merge_predictions_excluding(
+    key: &[(String, f64)],
+    desk: &[(String, f64)],
+    total: usize,
+    excluded: &str,
+) -> Vec<(String, f64)> {
+    if excluded.is_empty() {
+        return merge_predictions(key, desk, total);
+    }
+    let strip = |list: &[(String, f64)]| -> Vec<(String, f64)> {
+        list.iter()
+            .filter(|(text, _)| text != excluded)
+            .cloned()
+            .collect()
+    };
+    merge_predictions(&strip(key), &strip(desk), total)
+}
+
+/// 从 `list[*cursor..]` 里取下一个不与 `out` 重复的预测条目
+/// （[`merge_predictions`] 的核心小工具）。
+fn take_next(
+    list: &[(String, f64)],
+    cursor: &mut usize,
+    out: &[(String, f64)],
+) -> Option<(String, f64)> {
+    while *cursor < list.len() {
+        let item = &list[*cursor];
+        *cursor += 1;
+        if !out.iter().any(|(text, _)| *text == item.0) {
+            return Some(item.clone());
+        }
+    }
+    None
 }
 
 /// 结果键:`\x01` 不会出现在 UTF-8 文本里,拿它当分隔符不会把两批不同的
@@ -162,30 +363,61 @@ static GLOBAL: std::sync::RwLock<Option<Arc<RescoreWorker>>> = std::sync::RwLock
 
 /// 在数据根里找模型文件并初始化全局 worker(已有 worker 时直接短路)。
 ///
-/// **keyboard(6层) 优先**——2026-10-31 基准(`example/neural_bench`):
-/// 重排一轮暖缓存 60~170ms;desktop(8层) 293~858ms,质量更好但一轮要吃掉
-/// 半个打字停顿,只适合显式放置它的用户。都没有就保持 `None`
-/// ——整个神经重排层静默关闭,输入法照常工作。
+/// # 双模型(2026-11-08 用户口径)
+///
+/// * `model/sentence-model.safetensors` —— 小号键盘模型(key,6 层 4.5MB);
+/// * `model/sentence-model-desktop.safetensors` —— 大号桌面模型(desk,8 层 25MB)。
+///
+/// 两个可以来自**不同**数据根(用户目录覆盖共享目录),所以每个 root 都分别找、
+/// 各自取第一个命中。**key 优先**:找到 key 才启用双模型;只有 desk 时把 desk
+/// 当单模型启用(与旧版一致——旧版 desk 就是 fallback 单模型);两个都没有就保持
+/// `None` —— 整个神经层静默关闭,输入法照常工作。
 pub fn init_from_data_roots(roots: &[std::path::PathBuf]) {
     if global().is_some() {
         return;
     }
-    const CANDIDATES: &[&str] = &[
-        "model/sentence-model.safetensors",
-        "model/sentence-model-desktop.safetensors",
-    ];
+    const KEY_MODEL: &str = "model/sentence-model.safetensors";
+    const DESK_MODEL: &str = "model/sentence-model-desktop.safetensors";
     let mut slot = GLOBAL.write().expect("rescore 全局表毒化不可恢复");
     if slot.is_some() {
         return;
     }
+    let (mut key_path, mut desk_path) = (None, None);
     for root in roots {
-        for name in CANDIDATES {
-            let path = root.join(name);
+        if key_path.is_none() {
+            let path = root.join(KEY_MODEL);
             if path.is_file() {
-                *slot = Some(RescoreWorker::new_singleton(NeuralScorer::new(path)));
-                return;
+                key_path = Some(path);
             }
         }
+        if desk_path.is_none() {
+            let path = root.join(DESK_MODEL);
+            if path.is_file() {
+                desk_path = Some(path);
+            }
+        }
+    }
+    match (key_path, desk_path) {
+        (Some(key), desk) => {
+            // 部署核验用:日志里能直接看到 desk 路径,证明双模型都找到了。
+            tracing::info!(
+                key = %key.display(),
+                desk = ?desk.as_ref().map(|path| path.display().to_string()),
+                "rescore: 神经模型已加载（key + desk）"
+            );
+            *slot = Some(RescoreWorker::new_singleton(NeuralScorer::from_paths(
+                Some(key),
+                desk,
+            )));
+        }
+        (None, Some(desk)) => {
+            tracing::info!(
+                model = %desk.display(),
+                "rescore: 没有小号键盘模型,desktop 模型按单模型启用"
+            );
+            *slot = Some(RescoreWorker::new_singleton(NeuralScorer::new(desk)));
+        }
+        (None, None) => {}
     }
 }
 
@@ -193,11 +425,29 @@ pub fn init_from_data_roots(roots: &[std::path::PathBuf]) {
 ///
 /// **只给上屏路径用**：一次提交算一次，不在按键路径上。预测/重排另有异步通道，
 /// 不要拿它俩去调这个函数——那是把几十毫秒塞进按键预算。
+/// 双模型下用 **key**（小号模型）：提交路径要快。
 pub fn score_text(context: &str, text: &str) -> Option<f64> {
     let worker = global()?;
-    let model = worker.scorer.model.get()?;
+    let model = worker.scorer.score_model()?;
     let scores = model.score_sentences(context, &[text]);
     scores.first().copied()
+}
+
+/// 同步跑一次双模型合并预测——**只给上屏后的联想条用**（2026-11-08 用户口径：
+/// 联想条 4 条 = key2 + desk2，kkdd 顺序）。
+///
+/// `context` = 已上屏文本（提交前上文 + 刚上屏的词），`excluded` = 刚上屏的词。
+/// prefix 留空让模型从 context 末尾直接生成「下一个词」，并把 `excluded` 从
+/// 结果里剔掉，避免联想条重复刚上屏的文字。
+///
+/// 逐字自回归要几十毫秒（上一棒实测默认参数 key 17ms + desk 71ms ≈ 77ms/次提交），
+/// 用户认可放在提交路径上同步算 —— 联想条必须和上屏同一帧出现，异步重绘方案已被否。
+/// **别拿它上按键路径。** worker/模型不可用 → 空表，调用方回退个人 n-gram。
+pub fn predict_sync(context: &str, excluded: &str, total: usize) -> Vec<(String, f64)> {
+    let Some(worker) = global() else {
+        return Vec::new();
+    };
+    worker.scorer.predict_sync(context, excluded, total)
 }
 
 /// 全局 worker 的共享句柄;未初始化(没有模型)时返回 `None`。
@@ -406,5 +656,164 @@ impl RescoreWorker {
             owner.generation.fetch_add(1, Ordering::Release);
             // 回到外圈前降级;worker 若已被丢弃(测试场景),下轮 upgrade 失败退出。
         }
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::{merge_predictions, merge_predictions_excluding};
+
+    /// 造一组 `(完整词条, 分数)`：文本按 `prefix` 编号、分数递减，便于断言顺序。
+    fn pairs(prefix: &str, n: usize) -> Vec<(String, f64)> {
+        (0..n)
+            .map(|i| (format!("{prefix}{i}"), -(i as f64)))
+            .collect()
+    }
+
+    fn texts(items: &[(String, f64)]) -> Vec<&str> {
+        items.iter().map(|(text, _)| text.as_str()).collect()
+    }
+
+    /// 打字预测口径：总数 3 ⇒ key 2 + desk 1，kkdd 分块 `k0,k1,d0`。
+    #[test]
+    fn two_models_total_three_is_key_key_desk() {
+        let key = pairs("k", 3);
+        let desk = pairs("d", 3);
+        let merged = merge_predictions(&key, &desk, 3);
+        assert_eq!(texts(&merged), vec!["k0", "k1", "d0"]);
+    }
+
+    /// 联想条口径：总数 4 ⇒ key 2 + desk 2，用户 2026-11-08 "kkdd" 拍板。
+    #[test]
+    fn two_models_total_four_is_kkdd() {
+        let key = pairs("k", 3);
+        let desk = pairs("d", 3);
+        let merged = merge_predictions(&key, &desk, 4);
+        assert_eq!(texts(&merged), vec!["k0", "k1", "d0", "d1"]);
+        // 总数 2：key 1 + desk 1。
+        assert_eq!(texts(&merge_predictions(&key, &desk, 2)), vec!["k0", "d0"]);
+    }
+
+    /// 一般规则：奇数余数给 key（key 拿 ceil、desk 拿 floor），先 key 后 desk。
+    #[test]
+    fn odd_remainder_goes_to_key() {
+        let key = pairs("k", 5);
+        let desk = pairs("d", 5);
+        let merged = merge_predictions(&key, &desk, 5);
+        assert_eq!(texts(&merged), vec!["k0", "k1", "k2", "d0", "d1"]);
+        assert_eq!(merged.len(), 5);
+    }
+
+    /// 只有 key：等价单模型截断（打字 3 条 / 联想 4 条）。
+    #[test]
+    fn only_key_truncates_to_total() {
+        let key = pairs("k", 6);
+        assert_eq!(texts(&merge_predictions(&key, &[], 3)), vec!["k0", "k1", "k2"]);
+        assert_eq!(
+            texts(&merge_predictions(&key, &[], 4)),
+            vec!["k0", "k1", "k2", "k3"]
+        );
+    }
+
+    /// 只有 desk：同样按单模型截断（desk-only 退化路径）。
+    #[test]
+    fn only_desk_truncates_to_total() {
+        let desk = pairs("d", 6);
+        assert_eq!(texts(&merge_predictions(&[], &desk, 3)), vec!["d0", "d1", "d2"]);
+        assert_eq!(
+            texts(&merge_predictions(&[], &desk, 4)),
+            vec!["d0", "d1", "d2", "d3"]
+        );
+    }
+
+    /// 两个模型都没预测（或 total=0）⇒ 空表，调用方回退个人 n-gram。
+    #[test]
+    fn empty_inputs_yield_empty() {
+        assert!(merge_predictions(&[], &[], 4).is_empty());
+        assert!(merge_predictions(&pairs("k", 3), &pairs("d", 3), 0).is_empty());
+        assert!(merge_predictions(&[], &[], 0).is_empty());
+    }
+
+    /// 同文本去重：保留第一次出现（key 段先到先得），desk 的重复项顺延。
+    #[test]
+    fn duplicate_texts_keep_first_occurrence() {
+        let key = vec![("同".to_string(), -0.1), ("甲".to_string(), -0.2)];
+        let desk = vec![("同".to_string(), -0.3), ("乙".to_string(), -0.4)];
+        let merged = merge_predictions(&key, &desk, 4);
+        assert_eq!(
+            texts(&merged),
+            vec!["同", "甲", "乙"],
+            "desk 的「同」是重复项，被跳过并顺延到下一条"
+        );
+        // 分数跟着各自的模型走，没有被合并/重算。
+        assert_eq!(merged[0].1, -0.1);
+        assert_eq!(merged[2].1, -0.4);
+    }
+
+    /// 配额不足补齐：key 只有 1 条时，联想条 4 个位子由 desk 的剩余结果填满。
+    #[test]
+    fn short_key_quota_is_filled_from_desk() {
+        let key = pairs("k", 1);
+        let desk = pairs("d", 4);
+        let merged = merge_predictions(&key, &desk, 4);
+        assert_eq!(merged.len(), 4);
+        assert_eq!(texts(&merged), vec!["k0", "d0", "d1", "d2"]);
+    }
+
+    /// 反向补齐：desk 只有 1 条时由 key 的剩余结果填满（key 段已在最前）。
+    #[test]
+    fn short_desk_quota_is_filled_from_key() {
+        let key = pairs("k", 4);
+        let desk = pairs("d", 1);
+        let merged = merge_predictions(&key, &desk, 4);
+        assert_eq!(merged.len(), 4);
+        assert_eq!(texts(&merged), vec!["k0", "k1", "d0", "k2"]);
+    }
+
+    /// 两个模型给得比总数多：只取配额，不把另一模型的剩余塞进来（除非配额不足）。
+    #[test]
+    fn surplus_is_truncated_to_quota() {
+        let key = pairs("k", 8);
+        let desk = pairs("d", 8);
+        let merged = merge_predictions(&key, &desk, 3);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(texts(&merged), vec!["k0", "k1", "d0"]);
+    }
+
+    /// 上屏联想条：刚上屏的词不进结果、也不占配额（kkdd 仍严格 2+2）。
+    ///
+    /// 守 2026-11-08 用户反馈「预测怎么还会重复刚上屏的文字」。
+    #[test]
+    fn excluded_word_does_not_consume_quota() {
+        let key = vec![
+            ("你好".to_string(), -0.1), // 刚上屏的词，必须剔掉
+            ("k0".to_string(), -0.2),
+            ("k1".to_string(), -0.3),
+        ];
+        let desk = vec![
+            ("你好".to_string(), -0.4),
+            ("d0".to_string(), -0.5),
+            ("d1".to_string(), -0.6),
+        ];
+        assert_eq!(
+            texts(&merge_predictions_excluding(&key, &desk, 4, "你好")),
+            vec!["k0", "k1", "d0", "d1"]
+        );
+        // 空排除词 = 原行为（打字时候选窗的预测走这条）。
+        assert_eq!(
+            texts(&merge_predictions_excluding(&key, &desk, 4, "")),
+            vec!["你好", "k0", "d0", "d1"]
+        );
+    }
+
+    /// 排除词只在一侧出现时，另一侧配额不受影响。
+    #[test]
+    fn excluded_word_only_on_one_side() {
+        let key = vec![("你好".to_string(), -0.1), ("k0".to_string(), -0.2)];
+        let desk = pairs("d", 2);
+        assert_eq!(
+            texts(&merge_predictions_excluding(&key, &desk, 3, "你好")),
+            vec!["k0", "d0", "d1"]
+        );
     }
 }

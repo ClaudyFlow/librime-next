@@ -60,6 +60,23 @@ impl Session {
         ok
     }
 
+    /// 直拟上屏（符号面板/剪贴板点击）：不经组合直接把文本放进提交位，
+    /// 宿主下一次 `get_commit` 取走。无需组字态，组合里的内容不受影响——
+    /// 若正在组字，先整体上屏原组合再补提交这段文本（和真人打字衔接一致）。
+    pub fn commit_string(&mut self, text: &str) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+        if let Some(engine) = &mut self.engine
+            && engine.context.is_composing()
+        {
+            // 组字中：先把当前组合完整提交，再直拟符号。
+            let _ = self.commit_composition();
+        }
+        self.commit_text = Some(text.to_string());
+        true
+    }
+
     /// 神经重排结果落地检查(见 `Engine::poll_rescore_landing`):宿主每次
     /// 读上下文前调一次,后台分算完就把当前列表换成神经顺序。
     pub fn poll_rescore_landing(&mut self) {

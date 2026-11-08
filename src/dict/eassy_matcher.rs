@@ -227,13 +227,35 @@ fn collect(dir: &Path, out: &mut Vec<(String, f64)>, depth: usize) {
             collect(&path, out, depth + 1);
             continue;
         }
-        if path.extension().and_then(|e| e.to_str()) != Some("txt") {
+        // 词源只认 YAML(用户 2026-11-08 定版):三行头 + 词	频 行。
+        // 基础语料 essay.txt 已迁移为 essay.yaml。
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        if ext.as_deref() != Some("yaml") {
             continue;
         }
+        let is_yaml = true;
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        for line in text.lines() {
+        let mut cleaned = text.to_string();
+        if is_yaml {
+            // Rime YAML 头:从 `---` 行之后开始取词条;没有 `...` 收尾也要稳。
+            // (实机文件头 = "# Rime Eassy / # encode: utf-8 / # newline: lf / ---")
+            if let Some(i) = cleaned.find("\n---") {
+                cleaned = cleaned[i + 4..].to_string();
+            } else if cleaned.starts_with("---") {
+                cleaned = cleaned[3..].to_string();
+            }
+            cleaned = cleaned
+                .lines()
+                .skip_while(|line| line.trim() == "..." || line.starts_with('#'))
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+        for line in cleaned.lines() {
             let mut parts = line.split('\t');
             let Some(word) = parts.next() else { continue };
             if word.is_empty() || word.starts_with('#') {

@@ -173,13 +173,20 @@ fn predictable(character: char) -> bool {
 ///
 /// 小束搜索:`max_new` 步、每步留 `beam` 条,按**平均**对数概率裁剪 ——
 /// 平均是为了让不同长度的假设可比。只用 `prefix` 当锚点,不负责从零造整句。
+///
+/// **2026-11-08 起 `prefix` 允许为空**：此时直接拿 `context` 当上文、生成
+/// 的就是「下一个词」，专供上屏联想条。旧实现把刚上屏的词当 prefix 续写，
+/// 结果每条都是「上屏词 + 续写」（「你好」→「你好像是」），用户反馈
+/// 「预测怎么还会重复刚上屏的文字」。改成空 prefix 后，刚上屏的词并入
+/// `context`，模型从已上屏文本末尾直接生成下一词，不再重复。
+/// 打字时候选窗的预测仍传非空 anchors，行为不变。
 pub fn predict_extensions(
     model: &SentenceModel,
     context: &str,
     prefix: &str,
     options: &PredictOptions,
 ) -> Vec<(String, f64)> {
-    if options.max_new == 0 || options.beam == 0 || prefix.is_empty() {
+    if options.max_new == 0 || options.beam == 0 {
         return Vec::new();
     }
     let context = last_characters(context, options.context_chars);

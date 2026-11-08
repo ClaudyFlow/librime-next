@@ -522,6 +522,9 @@ fn punctuation_is_translated(engine: &Engine, tag: &str) -> bool {
 
 impl Processor for Punctuator {
     fn process_key_event(&mut self, engine: &mut Engine, key: &KeyEvent) -> ProcessResult {
+        if !key.release() && key.keycode < 0x80 {
+            tracing::info!("[键] keycode={:#x} 组字={}", key.keycode, engine.context.has_menu());
+        }
         if key.release() || key.ctrl() || key.alt() || (key.modifier & K_SUPER_MASK != 0) {
             return ProcessResult::Noop;
         }
@@ -533,6 +536,35 @@ impl Processor for Punctuator {
             return ProcessResult::Noop;
         }
         let byte = ch as u8;
+
+        // ⓪ 组字中有候选时的逗号/句号（用户 2026-11-08 定版 A 语义）：
+        //    逗号 = 高亮在第一位→上屏,否则**上移一个**;句号 = **下移一个**。
+        //    必须放在一切标点处理之前——punctuator 在编辑器之前,不然永远轮不到。
+        //    ⚠️ 这里不能再用 `move_highlight(∓page)`：用户 02:52「一个个移动候选」，
+        //    04:45 又报「逗号上屏没了」——两条合起来就是本段（首位上屏 + 逐格移动）。
+        //    宿主 `Rime-Next/default.yaml` 的 key_binder **不能**再引用
+        //    `paging_with_comma_period`，否则 key_binder 先吃键，本段不可达。
+        if (ch == 0x2c || ch == 0x2e) && engine.context.has_menu() {
+            let page = engine.context.page_size.max(1);
+            tracing::info!(
+                "[逗句] ch={ch:#x} 高亮={} 页宽={page}",
+                engine.context.highlight_index()
+            );
+            if ch == 0x2c {
+                if engine.context.highlight_index() == 0 {
+                    let index = engine.context.highlight_index();
+                    let _ = engine.context.select(index);
+                    tracing::info!("[逗句] 首位→上屏");
+                } else {
+                    engine.context.move_highlight(-1);
+                    tracing::info!("[逗句] 上移一个 → 高亮={}", engine.context.highlight_index());
+                }
+            } else {
+                engine.context.move_highlight(1);
+                tracing::info!("[逗句] 下移一个 → 高亮={}", engine.context.highlight_index());
+            }
+            return ProcessResult::Accepted;
+        }
 
         // ① 分隔符后面紧跟数字或空格 ⇒ 还在数字里：拼成一串直接提交。
         //    不能只 push 一个字符，否则 `3.` + `1` 会各自走一遍分段，`.` 又被翻译成「。」。
@@ -612,7 +644,111 @@ impl Processor for Punctuator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::candidate::Candidate;
+    use crate::engine::composition::Composition;
     use crate::engine::gear::translation::drain_opt;
+    use crate::engine::gear::translation::VecTranslation;
+    use crate::engine::menu::Menu;
+    use crate::engine::segmentation::Segment;
+
+    /// 组字+菜单的最小引擎(候选「你」覆盖整个输入)。
+    fn engine_with_menu() -> Engine {
+        let mut engine = engine_with(&config());
+        engine.context.page_size = 5;
+        engine.context.input = "ni".to_string();
+        engine.context.caret_pos = 2;
+        let mut menu = Menu::new();
+        menu.add_translation(Box::new(VecTranslation::new(vec![
+            Candidate::new("table", 0, 2, "你", 1.0),
+        ])));
+        let mut seg = Segment::new(0, 2);
+        seg.menu = Some(menu);
+        let mut comp = Composition::new();
+        comp.segmentation.input = "ni".to_string();
+        comp.segmentation.segments.push(seg);
+        engine.context.composition = comp;
+        engine
+    }
+
+    #[test]
+    fn comma_commits_first_candidate() {
+        // 用户 2026-11-07:高亮在第一位时,逗号 = 上屏当前候选。
+        let mut engine = engine_with_menu();
+        assert!(engine.context.has_menu());
+        engine
+            .context
+            .move_highlight(-(engine.context.page_size as isize)); // 先移到非首位
+        engine.context.move_highlight(engine.context.page_size as isize); // 回到首位
+        let r = Punctuator::new(&config()).process_key_event(&mut engine, &KeyEvent::new(0x2c, 0));
+        assert_eq!(r, ProcessResult::Accepted);
+        assert_eq!(
+            engine.context.commit_text.as_deref(),
+            Some("你"),
+            "逗号未上屏第一候选!"
+        );
+    }
+
+    /// 三个候选的菜单（`page_size=5`：一页放得下全部）。
+    /// 用来区分「移动一个」和「翻一页」——旧实现从第 3 个按逗号会直接跳到第 1 个。
+    fn engine_with_three_candidates() -> Engine {
+        let mut engine = engine_with(&config());
+        engine.context.page_size = 5;
+        engine.context.input = "ni".to_string();
+        engine.context.caret_pos = 2;
+        let mut menu = Menu::new();
+        menu.add_translation(Box::new(VecTranslation::new(vec![
+            Candidate::new("table", 0, 2, "你", 3.0),
+            Candidate::new("table", 0, 2, "泥", 2.0),
+            Candidate::new("table", 0, 2, "拟", 1.0),
+        ])));
+        let mut seg = Segment::new(0, 2);
+        seg.menu = Some(menu);
+        let mut comp = Composition::new();
+        comp.segmentation.input = "ni".to_string();
+        comp.segmentation.segments.push(seg);
+        engine.context.composition = comp;
+        engine
+    }
+
+    #[test]
+    fn comma_moves_up_one_when_highlight_not_first() {
+        // 用户 2026-11-08 定版 A：高亮不在首位时，逗号 = 上移**一个**（不是翻一页），不上屏。
+        let mut engine = engine_with_three_candidates();
+        assert!(engine.context.has_menu());
+        assert!(engine.context.move_highlight(2), "先移到第 3 个");
+        assert_eq!(engine.context.highlight_index(), 2);
+        let r = Punctuator::new(&config()).process_key_event(&mut engine, &KeyEvent::new(0x2c, 0));
+        assert_eq!(r, ProcessResult::Accepted);
+        assert_eq!(engine.context.commit_text, None, "非首位不应上屏");
+        assert_eq!(
+            engine.context.highlight_index(),
+            1,
+            "逗号应只上移一个（旧实现 move_highlight(-page) 会跳到 0）"
+        );
+    }
+
+    #[test]
+    fn period_moves_down_one() {
+        // 用户 2026-11-08 定版 A：句号 = 下移一个，不上屏；到末位后不再动。
+        let mut engine = engine_with_three_candidates();
+        let mut p = Punctuator::new(&config());
+        assert_eq!(
+            p.process_key_event(&mut engine, &KeyEvent::new(0x2e, 0)),
+            ProcessResult::Accepted
+        );
+        assert_eq!(engine.context.commit_text, None, "句号不应上屏");
+        assert_eq!(engine.context.highlight_index(), 1, "句号应下移一个");
+        assert_eq!(
+            p.process_key_event(&mut engine, &KeyEvent::new(0x2e, 0)),
+            ProcessResult::Accepted
+        );
+        assert_eq!(engine.context.highlight_index(), 2, "再下移一个到末位");
+        assert_eq!(
+            p.process_key_event(&mut engine, &KeyEvent::new(0x2e, 0)),
+            ProcessResult::Accepted
+        );
+        assert_eq!(engine.context.highlight_index(), 2, "末位后不再移动");
+    }
 
     fn config() -> Value {
         serde_json::json!({

@@ -244,6 +244,8 @@ pub struct RimeApi {
     pub cleanup_all_sessions: Option<unsafe extern "C" fn()>,
     pub process_key: Option<unsafe extern "C" fn(RimeSessionId, c_int, c_int) -> Bool>,
     pub commit_composition: Option<unsafe extern "C" fn(RimeSessionId) -> Bool>,
+    /// 直拟上屏（符号面板点击）：不经组合直接提交 UTF-8 文本。
+    pub commit_string: Option<unsafe extern "C" fn(RimeSessionId, *const c_char) -> Bool>,
     pub clear_composition: Option<unsafe extern "C" fn(RimeSessionId)>,
     pub get_commit: Option<unsafe extern "C" fn(RimeSessionId, *mut RimeCommit) -> Bool>,
     pub free_commit: Option<unsafe extern "C" fn(*mut RimeCommit)>,
@@ -683,6 +685,21 @@ unsafe extern "C" fn rime_commit_composition(id: RimeSessionId) -> Bool {
     }
 }
 
+unsafe extern "C" fn rime_commit_string(id: RimeSessionId, text: *const c_char) -> Bool {
+    if text.is_null() {
+        return 0;
+    }
+    let Ok(text) = CStr::from_ptr(text).to_str() else {
+        return 0;
+    };
+    let mut g = global().lock().unwrap();
+    if let Some(s) = g.sessions.get_mut(&id) {
+        s.commit_string(text) as Bool
+    } else {
+        0
+    }
+}
+
 unsafe extern "C" fn rime_clear_composition(id: RimeSessionId) {
     if let Some(s) = global().lock().unwrap().sessions.get_mut(&id) {
         s.clear_composition();
@@ -786,7 +803,14 @@ unsafe extern "C" fn rime_get_context(id: RimeSessionId, ctx: *mut RimeContext) 
     // 没同步头文件,于是宿主(Engine 按头文件生成绑定)传进来的是 5 字段结构,
     // 这边却按 7 字段写 → **越界写 8 字节** → Engine 一按键就 0xc0000005(实测 7 次 APPCRASH)。
     // 现在按调用方声明的 `data_size` 判断:结构不够大就一个字节都不碰。
-    let extended = (*ctx).data_size as usize >= std::mem::size_of::<RimeContext>();
+    //
+    // ⚠️ 2026-11-07 修:门槛原来写的是 `>= size_of::<RimeContext>()`,而本工程的
+    // `data_size` 约定是 `RIME_STRUCT_INIT` 的 `sizeof(Type) - sizeof(data_size)`
+    // (宿主 `struct_data_size()` 同口径)。于是**即便宿主正确声明了这两个扩展字段,
+    // data_size 也永远差 4 字节** → 预测一个都送不出去(链路第二处断点)。
+    // 现在按约定减掉 `data_size` 自己那 4 字节。
+    let required = std::mem::size_of::<RimeContext>() - std::mem::size_of::<c_int>();
+    let extended = (*ctx).data_size as usize >= required;
     if !extended {
         // 老宿主:没有这两个字段,别写(写了就是越界)。
     } else if g
@@ -836,7 +860,9 @@ unsafe extern "C" fn rime_free_context(ctx: *mut RimeContext) {
     }
     cstr_free((*ctx).commit_text_preview);
     // 同上:`predictions*` 是扩展字段 —— 宿主结构不够大时**连读都不能读**（读到的是别人的栈/堆）。
-    if (*ctx).data_size as usize >= std::mem::size_of::<RimeContext>()
+    // 门槛口径同 `rime_get_context`：`data_size` = sizeof(结构) - sizeof(data_size)。
+    if (*ctx).data_size as usize
+        >= std::mem::size_of::<RimeContext>() - std::mem::size_of::<c_int>()
         && !(*ctx).predictions.is_null()
     {
         let n = (*ctx).predictions_len.max(0) as usize;
@@ -1430,6 +1456,7 @@ fn build_api() -> RimeApi {
         cleanup_all_sessions: Some(rime_cleanup_all_sessions),
         process_key: Some(rime_process_key),
         commit_composition: Some(rime_commit_composition),
+        commit_string: Some(rime_commit_string),
         clear_composition: Some(rime_clear_composition),
         get_commit: Some(rime_get_commit),
         free_commit: Some(rime_free_commit),

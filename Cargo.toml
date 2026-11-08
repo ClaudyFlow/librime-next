@@ -176,6 +176,7 @@ name = "deploy_live"
 path = "example/deploy_live.rs"
 
 [dependencies]
+tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 # `preserve_order`：把 `serde_json::Value::Object` 的后备映射从 `BTreeMap` 换成
 # `IndexMap`。**这不是性能选择，是正确性选择**：配置树的键序必须来自源文件，而不是
@@ -290,3 +291,13 @@ path = "example/bench_two_engines.rs"
 [[example]]
 name = "probe_lua_schema"
 path = "example/probe_lua_schema.rs"
+
+# 逗号/句号候选光标探针(2026-11-08):验证 comma→Up / period→Down 是否移动
+# selected_index,并用物理方向键/翻页键做对照,定位"只有一页时不能移光标"。
+[[example]]
+name = "probe_comma_period"
+path = "example/probe_comma_period.rs"
+
+[[example]]
+name = "probe_predict_repeat"
+path = "example/probe_predict_repeat.rs"
