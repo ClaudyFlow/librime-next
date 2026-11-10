@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use super::neural::{
-    predict_extensions, rerank_order, LazySentenceModel, PredictOptions, RerankOptions,
+    predict_extensions, rerank_scored, LazySentenceModel, PredictOptions, RerankOptions,
     SentenceModel,
 };
 
@@ -55,15 +55,109 @@ enum Task {
     Predict(PredictJob),
 }
 
+/// 一批重排结果：顺序 + 每条的 λ 融合分（线性重排头的特征/基线）。
+struct RerankResult {
+    order: Vec<usize>,
+    combined: Vec<f64>,
+}
+
+/// 一次后台落地的「内容签名」——抄 msime `ApplyCandidateTranslations` 的
+/// `glosses_changed` / `IsTranslationCurrent`：异步结果回来后先逐条比现值，
+/// **全都没变就不推帧**。
+///
+/// 本仓的对应物是：worker 每落地一批就把「这次到底改了什么」记在
+/// [`RescoreWorker::last_landed`]；引擎侧 `poll_rescore_landing` 在 re-compose
+/// 前比对，内容一致就跳过一次整段重译。重排看 `order`(下标序列)，预测看
+/// 文本序列——只要落到屏幕上的东西和现在一样，这次 compose 就是纯浪费。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LandingSignature {
+    /// 重排结果落地：按这个下标序列调序（`identity` = 与静态顺序一致）。
+    Rerank { order: Vec<usize> },
+    /// 预测结果落地：插入这些文本（空 = 没有新候选）。
+    Predict { texts: Vec<String> },
+}
+
+impl LandingSignature {
+    /// 与屏幕现值逐条比对：一致 ⇒ 不值得重绘。
+    ///
+    /// * 重排：`order` 与已应用顺序相同 ⇒ 调序后候选列表一模一样；
+    ///   特别地，恒等 order 对任何已应用顺序都代表「没动」（`matches_any` 处理）。
+    /// * 预测：`texts` 与已插入的预测条相同 ⇒ 再 compose 也插不出新东西。
+    pub fn changes_from(&self, applied: Option<&LandingSignature>) -> bool {
+        match (self, applied) {
+            (LandingSignature::Rerank { order }, Some(LandingSignature::Rerank { order: old })) => {
+                order != old
+            }
+            // 恒等 order 与「还没应用过任何重排」在视觉上等价：静态顺序本来就在屏幕上。
+            (LandingSignature::Rerank { order }, None) => !Self::is_identity(order),
+            (LandingSignature::Predict { texts }, Some(LandingSignature::Predict { texts: old })) => {
+                texts != old
+            }
+            (LandingSignature::Predict { texts }, None) => !texts.is_empty(),
+            // 类别不同（重排 ↔ 预测）⇒ 一定要重新 compose，让对应滤镜消费这一批。
+            _ => true,
+        }
+    }
+
+    /// `order == [0,1,2,…]`：神经认为静态顺序已最优，落地后候选不变。
+    pub fn is_identity(order: &[usize]) -> bool {
+        order.iter().enumerate().all(|(i, &v)| i == v)
+    }
+}
+
+#[derive(Default)]
 struct WorkerState {
-    /// 已完成的重排结果:`key → 重排后的下标序列`。
-    done: HashMap<String, Vec<usize>>,
+    /// 已完成的重排结果:`key → 顺序 + 融合分`。
+    done: HashMap<String, RerankResult>,
     /// 已完成的预测结果:`key → (完整文本, 平均对数概率)`。
     done_predict: HashMap<String, Vec<(String, f64)>>,
-    /// 待办(单槽,新的盖旧的)。
-    pending: Option<Task>,
+    /// 待办**按任务类型分槽**(抄 msime `RescoreWorker::pending_` 的「每任务类型各
+    /// 留一格」)：重排 / 预测各一格,同类新的盖旧的,跨类不互挤。旧的单 `pending`
+    /// 会让后提交的一批把先提交的那批直接挤掉——预测任务频率低,常被重排挤没。
+    pending_rerank: Option<Job>,
+    pending_predict: Option<PredictJob>,
+    /// **正在算**的 key(从待办取出后到落地前)。抄 msime `active_keys_`：
+    /// 这段时间结果还没进 `done`,若同 key 再来一批会重复排队、白算一遍。
+    /// 单后台线程 ⇒ 同时最多一个,用 Option 足够。
+    active_rerank: Option<String>,
+    active_predict: Option<String>,
     /// 停工标志。
     stopping: bool,
+}
+
+impl WorkerState {
+    /// 重排任务是否值得排队。纯判定,便于单测覆盖「已完成 / 正在算 / 已在待办」。
+    fn should_queue_rerank(&self, key: &str) -> bool {
+        !self.stopping
+            && !self.done.contains_key(key)
+            && self.active_rerank.as_deref() != Some(key)
+            && self.pending_rerank.as_ref().is_none_or(|job| job.key != key)
+    }
+
+    /// 预测任务是否值得排队。与重排同构,只查自己的表 / 槽 / active。
+    fn should_queue_predict(&self, key: &str) -> bool {
+        !self.stopping
+            && !self.done_predict.contains_key(key)
+            && self.active_predict.as_deref() != Some(key)
+            && self
+                .pending_predict
+                .as_ref()
+                .is_none_or(|job| job.key != key)
+    }
+
+    /// 从两槽取下一件活:重排优先(当前候选顺序更贴按键反馈),其次预测。
+    /// 取走时立刻记进 active,落地时清除。两槽都空返回 `None` ⇒ 调用方睡等待。
+    fn take_next(&mut self) -> Option<Task> {
+        if let Some(job) = self.pending_rerank.take() {
+            self.active_rerank = Some(job.key.clone());
+            return Some(Task::Rerank(job));
+        }
+        if let Some(job) = self.pending_predict.take() {
+            self.active_predict = Some(job.key.clone());
+            return Some(Task::Predict(job));
+        }
+        None
+    }
 }
 
 /// 异步重排后台线程。进程级单例——见 [`global`] / [`init_from_data_roots`]。
@@ -83,6 +177,9 @@ pub struct RescoreWorker {
     /// 上次见过的代数,代数变了就 re-compose 一次——这就是"后台分算完,
     /// 候选列表当场跳到神经顺序"的信号通道(线程不能直接摸引擎)。
     generation: std::sync::atomic::AtomicU64,
+    /// 最近一次落地的内容签名(与 `generation` 同锁序发布)。引擎侧据此判断
+    /// 「代数虽然变了,但落到屏幕上的东西没变」⇒ 跳过一次无谓的 re-compose。
+    last_landed: Mutex<Option<LandingSignature>>,
 }
 
 /// 神经打分器：双模型 + 两套选项。`SentenceModel` 自身线程安全
@@ -156,7 +253,13 @@ impl NeuralScorer {
     /// 模型缺失时返回空表 —— 调用方按"没有预测"处理,不影响原有候选。
     /// 双模型各跑一遍，再按 [`merge_predictions`] 的配额合并。
     fn predict(&self, context: &str, prefixes: &[String]) -> Vec<(String, f64)> {
-        self.predict_merged(context, prefixes, self.predict_options.max_results, "")
+        self.predict_merged(
+            context,
+            prefixes,
+            self.predict_options.max_results,
+            "",
+            false,
+        )
     }
 
     /// 上屏联想条专用同步预测（对外入口见 [`predict_sync`]）。
@@ -169,7 +272,8 @@ impl NeuralScorer {
         if context.is_empty() || total == 0 {
             return Vec::new();
         }
-        self.predict_merged(context, &[String::new()], total, excluded)
+        // 上屏路径是"必须同帧出联想条"的同步等待，key/desk 两条腿并行算。
+        self.predict_merged(context, &[String::new()], total, excluded, true)
     }
 
     /// 双模型合并预测的公共路径。
@@ -183,14 +287,62 @@ impl NeuralScorer {
         prefixes: &[String],
         total: usize,
         excluded: &str,
+        parallel: bool,
     ) -> Vec<(String, f64)> {
         if prefixes.is_empty() || total == 0 {
             return Vec::new();
         }
         // 每个模型先按 2*total 收：够"各模型配额 + 去重损耗 + 补齐"用。
         let want = total.saturating_mul(2);
-        let key = self.predict_with(self.key_model.as_ref(), context, prefixes, want);
-        let desk = self.predict_with(self.desk_model.as_ref(), context, prefixes, want);
+        // 两个模型互不依赖、只读共享权重；同步上屏路径把 key 丢到一条临时线程，
+        // desk 留本线程，join 后再按固定顺序合并 —— 结果与串行逐位相同。
+        let (key, desk) = if parallel {
+            let key_model = self
+                .key_model
+                .as_ref()
+                .and_then(|m| m.get())
+                .map(|m| m.as_ref());
+            let desk_model = self
+                .desk_model
+                .as_ref()
+                .and_then(|m| m.get())
+                .map(|m| m.as_ref());
+            match (key_model, desk_model) {
+                (Some(key), Some(desk)) => {
+                    let mut options = self.predict_options.clone();
+                    options.max_results = want;
+                    let trace = crate::engine::stage_trace::enabled();
+                    std::thread::scope(|s| {
+                        let key_task = s.spawn(|| {
+                            let t = trace.then(std::time::Instant::now);
+                            let out = predict_model(key, context, prefixes, &options);
+                            (out, t.map(|t| t.elapsed()))
+                        });
+                        let t_desk = trace.then(std::time::Instant::now);
+                        let desk = predict_model(desk, context, prefixes, &options);
+                        let desk_elapsed = t_desk.map(|t| t.elapsed());
+                        let (key_out, key_elapsed) = key_task.join().unwrap_or_default();
+                        // 只在上屏同步路径（`parallel`）打这两行：候选窗每键预测不打。
+                        if let (Some(k), Some(d)) = (key_elapsed, desk_elapsed) {
+                            let seq = crate::engine::stage_trace::current();
+                            crate::engine::stage_trace::emit(seq, "predict_key", k.as_micros());
+                            crate::engine::stage_trace::emit(seq, "predict_desk", d.as_micros());
+                        }
+                        (key_out, desk)
+                    })
+                }
+                // 缺模型/未配置时照旧走串行，省掉无意义的线程。
+                _ => (
+                    self.predict_with(self.key_model.as_ref(), context, prefixes, want),
+                    self.predict_with(self.desk_model.as_ref(), context, prefixes, want),
+                ),
+            }
+        } else {
+            (
+                self.predict_with(self.key_model.as_ref(), context, prefixes, want),
+                self.predict_with(self.desk_model.as_ref(), context, prefixes, want),
+            )
+        };
         merge_predictions_excluding(&key, &desk, total, excluded)
     }
 
@@ -210,34 +362,46 @@ impl NeuralScorer {
         };
         let mut options = self.predict_options.clone();
         options.max_results = max_results;
-        let mut out: Vec<(String, f64)> = Vec::new();
-        for prefix in prefixes {
-            for (extension, score) in predict_extensions(&model, context, prefix, &options) {
-                let text = format!("{prefix}{extension}");
-                if text == *prefix || out.iter().any(|(existing, _)| *existing == text) {
-                    continue;
-                }
-                out.push((text, score));
-            }
-        }
-        out.sort_by(|a, b| b.1.total_cmp(&a.1));
-        out.truncate(max_results);
-        out
+        predict_model(&model, context, prefixes, &options)
     }
 
     /// 模型可用时跑一次重排;模型缺失/句子不足两条时返回空表
     /// (调用方保持静态顺序——半份重排比不排更糟)。
-    fn rerank(
+    fn rerank_scored(
         &self,
         context: &str,
         sentences: &[String],
         static_scores: &[f64],
-    ) -> Vec<usize> {
+    ) -> (Vec<usize>, Vec<f64>) {
         let Some(model) = self.rerank_model() else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
-        rerank_order(&model, context, sentences, static_scores, &self.options)
+        rerank_scored(&model, context, sentences, static_scores, &self.options)
     }
+}
+
+/// 一个模型对所有前缀做续写、拼成完整词条、去重、按平均分排序后截断。
+///
+/// 不依赖 `&self`：同步上屏路径要在临时线程里跑 key 模型，串行路径也复用同一份实现。
+fn predict_model(
+    model: &SentenceModel,
+    context: &str,
+    prefixes: &[String],
+    options: &PredictOptions,
+) -> Vec<(String, f64)> {
+    let mut out: Vec<(String, f64)> = Vec::new();
+    for prefix in prefixes {
+        for (extension, score) in predict_extensions(model, context, prefix, options) {
+            let text = format!("{prefix}{extension}");
+            if text == *prefix || out.iter().any(|(existing, _)| *existing == text) {
+                continue;
+            }
+            out.push((text, score));
+        }
+    }
+    out.sort_by(|a, b| b.1.total_cmp(&a.1));
+    out.truncate(options.max_results);
+    out
 }
 
 /// 双模型预测结果的配额合并（纯函数，便于单测）。
@@ -443,11 +607,40 @@ pub fn score_text(context: &str, text: &str) -> Option<f64> {
 /// 逐字自回归要几十毫秒（上一棒实测默认参数 key 17ms + desk 71ms ≈ 77ms/次提交），
 /// 用户认可放在提交路径上同步算 —— 联想条必须和上屏同一帧出现，异步重绘方案已被否。
 /// **别拿它上按键路径。** worker/模型不可用 → 空表，调用方回退个人 n-gram。
+///
+/// 2026-11-09：`WEASEL_PREDICT=off` / `enable_neural_inference=false` 在**这个入口**
+/// 一刀切（[`crate::engine::gear::neural::predictions_enabled`]）—— 关掉后直接返回
+/// 空表，不碰模型、不付推理成本；调用点不需要各自判断。
 pub fn predict_sync(context: &str, excluded: &str, total: usize) -> Vec<(String, f64)> {
+    predict_sync_gated(
+        crate::engine::gear::neural::predictions_enabled(),
+        context,
+        excluded,
+        total,
+    )
+}
+
+/// [`predict_sync`] 的实现：闸门作为参数，回归用例不必碰进程级环境变量。
+fn predict_sync_gated(
+    gate: bool,
+    context: &str,
+    excluded: &str,
+    total: usize,
+) -> Vec<(String, f64)> {
+    if !gate {
+        return Vec::new();
+    }
     let Some(worker) = global() else {
         return Vec::new();
     };
     worker.scorer.predict_sync(context, excluded, total)
+}
+
+/// 全局 worker 里某批候选的 λ 融合分；没算完/没模型返回 `None`。
+///
+/// 给线性重排头在提交时补查用（首次 compose 直接选词时，结果可能刚好落地）。
+pub fn scores_for(context: &str, sentences: &[String]) -> Option<Vec<f64>> {
+    global()?.scores_for(context, sentences)
 }
 
 /// 全局 worker 的共享句柄;未初始化(没有模型)时返回 `None`。
@@ -468,17 +661,13 @@ pub fn clear_pending() {
 impl RescoreWorker {
     pub fn new(scorer: NeuralScorer) -> Self {
         Self {
-            state: Mutex::new(WorkerState {
-                done: HashMap::new(),
-                done_predict: HashMap::new(),
-                pending: None,
-                stopping: false,
-            }),
+            state: Mutex::new(WorkerState::default()),
             wake: Condvar::new(),
             scorer: Arc::new(scorer),
             handle: Mutex::new(None),
             me: std::sync::OnceLock::new(),
             generation: AtomicU64::new(0),
+            last_landed: Mutex::new(None),
         }
     }
 
@@ -504,20 +693,17 @@ impl RescoreWorker {
     ) {
         let key = make_key(self.model_tag(), context, &sentences);
         let mut state = self.state.lock().unwrap();
-        if state.stopping {
+        // 已完成 / 正在算 / 已在待办槽的同一批都不必再排一份。
+        if !state.should_queue_rerank(&key) {
             return;
         }
-        // 正在算的就是这一批,算完自会进表,不必再排一份。
-        if state.done.contains_key(&key) {
-            return;
-        }
-        state.pending = Some(Task::Rerank(Job {
+        state.pending_rerank = Some(Job {
             key,
             context: context.to_string(),
             sentences,
             static_scores,
             options,
-        }));
+        });
         self.ensure_thread(&mut state);
         drop(state);
         self.wake.notify_one();
@@ -536,15 +722,16 @@ impl RescoreWorker {
         }
         let key = make_key(self.model_tag(), context, &prefixes);
         let mut state = self.state.lock().unwrap();
-        if state.stopping || state.done_predict.contains_key(&key) {
+        // 与重排同构：同 key 已完成 / 正在算 / 已在待办都跳过。
+        if !state.should_queue_predict(&key) {
             return;
         }
-        state.pending = Some(Task::Predict(PredictJob {
+        state.pending_predict = Some(PredictJob {
             key,
             context: context.to_string(),
             prefixes,
             options,
-        }));
+        });
         self.ensure_thread(&mut state);
         drop(state);
         self.wake.notify_one();
@@ -565,12 +752,29 @@ impl RescoreWorker {
     ) -> Option<Vec<usize>> {
         let key = make_key(self.model_tag(), context, sentences);
         let state = self.state.lock().unwrap();
-        state.done.get(&key).cloned()
+        state.done.get(&key).map(|result| result.order.clone())
+    }
+
+    /// 与 [`Self::order_for`] 同一批结果里的 λ 融合分；给线性重排头用。
+    pub fn scores_for(
+        &self,
+        context: &str,
+        sentences: &[String],
+    ) -> Option<Vec<f64>> {
+        let key = make_key(self.model_tag(), context, sentences);
+        let state = self.state.lock().unwrap();
+        state.done.get(&key).map(|result| result.combined.clone())
     }
 
     /// 当前结果代数(引擎线程用来发现"有新结果落地了")。
     pub fn current_generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
+    }
+
+    /// 最近一次落地的内容签名。引擎侧在代数变化时取回，与「已应用签名」比对；
+    /// 内容一致就跳过 re-compose（对应 msime 的 `glosses_changed` 守卫）。
+    pub fn last_landed(&self) -> Option<LandingSignature> {
+        self.last_landed.lock().unwrap().clone()
     }
 
     /// 上屏、换方案、换前文:存着的顺序对新语境没有意义了。
@@ -579,8 +783,16 @@ impl RescoreWorker {
         let mut state = self.state.lock().unwrap();
         state.done.clear();
         state.done_predict.clear();
-        if state.pending.is_some() {
-            state.pending = None;
+        // 结果表作废了，「上次落地的内容」对新语境也不再有效，否则下一次
+        // 同文本落地会被误判成「没变」而不推帧。
+        *self.last_landed.lock().unwrap() = None;
+        // 换语境后正在算的旧批次也作废：清掉 active,免得它落地时又把结果
+        // 写回新语境的同名 key。两槽一并清空。
+        let had_pending = state.pending_rerank.take().is_some()
+            || state.pending_predict.take().is_some();
+        state.active_rerank = None;
+        state.active_predict = None;
+        if had_pending {
             self.wake.notify_one();
         }
     }
@@ -590,7 +802,10 @@ impl RescoreWorker {
     pub fn shutdown_for_test(&self) {
         let mut state = self.state.lock().unwrap();
         state.stopping = true;
-        state.pending = None;
+        state.pending_rerank = None;
+        state.pending_predict = None;
+        state.active_rerank = None;
+        state.active_predict = None;
         self.wake.notify_all();
         let handle = self.handle.lock().unwrap().take();
         drop(state);
@@ -626,7 +841,7 @@ impl RescoreWorker {
                     if state.stopping {
                         return;
                     }
-                    if let Some(job) = state.pending.take() {
+                    if let Some(job) = state.take_next() {
                         break job;
                     }
                     state = owner.wake.wait(state).unwrap();
@@ -634,26 +849,59 @@ impl RescoreWorker {
             };
             let owner = me.as_ref().and_then(|w| w.upgrade());
             let Some(owner) = owner else { return };
-            match job {
+            // 本次落地的内容签名 + 「相对上次落地有没有真变化」。抄 msime
+            // `glosses_changed`：结果全没变就不 bump 代数 ⇒ 引擎侧连轮询都
+            // 不会触发 re-compose，省掉一次整段重译 + 一帧重绘。
+            // 两个分支都会赋值，不需要占位初值（也免掉 unused assignment 警告）。
+            let changed;
+            let signature = match job {
                 Task::Rerank(job) => {
-                    let order = owner.scorer.rerank(&job.context, &job.sentences, &job.static_scores);
+                    let (order, combined) =
+                        owner
+                            .scorer
+                            .rerank_scored(&job.context, &job.sentences, &job.static_scores);
                     let mut state = owner.state.lock().unwrap();
                     if state.done.len() >= MAX_RESULTS {
                         state.done.clear();
                     }
-                    state.done.insert(job.key, order);
+                    let sig = LandingSignature::Rerank { order: order.clone() };
+                    changed = owner
+                        .last_landed
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map_or(true, |old| sig.changes_from(Some(old)));
+                    state.done.insert(job.key.clone(), RerankResult { order, combined });
+                    // 落地完成,active 放行：同 key 再来才允许排新一轮。
+                    state.active_rerank = None;
+                    sig
                 }
                 Task::Predict(job) => {
                     let predicted = owner.scorer.predict(&job.context, &job.prefixes);
+                    let texts: Vec<String> =
+                        predicted.iter().map(|(text, _)| text.clone()).collect();
                     let mut state = owner.state.lock().unwrap();
                     if state.done_predict.len() >= MAX_RESULTS {
                         state.done_predict.clear();
                     }
-                    state.done_predict.insert(job.key, predicted);
+                    let sig = LandingSignature::Predict { texts };
+                    changed = owner
+                        .last_landed
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map_or(true, |old| sig.changes_from(Some(old)));
+                    state.done_predict.insert(job.key.clone(), predicted);
+                    state.active_predict = None;
+                    sig
                 }
-            }
+            };
+            *owner.last_landed.lock().unwrap() = Some(signature);
             // 落地信号:引擎线程在 get_context 时轮询代数,变了就 re-compose。
-            owner.generation.fetch_add(1, Ordering::Release);
+            // 内容没变(恒等 order / 同文本预测)时不发信号,这就是「结果没变不重绘」。
+            if changed {
+                owner.generation.fetch_add(1, Ordering::Release);
+            }
             // 回到外圈前降级;worker 若已被丢弃(测试场景),下轮 upgrade 失败退出。
         }
     }
@@ -815,5 +1063,283 @@ mod merge_tests {
             texts(&merge_predictions_excluding(&key, &desk, 3, "你好")),
             vec!["k0", "d0", "d1"]
         );
+    }
+}
+
+#[cfg(test)]
+mod landing_tests {
+    use super::LandingSignature as S;
+
+    fn rerank(order: &[usize]) -> S {
+        S::Rerank {
+            order: order.to_vec(),
+        }
+    }
+    fn predict(texts: &[&str]) -> S {
+        S::Predict {
+            texts: texts.iter().map(|t| t.to_string()).collect(),
+        }
+    }
+    fn text(sig: &S) -> String {
+        match sig {
+            S::Rerank { order } => format!("rerank {order:?}"),
+            S::Predict { texts } => format!("predict {texts:?}"),
+        }
+    }
+
+    /// 抄 msime `glosses_changed`：恒等 order（静态顺序已最优）落地 ⇒ 屏幕不变，
+    /// 即使引擎还没应用过任何重排签名也不值得 re-compose 一帧。
+    #[test]
+    fn identity_order_never_needs_recompose() {
+        let sig = rerank(&[0, 1, 2, 3]);
+        assert!(S::is_identity(&sig.clone().into_order().unwrap()));
+        println!(
+            "落地={} 已应用=None → 需要重绘={}（期望 false）",
+            text(&sig),
+            sig.changes_from(None)
+        );
+        assert!(!sig.changes_from(None), "恒等 order 不该触发重绘");
+    }
+
+    /// 非恒等 order 首次落地必须推一帧，否则神经顺序上不了屏。
+    #[test]
+    fn first_non_identity_order_needs_recompose() {
+        let sig = rerank(&[2, 0, 1]);
+        println!(
+            "落地={} 已应用=None → 需要重绘={}（期望 true）",
+            text(&sig),
+            sig.changes_from(None)
+        );
+        assert!(sig.changes_from(None));
+    }
+
+    /// 同一 order 重复落地（用户重打同一句）⇒ 逐条比现值全一样，跳过。
+    #[test]
+    fn same_order_twice_is_noop() {
+        let sig = rerank(&[2, 0, 1]);
+        let applied = rerank(&[2, 0, 1]);
+        println!(
+            "落地={} 已应用={} → 需要重绘={}（期望 false）",
+            text(&sig),
+            text(&applied),
+            sig.changes_from(Some(&applied))
+        );
+        assert!(!sig.changes_from(Some(&applied)));
+    }
+
+    /// order 变了（哪怕只换两条）必须推帧。
+    #[test]
+    fn different_order_needs_recompose() {
+        let sig = rerank(&[2, 0, 1]);
+        let applied = rerank(&[1, 0, 2]);
+        println!(
+            "落地={} 已应用={} → 需要重绘={}（期望 true）",
+            text(&sig),
+            text(&applied),
+            sig.changes_from(Some(&applied))
+        );
+        assert!(sig.changes_from(Some(&applied)));
+    }
+
+    /// 预测文本逐条相同 ⇒ 不重绘；多一条/少一条都算变化。
+    #[test]
+    fn prediction_changes_only_when_texts_change() {
+        let same = predict(&["你好", "你好呀"]);
+        let applied = predict(&["你好", "你好呀"]);
+        let added = predict(&["你好", "你好呀", "你们好"]);
+        let reordered = predict(&["你好呀", "你好"]);
+        println!(
+            "落地={} 已应用={} → {}（期望 false）",
+            text(&same),
+            text(&applied),
+            same.changes_from(Some(&applied))
+        );
+        println!(
+            "落地={} 已应用={} → {}（期望 true）",
+            text(&added),
+            text(&applied),
+            added.changes_from(Some(&applied))
+        );
+        println!(
+            "落地={} 已应用={} → {}（期望 true）",
+            text(&reordered),
+            text(&applied),
+            reordered.changes_from(Some(&applied))
+        );
+        assert!(!same.changes_from(Some(&applied)));
+        assert!(added.changes_from(Some(&applied)));
+        assert!(reordered.changes_from(Some(&applied)));
+    }
+
+    /// 空预测落地（模型没给出新东西）不推帧。
+    #[test]
+    fn empty_prediction_is_noop() {
+        let sig = predict(&[]);
+        println!(
+            "落地={} 已应用=None → 需要重绘={}（期望 false）",
+            text(&sig),
+            sig.changes_from(None)
+        );
+        assert!(!sig.changes_from(None));
+    }
+
+    /// 重排 ↔ 预测 是两类不同的落地，类别变了必须重新 compose 让对应滤镜消费。
+    #[test]
+    fn cross_kind_always_needs_recompose() {
+        let r = rerank(&[2, 0, 1]);
+        let p = predict(&["你好"]);
+        println!(
+            "落地={} 已应用={} → {}（期望 true）",
+            text(&r),
+            text(&p),
+            r.changes_from(Some(&p))
+        );
+        assert!(r.changes_from(Some(&p)));
+        assert!(p.changes_from(Some(&r)));
+    }
+}
+
+impl LandingSignature {
+    #[cfg(test)]
+    fn into_order(self) -> Option<Vec<usize>> {
+        match self {
+            LandingSignature::Rerank { order } => Some(order),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    /// 2026-11-09：总开关关掉时，上屏联想入口必须直接给空表
+    /// （不碰模型、不付推理成本）。闸门参数化，单测不必碰进程级环境变量。
+    #[test]
+    fn predict_sync_gate_off_is_empty() {
+        assert!(super::predict_sync_gated(false, "今天你好", "你好", 4).is_empty());
+    }
+}
+
+/// 2026-11-10 第四条：待办分槽 + active key 去重（抄 msime `RescoreWorker`）。
+/// 全部只构造 `WorkerState` 纯数据，不碰模型 / 线程 / 环境变量。
+#[cfg(test)]
+mod pending_tests {
+    use super::{
+        Job, PredictJob, RerankResult, Task, WorkerState, make_key,
+    };
+    use super::super::neural::{PredictOptions, RerankOptions};
+
+    fn rerank_job(key: &str) -> Job {
+        Job {
+            key: key.to_owned(),
+            context: "ctx".to_owned(),
+            sentences: vec!["句".to_owned()],
+            static_scores: vec![0.0],
+            options: RerankOptions::default(),
+        }
+    }
+
+    fn predict_job(key: &str) -> PredictJob {
+        PredictJob {
+            key: key.to_owned(),
+            context: "ctx".to_owned(),
+            prefixes: vec!["你".to_owned()],
+            options: PredictOptions::default(),
+        }
+    }
+
+    #[test]
+    fn rerank_and_predict_take_separate_slots() {
+        // 两槽各一：重排先取（贴按键反馈），预测仍在自己槽里、不会被挤掉。
+        let mut state = WorkerState::default();
+        state.pending_rerank = Some(rerank_job("rk"));
+        state.pending_predict = Some(predict_job("pk"));
+        match state.take_next() {
+            Some(Task::Rerank(j)) => assert_eq!(j.key, "rk"),
+            _ => panic!("第一件应是重排 rk"),
+        }
+        assert_eq!(state.active_rerank.as_deref(), Some("rk"));
+        assert_eq!(state.active_predict, None, "还没取预测就不该标 active");
+        match state.take_next() {
+            Some(Task::Predict(j)) => assert_eq!(j.key, "pk"),
+            _ => panic!("第二件应是预测 pk（分槽后没被重排挤掉）"),
+        }
+        assert_eq!(state.active_rerank.as_deref(), Some("rk"));
+        assert_eq!(state.active_predict.as_deref(), Some("pk"));
+        assert!(state.take_next().is_none(), "两槽都取空后应无活");
+    }
+
+    #[test]
+    fn predict_submitted_first_is_not_overwritten_by_rerank() {
+        // 旧单槽的真实 bug：先提交预测 pk，再提交重排 rk ⇒ 预测被覆盖丢弃。
+        // 分槽后两次入队都成功，且重排优先被取走、预测仍在槽里。
+        let mut state = WorkerState::default();
+        assert!(state.should_queue_predict("pk"));
+        state.pending_predict = Some(predict_job("pk"));
+        assert!(state.should_queue_rerank("rk"));
+        state.pending_rerank = Some(rerank_job("rk"));
+        assert!(matches!(state.take_next(), Some(Task::Rerank(_))));
+        assert!(
+            matches!(state.take_next(), Some(Task::Predict(_))),
+            "重排入队不能把先提交的预测挤掉"
+        );
+    }
+
+    #[test]
+    fn active_key_blocks_duplicate_queue_until_landed() {
+        let mut state = WorkerState::default();
+        let key = make_key("neural", "前文", &["句".to_owned()]);
+        assert!(state.should_queue_rerank(&key));
+        state.pending_rerank = Some(rerank_job(&key));
+        // 取出后 pending 空，但 active 仍标着 ⇒ 同 key 不得再排第二份。
+        assert!(matches!(state.take_next(), Some(Task::Rerank(_))));
+        assert_eq!(state.active_rerank.as_deref(), Some(key.as_str()));
+        assert!(
+            !state.should_queue_rerank(&key),
+            "正在算的同 key 必须被 active 挡住"
+        );
+        // 落地清 active 后，同 key 才允许重新排。
+        state.active_rerank = None;
+        state.done.insert(
+            key.clone(),
+            RerankResult {
+                order: vec![0],
+                combined: vec![0.0],
+            },
+        );
+        assert!(!state.should_queue_rerank(&key), "已完成也不该重排");
+    }
+
+    #[test]
+    fn predict_active_blocks_duplicate_queue_until_landed() {
+        let mut state = WorkerState::default();
+        let key = make_key("neural", "前文", &["你".to_owned()]);
+        state.pending_predict = Some(predict_job(&key));
+        assert!(matches!(state.take_next(), Some(Task::Predict(_))));
+        assert!(
+            !state.should_queue_predict(&key),
+            "预测正在算的同 key 也必须被 active 挡住"
+        );
+        state.active_predict = None;
+        state.done_predict.insert(key.clone(), vec![("你好".to_owned(), -1.0)]);
+        assert!(!state.should_queue_predict(&key));
+    }
+
+    #[test]
+    fn duplicate_key_in_same_slot_is_overwritten_not_stacked() {
+        // 同类待办仍保持「新的盖旧的」：已在 pending 的同 key 不该再入队。
+        let mut state = WorkerState::default();
+        let key = "same";
+        state.pending_rerank = Some(rerank_job(key));
+        assert!(!state.should_queue_rerank(key));
+        assert!(state.should_queue_rerank("other"));
+    }
+
+    #[test]
+    fn stopping_blocks_all_new_work() {
+        let mut state = WorkerState::default();
+        state.stopping = true;
+        assert!(!state.should_queue_rerank("r"));
+        assert!(!state.should_queue_predict("p"));
+        assert!(state.take_next().is_none());
     }
 }
