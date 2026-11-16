@@ -12,7 +12,7 @@
 
 use std::path::PathBuf;
 
-use librime_next::engine::gear::rescore;
+use librime_next::gear::filter::rescore;
 
 fn main() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-data");

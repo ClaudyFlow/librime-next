@@ -295,7 +295,7 @@ pub fn ensure_manifest(user_data_dir: &Path, shared_data_dir: &Path) -> EnsureOu
 const GENERATED_HEADER: &str = "\
 # 方案信息 —— 勾选清单 + 当前使用的方案。
 # 由部署流程自动生成：识别程序文件夹里过准入检查的方案后写入。
-# 之后由「方案选单设定」与输入法自己维护；手改请保持 `schemas` 是 id 列表。
+# 之后由「方案菜单设置」与输入法自己维护；手改请保持 `schemas` 是 id 列表。
 ";
 
 #[cfg(test)]

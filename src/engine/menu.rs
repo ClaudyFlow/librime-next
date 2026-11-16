@@ -16,8 +16,8 @@
 
 use crate::engine::candidate::Candidate;
 use crate::engine::context::Context;
-use crate::engine::gear::filter::Filter;
-use crate::engine::gear::translation::{MergedTranslation, Translation};
+use crate::gear::filter::filter::Filter;
+use crate::gear::translator::translation::{MergedTranslation, Translation};
 use std::cell::{Cell, RefCell};
 
 /// 懒式候选菜单(对照 C++ `Menu`)。
@@ -100,7 +100,7 @@ impl Menu {
         match result.take() {
             None => *result = Some(tier),
             Some(existing) => {
-                *result = Some(Box::new(crate::engine::gear::translation::TieredTranslation::new(
+                *result = Some(Box::new(crate::gear::translator::translation::TieredTranslation::new(
                     vec![existing, tier],
                 )));
             }

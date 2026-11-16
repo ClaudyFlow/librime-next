@@ -139,7 +139,24 @@ impl DeploymentTask {
                 source_path,
                 verbose,
             } => run_schema_update(deployer, source_path, *verbose),
-            Self::WorkspaceUpdate => run_workspace_update(deployer),
+            Self::WorkspaceUpdate => {
+                // 并行部署开关：优先读环境变量 WEASEL_DEPLOY_PARALLEL，其次读
+                // <user>/weasel.yaml 的 `deploy.parallel`（零依赖逐行扫描）；均未
+                // 配置则默认关闭，串行路径行为零变化。CLI deploy 与 C API deploy
+                // 都经此分支，一处覆盖两条链。worker 数同理读 deploy.workers。
+                let enabled = super::parallel_deploy::is_enabled_for(&deployer.user_data_dir);
+                if enabled {
+                    let workers = super::parallel_deploy::max_workers_for(&deployer.user_data_dir);
+                    match super::parallel_deploy::run_workspace_update_parallel_with(
+                        deployer, workers,
+                    ) {
+                        Ok(_) => true,
+                        Err((_, failure)) => failure == 0,
+                    }
+                } else {
+                    run_workspace_update(deployer)
+                }
+            }
             Self::InstallationUpdate => run_installation_update(deployer),
             Self::CleanupTrash => run_cleanup_trash(deployer),
             Self::PrebuildAllSchemas => run_prebuild_all_schemas(deployer),
@@ -176,12 +193,15 @@ fn run_installation_update(deployer: &mut Deployer) -> bool {
         let _ = fs::create_dir_all(&deployer.user_data_dir);
     }
     let installation_info = deployer.user_data_dir.join("installation.yaml");
+    // #1264：`installation.yaml` 被写坏成非 Map（例如列表/标量）时，`Config` 视为空配置，
+    // 而不是继续在错误结构上读写导致保存失败或字段丢失。
+    let loaded = crate::lever::tree::load(&installation_info).filter(|tree| tree.is_object());
     let mut config: crate::lever::tree::Tree = serde_json::json!({});
     let mut installation_id = String::new();
     let mut last_distro_code_name = String::new();
     let mut last_distro_version = String::new();
     let mut last_rime_version = String::new();
-    if let Some(tree) = crate::lever::tree::load(&installation_info) {
+    if let Some(tree) = loaded {
         config = tree;
         if let Some(id) = crate::lever::tree::get_string(&config, "installation_id") {
             log_info(&format!("installation info exists. installation id: {id}"));
@@ -208,6 +228,9 @@ fn run_installation_update(deployer: &mut Deployer) -> bool {
             log_info(&format!("previous Rime version: {version}"));
             last_rime_version = version;
         }
+    } else {
+        // 读不到或结构不对：回到默认同步目录（C++ 的 else 分支）
+        deployer.sync_dir = deployer.user_data_dir.join(crate::lever::paths::SYNC_DIR);
     }
     if !installation_id.is_empty()
         && last_distro_code_name == deployer.distribution_code_name
@@ -245,6 +268,18 @@ fn run_installation_update(deployer: &mut Deployer) -> bool {
             &deployer.distribution_version,
         );
     }
+    // #1264：写回时带上同步目录与备份开关，否则 `sync_dir` 只存在于内存，
+    // 下次启动（以及用户手动改 installation.yaml）时同步配置会丢失。
+    crate::lever::tree::set_scalar(
+        &mut config,
+        "sync_dir",
+        &deployer.sync_dir.to_string_lossy(),
+    );
+    crate::lever::tree::set_subtree(
+        &mut config,
+        "backup_config_files",
+        serde_json::Value::Bool(deployer.backup_config_files),
+    );
     crate::lever::tree::set_scalar(&mut config, "rime_version", crate::config::RIME_VERSION);
     log_info(&format!("Rime version: {}", crate::config::RIME_VERSION));
     crate::lever::tree::save(&config, &installation_info)
@@ -496,17 +531,8 @@ fn is_customized_copy(path: &Path) -> bool {
 /// （注释原文 "nothing to upgrade"）。这条短路很要紧 —— 它让
 /// `RimeDeployWorkspace()` 的 `&&` 链在"没装旧版词典"的机器上能走完。
 fn run_user_dict_upgrade(deployer: &mut Deployer) -> bool {
-    log_info("upgrading user dictionaries.");
-    if deployer.legacy_user_db.is_none() {
-        // C++ 同款短路：没有 legacy userdb 组件 → 没什么可升级的
-        return true;
-    }
-    let Some(db) = deployer.legacy_user_db.as_mut() else {
-        return true;
-    };
-    // C++ 是**逐个词典**升级（`manager.UpgradeUserDict(*it)`）；我们的
-    // `UserDbFactory::upgrade()` 是聚合动作，所以调一次即可。
-    db.upgrade()
+    // userdb 组件未注册(恒 None)→ 无事可做,返回 true(C++ 同款短路)
+    true
 }
 
 /// `UserDictSync::Run` → `UserDictManager::SynchronizeAll()`（C++ user_dict_manager.cc:210-224）。
@@ -514,20 +540,8 @@ fn run_user_dict_upgrade(deployer: &mut Deployer) -> bool {
 /// 取用户词典列表，逐个同步；有失败就记失败数，全部成功才返回 true。
 /// 没有词典时 C++ 的循环体一次都不进 → 返回 true。
 fn run_user_dict_sync(deployer: &mut Deployer) -> bool {
-    let destination = deployer.user_data_sync_dir();
-    let Some(db) = deployer.user_db.as_mut() else {
-        // 没有 userdb 组件 → 没有可同步的词典（C++ 空列表时同样返回 true）
-        return true;
-    };
-    let names = db.list();
-    log_info(&format!("synchronizing {} user dicts.", names.len()));
-    if names.is_empty() {
-        return true;
-    }
-    if !crate::lever::tree::maybe_create_directory(&destination) {
-        return false;
-    }
-    db.backup(&destination)
+    // userdb 组件未注册(恒 None)→ 无词典可同步,恒 true(C++ 空列表同款)
+    true
 }
 
 /// `CleanOldLogFiles::Run`（C++ deployment_tasks.cc:723-…）。
@@ -583,7 +597,11 @@ fn file_days_since_modified(path: &Path) -> Option<u64> {
 /// 2. 加载已部署产物，`ConfigNeedsUpdate` 比对 `__build_info/timestamps` 与源文件 mtime；
 /// 3. 需要更新 → `config::compile` 编译源文件，产物写 `staged_output`（分类路径，
 ///    `SaveOutputPlugin` 的写侧契约）。
-fn run_config_file_update(deployer: &mut Deployer, file_name: &str, version_key: &str) -> bool {
+pub(crate) fn run_config_file_update(
+    deployer: &Deployer,
+    file_name: &str,
+    version_key: &str,
+) -> bool {
     // 资源 id = file_name 去掉 ".yaml"（C++ 的 config_source_file 类型后缀）
     let Some(resource_id) = file_name.strip_suffix(".yaml") else {
         log_warn(&format!("invalid config file name '{file_name}'"));
@@ -619,7 +637,14 @@ fn run_config_file_update(deployer: &mut Deployer, file_name: &str, version_key:
     // （真机：default.yaml 在用户目录），compile 的根去重后只剩 user 单根，
     // `symbols`/`luna_pinyin_simp` 等只在共享目录的资源全部解析失败
     // （真机 2026-10-26：default 编译 11 处 "resource could not be loaded: symbols"）。
-    match config::compile(&source, &defaults_path, &[deployer.shared_data_dir.clone()]) {
+    // 2026-11-12：补上 user 根 —— 之前只有 shared 单根，`<方案>.custom:/patch?`
+    // 在用户目录根的 `pinyin.custom.yaml` 永远解析不到（C++ 双根语义，注释
+    // 早就写明了，代码漏了 user 这一根）。
+    let mut roots = vec![deployer.user_data_dir.clone()];
+    if deployer.shared_data_dir != deployer.user_data_dir {
+        roots.push(deployer.shared_data_dir.clone());
+    }
+    match config::compile(&source, &defaults_path, &roots) {
         Ok(compiled) => match write_compiled_schema(&compiled, &output) {
             Ok(()) => {
                 log_info(&format!("updated config file '{file_name}' -> {}", output.display()));
@@ -759,12 +784,29 @@ fn compare_version_string(left: &str, right: &str) -> i32 {
 /// 3. reload 产物读 `translator/dict`（正式键；旧产物回退 `dictionary`）—— 有词典才需要 `Dictionary::Create`
 ///    （`.bin` 编译，Rust 留 dict 层接缝）；没有词典的方案到此为止。
 fn run_schema_update(deployer: &mut Deployer, source_path: &Path, verbose: bool) -> bool {
+    // 串行路径：两阶段依次执行，行为与拆分前逐字一致。
+    let Some(schema_id) = compile_schema_config(deployer, source_path, verbose) else {
+        return false;
+    };
+    compile_schema_payload(deployer, &schema_id, verbose)
+}
+
+/// 阶段 A —— 校验源方案 + 把配置编译到 staging，返回 schema_id。
+///
+/// **只读** `deployer` 的路径字段（见 [`compile_schema_payload`] 同理），因此可在
+/// worker 线程里用只含路径的局部 `Deployer` 调用——这是并行部署能复用本函数的关键。
+/// 编译产物落在 `staging/<系列>/<id>/<id>.schema.yaml`，各方案互不重叠。
+pub(crate) fn compile_schema_config(
+    deployer: &Deployer,
+    source_path: &Path,
+    verbose: bool,
+) -> Option<String> {
     if !source_path.is_file() {
         log_warn(&format!(
             "Error updating schema: nonexistent file '{}'.",
             source_path.display()
         ));
-        return false;
+        return None;
     }
     // id = 文件名主干（清单归属；准入已保证与 `schema/id` 一致）
     let Some(schema_id) = source_path
@@ -777,7 +819,7 @@ fn run_schema_update(deployer: &mut Deployer, source_path: &Path, verbose: bool)
             "invalid schema definition in '{}'.",
             source_path.display()
         ));
-        return false;
+        return None;
     };
     // 一致性校验：显式写了 `schema/id` 就必须与文件名一致（load_file 已把
     // 方言单数 `id` 归一化出来；旧式 `schema_id:` 不再参与身份判定）
@@ -796,22 +838,35 @@ fn run_schema_update(deployer: &mut Deployer, source_path: &Path, verbose: bool)
             "schema id mismatch in '{}': declared '{declared}', file name says '{schema_id}'.",
             source_path.display()
         ));
-        return false;
+        return None;
     }
     if verbose {
         log_info(&format!("schema: {schema_id} <- {}", source_path.display()));
     }
-    // 1. 编译写 staging（ConfigFileUpdate 的语义就是"编译配置到 staging"）
-    let config_file_update = DeploymentTask::ConfigFileUpdate {
-        file_name: format!("{schema_id}.schema.yaml"),
-        version_key: "schema/version".to_string(),
-    };
-    if !config_file_update.run(deployer) {
-        return false;
+    // ConfigFileUpdate 的语义就是"编译配置到 staging"
+    if !run_config_file_update(
+        deployer,
+        &format!("{schema_id}.schema.yaml"),
+        "schema/version",
+    ) {
+        return None;
     }
-    // 2. reload 产物，看要不要编译词典（.bin 在 dict 层，留接缝）
+    Some(schema_id.to_string())
+}
+
+/// 阶段 B —— 读 staged 配置，编译该方案的词典 + 辅助码。
+///
+/// **只读** `deployer` 的路径字段，可在 worker 线程里用局部 `Deployer` 调用。
+/// 这一阶段会写共享产物（`<dict>.table.bin` / `prism.bin` / `prisms.list` /
+/// `<group>.aux.bin`），因此并行部署时由 `super::parallel_deploy` 的银行家池按
+/// 资源名 `dict:<name>` / `aux:<group>` 做独占准入：同产物串行、不同产物并行。
+pub(crate) fn compile_schema_payload(
+    deployer: &Deployer,
+    schema_id: &str,
+    verbose: bool,
+) -> bool {
     let layout = deployer.layout();
-    let staged = layout.compiled_schema(&schema_id);
+    let staged = layout.compiled_schema(schema_id);
     // 要不要编译词典:主 `translator/dict`，
     // 或 `translator` 下的变体节 (`translator/simp` / `translator/trad` …,Rime-Next 双变体设计)。
     // 只认嵌套写法:旧式顶层 `simp:` / `trad:` 不再识别。
@@ -834,12 +889,70 @@ fn run_schema_update(deployer: &mut Deployer, source_path: &Path, verbose: bool)
         .unwrap_or(false);
     // 词库一律**单文件直接用**：`translator/dict` 指到哪本就编译哪本，
     // 部署期不做 opencc 生成（没有 simp/trad 标记的更不碰）。
-    if has_dictionary {
+    let dictionaries_ok = if has_dictionary {
         // Dictionary::Create + DictCompiler::Compile（C++ deployment_tasks.cc:402-429）
-        compile_dictionary(deployer, &schema_id, verbose)
+        compile_dictionary(deployer, schema_id, verbose)
     } else {
         log_info(&format!("schema '{schema_id}': not requiring a dictionary"));
         true
+    };
+    if !dictionaries_ok {
+        return false;
+    }
+    // 独立辅助码产物（evo `DictCompiler::CompileAuxiliary`）：与词典无关，
+    // 只要方案里有 `build/auxiliary` 就编。
+    compile_auxiliary_units(deployer, schema_id, verbose)
+}
+
+/// evo `DictCompiler::CompileAuxiliary` 的部署接入：`build/auxiliary/{dictionary,algebra}`
+/// → `<staging>/<group>.aux.bin`。
+///
+/// 没有 `build/auxiliary` 时直接返回 `true`（不报错、不产出）。
+pub(crate) fn compile_auxiliary_units(
+    deployer: &Deployer,
+    schema_id: &str,
+    verbose: bool,
+) -> bool {
+    let layout = deployer.layout();
+    let compiled_schema = layout.compiled_schema(schema_id);
+    let Ok(config) = load_file(&compiled_schema) else {
+        log_error(&format!(
+            "Error loading compiled schema '{}'.",
+            compiled_schema.display()
+        ));
+        return false;
+    };
+    match crate::lever::auxiliary_compiler::compile_auxiliary(
+        &config,
+        &deployer.user_data_dir,
+        &deployer.shared_data_dir,
+        &deployer.staging_dir,
+        verbose,
+    ) {
+        Ok(results) => {
+            if verbose {
+                for result in &results {
+                    log_info(&format!(
+                        "auxiliary group '{}': {} ({} entries, {})",
+                        result.name,
+                        result.path.display(),
+                        result.entries,
+                        if result.recompiled {
+                            "compiled"
+                        } else {
+                            "up-to-date"
+                        }
+                    ));
+                }
+            }
+            true
+        }
+        Err(message) => {
+            log_error(&format!(
+                "schema '{schema_id}': auxiliary compilation failed: {message}"
+            ));
+            false
+        }
     }
 }
 
@@ -869,7 +982,11 @@ fn dict_name_in(node: Option<&serde_json::Value>) -> Option<&str> {
 /// `translator/trad` …）是**一个变体词库**，逐个编译。旧式顶层 `simp:` / `trad:` 一节
 /// 不再识别（不兼容）。词库一律单文件直接用：变体（`translator/simp` / `translator/trad`）
 /// 各自指到一份现成的 `.dict.yaml`，**不做 opencc 生成/转换**；源缺失就跳过该变体。
-fn compile_dictionary(deployer: &mut Deployer, schema_id: &str, verbose: bool) -> bool {
+pub(crate) fn compile_dictionary(
+    deployer: &Deployer,
+    schema_id: &str,
+    verbose: bool,
+) -> bool {
     let layout = deployer.layout();
     let compiled_schema = layout.compiled_schema(schema_id);
     let Ok(config) = load_file(&compiled_schema) else {
@@ -939,7 +1056,7 @@ fn compile_dictionary(deployer: &mut Deployer, schema_id: &str, verbose: bool) -
         } else {
             Vec::new()
         };
-        let mut compiler = crate::dict::dict_compiler::DictCompiler::new(
+        let mut compiler = crate::gear::dict::dict_compiler::DictCompiler::new(
             dict_name.clone(),
             prism_name.clone(),
             packs,
@@ -950,11 +1067,74 @@ fn compile_dictionary(deployer: &mut Deployer, schema_id: &str, verbose: bool) -
         );
         if verbose {
             // C++：verbose_ → kRebuild | kDump（kDump 未移植，只留 kRebuild）
-            compiler.set_options(crate::dict::dict_compiler::CompileOptions::rebuild_all());
+            compiler.set_options(crate::gear::dict::dict_compiler::CompileOptions::rebuild_all());
         }
+        // 阶段 B：`build/dictionaries.<dict>.algebra`（列表=主 prism，映射=额外 prism）。
+        // 本词库的节点写坏了就让该词库失败；其他形态的异常已在解析器里记日志跳过。
+        // 同时记下"有没有该节点"与"声明了哪些组"：部署成功后要落盘棱镜索引，
+        // 子方案没有这个节点，不能拿空集合覆盖主方案写好的索引。
+        let (has_build_node, declared_groups) =
+            match crate::gear::dict::dict_compiler::parse_build_dictionaries(&config, &dict_name) {
+                Ok(spec) => {
+                    // 单数方言 `build/dict/` 也要算「有声明」，否则棱镜索引漏写。
+                    let has_build_node = crate::gear::dict::dict_compiler::build_dict_node(
+                        &config,
+                        &dict_name,
+                    )
+                    .is_some();
+                    let groups: Vec<String> = spec
+                        .extra_prisms
+                        .keys()
+                        .filter_map(|qualified| {
+                            qualified
+                                .strip_prefix(&format!("{dict_name}."))
+                                .map(str::to_string)
+                        })
+                        .collect();
+                    compiler.set_primary_algebra(spec.primary_algebra);
+                    compiler.set_extra_prisms(spec.extra_prisms);
+                    (has_build_node, groups)
+                }
+                Err(error) => {
+                    log_error(&format!(
+                        "dictionary '{dict_name}' build/dictionaries config is invalid: {error}"
+                    ));
+                    all_ok = false;
+                    continue;
+                }
+            };
         match compiler.compile(Some(&compiled_schema)) {
             Ok(()) => {
                 log_info(&format!("dictionary '{dict_name}' is ready."));
+                // 部署结束（该词库编译完成）时把实际产出的棱镜集合落成索引，
+                // 供运行时按名字自动认；写失败只记日志，不影响部署结果。
+                if has_build_node {
+                    // 先清掉上一次部署留下、本次已不在声明集合里的棱镜
+                    // （`input_types.enabled` 缩小后旧组必须消失），再写索引。
+                    let removed = crate::gear::dict::prism_index::prune_stale_prisms(
+                        &deployer.staging_dir,
+                        &dict_name,
+                        &declared_groups,
+                    );
+                    if removed > 0 {
+                        log_info(&format!(
+                            "dictionary '{dict_name}' pruned {removed} stale prism file(s)"
+                        ));
+                    }
+                    match crate::gear::dict::prism_index::write_index(
+                        &deployer.staging_dir,
+                        &dict_name,
+                        &declared_groups,
+                    ) {
+                        Ok(entries) => log_info(&format!(
+                            "dictionary '{dict_name}' prism index written: {} entries",
+                            entries.len()
+                        )),
+                        Err(error) => log_warn(&format!(
+                            "dictionary '{dict_name}' prism index not written: {error}"
+                        )),
+                    }
+                }
             }
             Err(error) => {
                 if skippable && dict_source_missing(&error) {
@@ -1068,15 +1248,38 @@ fn run_workspace_update(deployer: &mut Deployer) -> bool {
         ));
     }
     let manifest = load_schema_manifest(&deployer.user_data_dir);
-    let mut schema_ids = manifest.schemas.clone();
-    if schema_ids.is_empty() {
+    let raw_ids = manifest.schemas.clone();
+    if raw_ids.is_empty() {
         log_warn("schema list not defined; 程序文件夹里没识别到任何过准入检查的方案。");
         return false;
     }
+    // 2026-11-11 修正：「不选 pinyin 的时候子方案禁用，不是 pinyin 也禁用了」。
+    // schema.yaml 的 active/schemas 一个字节都不动；只按 disabled.yaml 的显式禁用
+    // + schema.parent 推出的「父未选压住子方案」过滤**内存中的**部署清单。
+    let (schema_ids, disabled) = super::schema_disabled::enabled_ids(
+        &deployer.user_data_dir,
+        &deployer.shared_data_dir,
+        &raw_ids,
+    );
+    if schema_ids.is_empty() {
+        log_warn(&format!(
+            "[Weasel-Next] {} 个勾选方案全被压住（显式禁用或父方案未勾选）；源 schema.yaml 原样保留，本次不部署任何方案。",
+            raw_ids.len()
+        ));
+        return false;
+    }
     log_info(&format!(
-        "[Weasel-Next] 方案清单：{} 项（schema/schema.yaml 为唯一权威）",
-        schema_ids.len()
+        "[Weasel-Next] 方案清单：原始 {} 项 → 实际部署 {} 项（当前不部署 {} 项；schema/schema.yaml 为唯一权威且未被改写）",
+        raw_ids.len(),
+        schema_ids.len(),
+        disabled.len()
     ));
+    if !disabled.is_empty() {
+        log_info(&format!(
+            "[Weasel-Next] 当前不部署（显式禁用或父未选压住；不编译、不进菜单）：{}",
+            disabled.iter().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
 
     // 4. 逐方案编译 + dependencies 递归（C++ 的 build_schema lambda）
     let layout = deployer.layout();
@@ -1101,6 +1304,10 @@ fn run_workspace_update(deployer: &mut Deployer) -> bool {
             }
             continue;
         }
+        // 2026-11-11 台账：哈希复用引擎已有的源文件 checksum，到达 = 编译前墙钟，
+        // 结束 = 编译后墙钟。每个方案一行，用户根与 build 各写一份。
+        let hash = crate::lever::tree::checksum(&source);
+        let arrival_ms = crate::lever::deployer::wall_now_ms();
         let task = DeploymentTask::SchemaUpdate {
             source_path: source,
             // C++ `SchemaUpdate` 构造器恒 verbose_=false（`deployment_tasks.cc:308`，
@@ -1110,6 +1317,12 @@ fn run_workspace_update(deployer: &mut Deployer) -> bool {
         };
         if task.run(deployer) {
             success += 1;
+            deployer.append_deploy_record(
+                &schema_id,
+                hash,
+                arrival_ms,
+                crate::lever::deployer::wall_now_ms(),
+            );
         } else {
             failure += 1;
             continue;
@@ -1611,6 +1824,76 @@ schemas = ["a", "b"]
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// 2026-11-11 回归：禁用 pinyin 组后，串行 workspace 部署必须
+    /// ① `schema.yaml` 原始 4 项 + active 逐字节不动；② 禁用组及其子方案不编译；
+    /// ③ `staging/default.yaml` 的 `schema_list` 只剩未禁用方案。
+    #[test]
+    fn workspace_update_filters_disabled_group_but_preserves_manifest() {
+        let root = std::env::temp_dir().join(format!("disabled-deploy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let shared = root.join("shared");
+        let user = root.join("user");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::create_dir_all(user.join("schema")).unwrap();
+        std::fs::write(shared.join("default.yaml"), "config_version: 2\nschema_list: []\n").unwrap();
+
+        // 4 个真实方案源；pinyin.luna 声明 parent: pinyin，让组禁用可展开。
+        for (id, parent) in [
+            ("pinyin", None),
+            ("pinyin.luna", Some("pinyin")),
+            ("wubi86", None),
+            ("liangfen", None),
+        ] {
+            let path = user
+                .join("schema")
+                .join(id.replace('.', "/"))
+                .join(format!("{id}.schema.yaml"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let parent_line = parent
+                .map(|p| format!("  parent: {p}\n"))
+                .unwrap_or_default();
+            std::fs::write(
+                &path,
+                format!("schema:\n  schema_id: {id}\n  name: {id}\n{parent_line}"),
+            )
+            .unwrap();
+        }
+
+        let manifest = "# 方案信息\nactive: pinyin\nschemas:\n  - pinyin\n  - pinyin.luna\n  - wubi86\n  - liangfen\n";
+        let manifest_path = user.join("schema").join("schema.yaml");
+        std::fs::write(&manifest_path, manifest).unwrap();
+        std::fs::write(
+            user.join("schema").join("disabled.yaml"),
+            "groups:\n  - pinyin\nschemas: []\n",
+        )
+        .unwrap();
+
+        let mut deployer = Deployer::with_data_dirs(&shared, &user);
+        assert!(run_workspace_update(&mut deployer), "部署本身应成功");
+
+        assert_eq!(
+            std::fs::read_to_string(&manifest_path).unwrap(),
+            manifest,
+            "禁用后 schema.yaml 必须逐字节不变（active 与 4 项勾选都在）"
+        );
+        let staging = user.join("build");
+        let deployed = load_file(&staging.join("default.yaml")).unwrap();
+        assert_eq!(
+            schema_list_from_json(&deployed),
+            vec!["wubi86".to_string(), "liangfen".to_string()],
+            "输入 4 项 + groups=[pinyin] → build/default.yaml 只应剩 wubi86, liangfen（保序）"
+        );
+        assert!(
+            !staging.join("pinyin").exists(),
+            "禁用组的编译产物不该生成"
+        );
+        assert!(
+            staging.join("wubi86/wubi86.schema.yaml").is_file(),
+            "未禁用方案仍要正常编译"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn detect_modifications_compares_yaml_mtime_with_last_build_time() {
         let root = std::env::temp_dir().join(format!("detect-test-{}", std::process::id()));
@@ -1681,6 +1964,75 @@ schemas = ["a", "b"]
 
         // 再跑一次：CRC 相同 → latest，不报错
         assert!(DeploymentTask::BackupConfigFiles.run(&mut deployer));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #1264：`installation.yaml` 结构被写坏（不是 Map）时按空配置重建，
+    /// 并把默认同步目录写回文件。
+    #[test]
+    fn installation_update_rebuilds_non_map_config() {
+        let root = std::env::temp_dir().join(format!("inst-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut deployer = Deployer::new_in(&root);
+        std::fs::create_dir_all(&deployer.user_data_dir).unwrap();
+        let info = deployer.user_data_dir.join("installation.yaml");
+        std::fs::write(&info, "- a\n- b\n").unwrap();
+
+        assert!(run_installation_update(&mut deployer));
+
+        let config = crate::lever::tree::load(&info).expect("应写出 installation.yaml");
+        assert!(config.is_object(), "坏结构应被重建成 Map");
+        assert!(
+            crate::lever::tree::get_string(&config, "installation_id").is_some(),
+            "重建后应生成 installation id"
+        );
+        assert_eq!(
+            crate::lever::tree::get_string(&config, "sync_dir").as_deref(),
+            Some(
+                deployer
+                    .user_data_dir
+                    .join(crate::lever::paths::SYNC_DIR)
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert_eq!(
+            crate::lever::tree::get_bool(&config, "backup_config_files"),
+            Some(true)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #1264：首次安装时也要把 `sync_dir` / `backup_config_files` 持久化，
+    /// 否则重启后同步配置丢失。
+    #[test]
+    fn installation_update_writes_sync_dir_and_backup_defaults() {
+        let root = std::env::temp_dir().join(format!("inst-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut deployer = Deployer::new_in(&root);
+        deployer.backup_config_files = false;
+
+        assert!(run_installation_update(&mut deployer));
+
+        let info = deployer.user_data_dir.join("installation.yaml");
+        let config = crate::lever::tree::load(&info).expect("应写出 installation.yaml");
+        assert_eq!(
+            crate::lever::tree::get_string(&config, "sync_dir").as_deref(),
+            Some(
+                deployer
+                    .user_data_dir
+                    .join(crate::lever::paths::SYNC_DIR)
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert_eq!(
+            crate::lever::tree::get_bool(&config, "backup_config_files"),
+            Some(false),
+            "用户关闭备份后应持久化 false"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

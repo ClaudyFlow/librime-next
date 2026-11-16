@@ -5,32 +5,36 @@
 //!
 //! # 组件装配（`InitializeComponents`）
 //!
-//! 方案编译后的 `engine/processors` / `engine/translators` 列表由 [`crate::engine::gear::registry`]
+//! 方案编译后的 `engine/processors` / `engine/translators` 列表由 [`crate::gear::registry`]
 //! 逐个创建，**没移植的组件跳过而不是让链条断掉**（等同 C++ `Require` 失败的处理）。
 //! 列表为空时回退到 `[speller, selector]` —— 保证只装配ator了 Schema 的测试环境仍可打字。
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver};
 
-use crate::dict::dictionary::Dictionary;
+use crate::gear::dict::dictionary::Dictionary;
 use crate::engine::candidate::Candidate;
 use crate::engine::composition::Composition;
 use crate::engine::context::Context;
-use crate::engine::gear::abc_segmentor::AbcSegmentor;
-use crate::engine::gear::fallback_segmentor::FallbackSegmentor;
-use crate::engine::gear::filter::Filter;
-use crate::engine::gear::matcher::Matcher;
-use crate::engine::gear::processor::{ProcessResult, Processor};
-use crate::engine::gear::registry::{ComponentEntry, install_engine_components};
-use crate::engine::gear::schema_list_translator;
-use crate::engine::gear::segmentor::{Segmentor, SegmentorView};
-use crate::engine::gear::selector::Selector;
-use crate::engine::gear::speller::Speller;
-use crate::engine::gear::translator::{ScriptTranslator, Translator};
+use crate::gear::segmentor::abc_segmentor::AbcSegmentor;
+use crate::gear::segmentor::fallback_segmentor::FallbackSegmentor;
+use crate::gear::filter::filter::Filter;
+use crate::gear::segmentor::matcher::Matcher;
+use crate::gear::processor::{ProcessResult, Processor};
+use crate::gear::registry::{ComponentEntry, install_engine_components};
+use crate::gear::schema::list_translator;
+use crate::gear::segmentor::{Segmentor, SegmentorView};
+use crate::gear::processor::selector::Selector;
+use crate::gear::processor::speller::Speller;
+use crate::gear::translator::{ScriptTranslator, Translator};
 use crate::engine::key_event::{KeyEvent, XK_SPACE};
 use crate::engine::menu::Menu;
-use crate::engine::schema::Schema;
+use crate::gear::schema::Schema;
+use crate::signal::{Notification, Signal};
 use crate::engine::segmentation::{SegStatus, Segmentation};
-use crate::engine::switcher::{self, Switcher};
+use crate::gear::processor::switcher::{self, Switcher};
 
 /// 引擎（对照 C++ `Engine`）。
 ///
@@ -89,7 +93,7 @@ pub struct Engine {
     rescore_seen_generation: u64,
     /// 上一次真正应用到候选菜单的落地签名。代数变了但内容没变(恒等 order、
     /// 同文本预测)时跳过 re-compose——抄 msime `glosses_changed` 的「没变不推帧」。
-    rescore_applied_signature: Option<crate::engine::gear::rescore::LandingSignature>,
+    rescore_applied_signature: Option<crate::gear::filter::rescore::LandingSignature>,
     /// 菜单刚被确认关闭时置位：吞掉宿主紧接着重复投递的那一下空格。
     ///
     /// TSF 的 `OnTestKeyDown` 会真的把按键送进引擎，`OnKeyDown` 靠 `tested_key`
@@ -112,11 +116,54 @@ pub struct Engine {
     /// （`nihao` 在全拼是 `ni hao`，在自然码可能是别的音节），所以切换时
     /// **清空当前组字**——与切方案 `apply_schema` 里的 `context.clear()` 一致。
     /// 见 [`Engine::process_key`] 与 [`Engine::set_option`]。
-    input_type_options: Vec<String>,
+    ///
+    /// `pub(crate)`：`switcher` 的单元测试要构造"当前可切输入类型"的引擎状态。
+    pub(crate) input_type_options: Vec<String>,
     /// 分阶段计时（2026-11-08）：`WEASEL_STAGE_TRACE=1` 时才填，平时全 0。
     pub last_stages: StageTimings,
     /// 本次按键的阶段关联 id（`WEASEL_STAGE_TRACE=1` 时递增；关闭时为 0）。
     stage_seq: u64,
+    /// 信号订阅接收端：引擎订阅自己在全局总线上的 `OptionChanged`（由
+    /// `Context::set_option` / 任意组件经 `Context::set_option` 发出），用 Qt 队列连接
+    /// 语义在 [`Self::drain_option_signals`] 处同步消费——把"开关变化 ⇒ 组件刷新 / 清空 /
+    /// 重译"从直接调用改成信号反应（对齐 Qt 的 `engine->onOptionChanged` 槽）。
+    signal_rx: Receiver<Notification>,
+    /// 本引擎在全局总线上的订阅句柄（`connect_queued` 返回值），用于 [`Drop`] 退订，避免
+    /// 测试/并发会话里残留的 queued 槽污染总线计数与其它引擎的队列。
+    signal_sub: u64,
+    /// 引擎"已反应过"的开关快照，供信号槽推算 `changed`（对齐 Qt 槽里用旧值比对新值）。
+    /// 键缺省视为 `false`，与 `Context::get_option` 的默认值一致。
+    signal_option_mirror: HashMap<String, bool>,
+}
+
+/// 每引擎唯一会话号（从 1 起，避开 `0` 的"未绑定"语义）。用于在**全局**信号总线上把
+/// 本引擎自己发出的 `OptionChanged` 与别的引擎 / 宿主区分开——等价于 Qt 的对象线程亲和
+/// 隔离，避免多引擎在总线上互相收信号。`session.rs` 在会话绑定后会用真实会话号覆盖
+/// `Context::signal_session_id`，但订阅句柄不变，槽过滤仍按当时的 `signal_session_id` 走。
+static NEXT_ENGINE_SESSION: AtomicU64 = AtomicU64::new(1);
+fn next_engine_session() -> usize {
+    NEXT_ENGINE_SESSION.fetch_add(1, Ordering::Relaxed) as usize
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // 退订全局总线：queued 槽不摘会一直挂在快照里，SUBSCRIBER_COUNT 虚高还会
+        // 让别的引擎/会话的 set_option 白白发信号。
+        crate::signal::disconnect(self.signal_sub);
+    }
+}
+
+/// [`Engine::drain_option_signals`] 的反应计划——信号槽里决定"要做什么"，调用方拿到
+/// `&mut Engine` 后执行（`compose` 需要 `&mut self`，槽里只有字段级拆借）。
+#[derive(Default)]
+struct OptionReaction {
+    /// 重算组件启用条件（`refresh_component_conditions`）。对齐原语义：**每次**收到
+    /// 自己的 OptionChanged 都重算，与 changed 无关。
+    refresh: bool,
+    /// 输入类型开关变了 ⇒ 清空当前组字（context switch，不保留重译）。
+    clear: bool,
+    /// 组字中 ⇒ 刷新未确认段并重译。
+    compose: bool,
 }
 
 /// 一次按键在引擎内部的阶段耗时（微秒）。**各段可加**：都取自同一条同步调用链，
@@ -202,7 +249,7 @@ impl Engine {
         // `switcher_->CreateSchema()` 的结果）。挑法是"上次用过的，否则清单第一条"。
         let resolved_id = if schema_id == ".default" || schema_id.is_empty() {
             let previous = switcher::load_previous_schema(user_dir.as_deref());
-            schema_list_translator::pick_initial_schema(&default_config, previous.as_deref())?
+            list_translator::pick_initial_schema(&default_config, previous.as_deref())?
         } else {
             schema_id.to_string()
         };
@@ -236,8 +283,21 @@ impl Engine {
             input_type_options: Vec::new(),
             last_stages: StageTimings::default(),
             stage_seq: 0,
+            // 占位通道：真正订阅在 initialize_components 之后（初始化期的 set_option
+            // 不该触发组件反应，见 `create_with_roots` 尾部的订阅逻辑）。
+            signal_rx: mpsc::sync_channel(1).1,
+            signal_sub: 0,
+            signal_option_mirror: HashMap::new(),
         };
         engine.initialize_components();
+        // 独立引擎（测试 / 未挂会话）也给一个唯一号：全局总线按 session_id 过滤，
+        // 两个都挂在 0 上的引擎会互收对方的 OptionChanged。
+        engine.context.signal_session_id = next_engine_session();
+        // 初始化完成后再订阅：`initialize_options` 等初始化期的 `set_option` 只落状态、
+        // 不进信号反应（对齐 C++ 初始化时 `UpdateComponentConditions` 不致清空组字）。
+        let (signal_tx, signal_rx) = mpsc::sync_channel(256);
+        engine.signal_sub = crate::signal::connect_queued(signal_tx);
+        engine.signal_rx = signal_rx;
         trace_schema_ms(&format!("create_with_roots 总计({resolved_id})"), t_total);
         Some(engine)
     }
@@ -255,7 +315,8 @@ impl Engine {
         // 输入类型开关清单来自方案配置，必须在任何按键进来之前算好（切方案后
         // `apply_schema` 会重新走这里）。没配 `prisms` / `input_types` 时为空，
         // 下面 `process_key` / `set_option` 的清理逻辑整段跳过。
-        self.input_type_options = collect_input_type_options(&self.schema.config);
+        self.input_type_options =
+            collect_input_type_options(&self.schema.config, Some(&self.build_dir));
         let trace_options = std::time::Instant::now();
         self.initialize_options();
         trace_schema_ms("  initialize_options", trace_options);
@@ -453,6 +514,9 @@ impl Engine {
             // 置位是为了覆盖"输入本来就是空、只挂着 switcher 空段"的边角情况。
             self.context.needs_recompose = true;
         }
+        // 组件在本次按键里改过的 option 信号只同步镜像、不重复反应——上面的
+        // refresh / 输入类型清空已经是同样的反应，信号槽再走一遍会把用户刚敲的串清掉。
+        self.sync_option_mirror_from_signals();
         // 删词这类操作输入没变、但末段已被 reopen，同样要重算（21:xx）。
         if let Some(t) = t_start {
             self.last_stages.proc_us = t.elapsed().as_micros() as u64;
@@ -527,7 +591,7 @@ impl Engine {
         // 所以在 `elements` 的提前返回之前取走并学习。
         let rerank_samples = self.context.take_rerank_samples();
         if crate::engine::privacy::learning_enabled() {
-            crate::engine::gear::neural::rerank_head::observe_samples(&rerank_samples);
+            crate::gear::neural::rerank_head::observe_samples(&rerank_samples);
         }
         if elements.is_empty() {
             return;
@@ -592,7 +656,7 @@ impl Engine {
         // 候选窗那条共用；关掉时联想条整个收起（也不回退个人 n-gram）。
         // 闸门本身在 `rescore::predict_sync` 入口还有一道；这里只需要知道
         // 「要不要回退个人 n-gram」。
-        let predictions_on = crate::engine::gear::neural::predictions_enabled();
+        let predictions_on = crate::gear::neural::predictions_enabled();
         let neural = if predictions_on && is_neural_predict_word(&word) {
             // 「不读上文」时只把刚上屏的词交给模型，不带历史上下文。
             let context = if crate::engine::privacy::context_enabled() {
@@ -600,7 +664,7 @@ impl Engine {
             } else {
                 word.clone()
             };
-            crate::engine::gear::rescore::predict_sync(&context, &word, 4)
+            crate::gear::filter::rescore::predict_sync(&context, &word, 4)
         } else {
             Vec::new()
         };
@@ -633,7 +697,7 @@ impl Engine {
     /// 由 C API 的 `rime_get_context` 在每次快照前调用:宿主每键/每次重绘
     /// 都会读上下文,落地的分最多迟一个读周期就能上屏。
     pub fn poll_rescore_landing(&mut self) {
-        let Some(worker) = crate::engine::gear::rescore::global() else {
+        let Some(worker) = crate::gear::filter::rescore::global() else {
             return;
         };
         let generation = worker.current_generation();
@@ -645,9 +709,28 @@ impl Engine {
         // 先逐条比「这次落地的东西」和「屏幕上的东西」。恒等 order / 同文本
         // 预测对候选菜单没有任何影响，再 compose 一次是纯浪费（实测每键一帧）。
         let landed = worker.last_landed();
-        let needs_recompose = landed.as_ref().map_or(true, |sig| {
+        let mut needs_recompose = landed.as_ref().map_or(true, |sig| {
             sig.changes_from(self.rescore_applied_signature.as_ref())
         });
+        // 抄 CloudInputMethodEditor `advance_rescoring` 的 navigated 闸门
+        // （目标仓 GPL-3.0，只取思路）：异步结果落地时若用户已经翻页或
+        // 动过高亮，当前页已被接管，重排换序会让整页内容跳变 ⇒ 丢弃这次落地。
+        // 下一轮打字（高亮回 0、新批次落地）自然恢复神经顺序。
+        if needs_recompose
+            && let Some(submitted) = worker.last_landed_nav()
+        {
+            let current = crate::gear::filter::rescore::NavSnapshot::new(
+                self.context.highlight_index(),
+                self.context.page_size,
+            );
+            if submitted.defers(&current) {
+                needs_recompose = false;
+                tracing::debug!(
+                    "[导航闸门] 丢弃异步落地：提交时高亮={}/页大小={}，落地时高亮={}/页大小={}",
+                    submitted.highlight, submitted.page_size, current.highlight, current.page_size
+                );
+            }
+        }
         if !needs_recompose {
             return;
         }
@@ -769,6 +852,10 @@ impl Engine {
                 let t_init = std::time::Instant::now();
                 self.initialize_components();
                 trace_schema_ms(&format!("initialize_components({schema_id})"), t_init);
+                // 重新初始化期间 `initialize_options` 的 set_option 已发过信号：组件链
+                // 是按新方案全新装配的、条件天然正确，这里只同步镜像，防止下次
+                // `set_option` 把这批信号当新变化误清组字。
+                self.sync_option_mirror_from_signals();
                 self.context.clear();
                 // C++ `Schema::page_size` 是引擎级的：selector 翻页、c_api 菜单都读它
                 self.context.page_size = self.schema.page_size;
@@ -834,22 +921,89 @@ impl Engine {
     /// C++ `set_option` 会发 `option_update_notifier` ⇒ `OnOptionUpdate` ⇒
     /// `UpdateComponentConditions`——组件的 `when` 条件**立即**重算。漏了这一步,
     /// 宿主经 API 切开关(简繁/西文中文)后,组件列表要等下一次按键才自愈。
+    ///
+    /// **信号化（Qt 范式）**：这里只负责"发"——`Context::set_option` 把
+    /// `OptionChanged` 挂上总线（其中就有本引擎自己的 queued 订阅），随后
+    /// [`Self::drain_option_signals`] 消费自己的队列并给出反应计划。跨模块路径
+    /// （开关变化 ⇒ 组件刷新 / 清空 / 重译）全部经信号，不再有 set_option →
+    /// refresh 的直接调用；组件在任何地方经 `Context::set_option` 改开关也走同一条路。
     pub fn set_option(&mut self, name: &str, value: bool) {
-        let changed = self.context.get_option(name) != value;
         self.context.set_option(name, value);
-        self.refresh_component_conditions();
-        if changed && self.input_type_options.iter().any(|option| option == name) {
+        let act = self.drain_option_signals();
+        if act.refresh {
+            self.refresh_component_conditions();
+        }
+        if act.clear {
             // 与 `process_key` 的 key_binder 路径同一语义：换输入类型 ⇒ 清空组字。
             // 这里覆盖 TIP 侧直接调 `set_option` 的入口，避免"按键切清空、接口切
             // 保留重译"两套行为。
             self.context.clear();
             return;
         }
-        if self.context.is_composing() {
+        if act.compose {
             // C++ OnOptionUpdate:组字中 ⇒ `RefreshNonConfirmedComposition` ⇒ 重算
             self.context.refresh_non_confirmed_composition();
             self.compose();
         }
+    }
+
+    /// Qt 槽 `Engine::onOptionChanged` 的等价物：从本引擎的信号队列取出
+    /// `OptionChanged` 并推算反应计划。
+    ///
+    /// `changed` 用镜像（上次已反应过的值）推算，对齐 Qt 槽里"用旧值比对新值"；
+    /// 镜像缺省视为 `false`，与 `Context::get_option` 的默认一致。其它引擎 / 宿主
+    /// 发的信号按 `session_id` 过滤掉（对象亲和隔离）。
+    fn drain_option_signals(&mut self) -> OptionReaction {
+        // 字段级拆借：闭包要可变借用镜像/context/输入类型清单，drain 又要借
+        // signal_rx —— 整个 `&mut self` 会撞借用，按字段拆开才互不相交。
+        let Engine {
+            signal_rx,
+            signal_option_mirror,
+            context,
+            input_type_options,
+            ..
+        } = self;
+        let mut act = OptionReaction::default();
+        crate::signal::drain(signal_rx, |note| {
+            let Signal::OptionChanged { name, on } = &note.signal else {
+                return;
+            };
+            if note.session_id != context.signal_session_id {
+                return;
+            }
+            let prev = signal_option_mirror.get(name).copied().unwrap_or(false);
+            signal_option_mirror.insert(name.clone(), *on);
+            act.refresh = true;
+            if prev != *on && input_type_options.iter().any(|option| option == name) {
+                act.clear = true;
+            }
+            if context.is_composing() {
+                act.compose = true;
+            }
+        });
+        act
+    }
+
+    /// 只消费队列、更新镜像，**不做任何反应**。
+    ///
+    /// `process_key` 里组件改 option 的反应已由那里的 refresh/输入类型清空逻辑
+    /// （对照 C++ `ProcessKey` 尾部）做过；若不把那些信号从这里收走并同步镜像，
+    /// 下次 [`Self::set_option`] 会把它们当新变化再反应一遍——可能把用户刚敲的串清掉。
+    fn sync_option_mirror_from_signals(&mut self) {
+        let Engine {
+            signal_rx,
+            signal_option_mirror,
+            context,
+            ..
+        } = self;
+        crate::signal::drain(signal_rx, |note| {
+            if note.session_id != context.signal_session_id {
+                return;
+            }
+            if let Signal::OptionChanged { name, on } = &note.signal {
+                signal_option_mirror.insert(name.clone(), *on);
+            }
+        });
     }
 
     /// 当前各输入类型开关的状态快照（用于检测一次按键里是否发生了切换）。
@@ -908,19 +1062,67 @@ impl Engine {
     /// 选项——明月简体的 `zh_simp`（`reset: 1`）就靠它置真，simplifier 才会
     /// 生效。此前没移植，所有开关选项默认 false，simplifier 永远不生效。
     fn initialize_options(&mut self) {
-        let switches = crate::engine::switches::Switches::new(&self.schema.config);
+        let switches = crate::gear::schema::switches::Switches::new(&self.schema.config);
         for option in switches.all_options() {
             if option.reset_value < 0 {
                 continue; // 没配 reset 的开关保持默认
             }
             let value = match option.kind {
-                crate::engine::switches::SwitchType::ToggleOption => option.reset_value != 0,
-                crate::engine::switches::SwitchType::RadioGroup => {
+                crate::gear::schema::switches::SwitchType::ToggleOption => option.reset_value != 0,
+                crate::gear::schema::switches::SwitchType::RadioGroup => {
                     option.option_index as i32 == option.reset_value
                 }
             };
             self.context.set_option(&option.option_name, value);
         }
+        // 顶层 `input_types.reset` = 默认选中的输入类型。若它不在可用清单里（比如
+        // 从 `enabled` 里删掉了），回退到清单第一项并记日志：报错会让整个方案起
+        // 不来，回退到"options 顺序的第一项"则是确定且可预测的，键盘仍可用。
+        if let Some(reset) = crate::gear::dict::dict_compiler::input_types_reset(&self.schema.config) {
+            use crate::lever::tree::log_warn;
+            let chosen = if self.input_type_options.iter().any(|name| name == &reset) {
+                reset
+            } else if let Some(fallback) = self.input_type_options.first().cloned() {
+                log_warn(&format!(
+                    "input_types.reset: '{reset}' 不在可用输入类型里（可用：{}），回退到 '{fallback}'",
+                    self.input_type_options.join(", ")
+                ));
+                fallback
+            } else {
+                reset
+            };
+            for option in &self.input_type_options {
+                self.context.set_option(option, option == &chosen);
+            }
+        }
+    }
+
+    /// 切换输入类型（互斥单选）：把 `name` 设为 true，其余 `input_type_options` 设
+    /// false，并清空已组字。供方案菜单第二级的 [`crate::gear::processor::switcher::SwitcherCommand::InputType`]
+    /// 使用——与 `initialize_options` 的互斥循环同语义，但运行期可随时调用，
+    /// 不依赖 `input_types.reset`。
+    ///
+    /// 运行期若只 `set_option(name, true)` 而不清兄弟项，会有多个 input_type 开关同时
+    /// 为真；`input_type_speller` / translator 的 `sync_context` 用 `find` 取**第一个**为
+    /// 真的项，于是实际生效类型退化为"字母序最小的那一个"，表现不可预测。这里强制
+    /// 互斥，保证 `name` 是唯一为真的项。
+    pub(crate) fn select_input_type(&mut self, name: &str) {
+        if !self.input_type_options.iter().any(|option| option == name) {
+            return; // 不在可用清单里：忽略，避免越权 option 名
+        }
+        // 先拷出清单再改 self：循环里调 `set_option` 会可变借用 `self`，若直接迭代
+        // `&self.input_type_options` 会触发借用冲突（E0502）。
+        let options = self.input_type_options.clone();
+        for option in &options {
+            let selected = option == name;
+            if self.context.get_option(option) != selected {
+                self.set_option(option, selected);
+            }
+        }
+        // 换类型清空组字（与 `set_option` 的 input_type 分支一致；上面循环里最后一个
+        // 变化的 input_type 已触发过 clear，这里再补一次确保干净）。
+        self.context.clear();
+        self.swallow_next_space = true;
     }
 
     /// C++ `CalculateSegmentation`：让每个 segmentor 依次 `Proceed`，跑完一轮 `Forward`。
@@ -1014,7 +1216,7 @@ impl Engine {
             // 实现；懒化下翻译器在查询时不知道自己会不会有产出，所以把兜底流
             // 挂成 [`TieredTranslation`] 的**最底层**——上层全部穷尽了它才浮现，
             // 与 C++ 的 Compare 行为逐条对齐。
-            let mut fallback: Option<Box<dyn crate::engine::gear::translation::Translation>> = None;
+            let mut fallback: Option<Box<dyn crate::gear::translator::translation::Translation>> = None;
             // 段标签决定翻译器是否认领这段（C++ `segment.HasAnyTagIn(tags_)`）——
             // 标签现在由 translator 自己从 `segment.tags` 读，不再单独传。
             for entry in &mut translators {
@@ -1034,7 +1236,7 @@ impl Engine {
                         }
                         if !items.is_empty() {
                             fallback = Some(Box::new(
-                                crate::engine::gear::translation::VecTranslation::new(items),
+                                crate::gear::translator::translation::VecTranslation::new(items),
                             ));
                         }
                     }
@@ -1106,7 +1308,7 @@ impl Engine {
             // 神经重排:最后一段、滤镜链最外层(见 neural/rescore_filter.rs)。
             if i + 1 == n {
                 // 方案配置 `translator/enable_rerank_head`（缺省 true = 影子模式）。
-                let head_enabled = crate::engine::gear::neural::rerank_head::scheme_enabled(
+                let head_enabled = crate::gear::neural::rerank_head::scheme_enabled(
                     &self.schema.config,
                 );
                 // 个性化开关只影响线性头的 pin 特征；关掉后与基线逐位一致。
@@ -1121,7 +1323,7 @@ impl Engine {
                     })
                     .unwrap_or(true);
                 let mut neural_filter =
-                    crate::engine::gear::neural::NeuralRescoreFilter::new(
+                    crate::gear::neural::NeuralRescoreFilter::new(
                         head_enabled,
                         personalization_enabled,
                     );
@@ -1133,7 +1335,7 @@ impl Engine {
                 }
                 // 续写预测:后挂 ⇒ 包在重排外面，拿到的是重排后的顺序。
                 // 只在候选稀薄时才真出手(见 neural/predict_filter.rs)。
-                let mut predict_filter = crate::engine::gear::neural::NeuralPredictFilter;
+                let mut predict_filter = crate::gear::neural::NeuralPredictFilter;
                 if predict_filter.applies_to_segment(
                     context,
                     &context.composition.segmentation.segments[i],
@@ -1181,7 +1383,7 @@ impl Engine {
     /// 测试专用：不加载方案的空引擎（处理器链与翻译器链为空）。
     #[cfg(test)]
     pub fn empty_for_test() -> Engine {
-        Engine {
+        let mut engine = Engine {
             schema: Schema::empty_for_test(),
             context: Context::new(),
             translators: Vec::new(),
@@ -1203,7 +1405,21 @@ impl Engine {
             input_type_options: Vec::new(),
             last_stages: StageTimings::default(),
             stage_seq: 0,
-        }
+            signal_rx: mpsc::sync_channel(1).1,
+            signal_sub: 0,
+            signal_option_mirror: HashMap::new(),
+        };
+        engine.context.signal_session_id = next_engine_session();
+        let (signal_tx, signal_rx) = mpsc::sync_channel(256);
+        engine.signal_sub = crate::signal::connect_queued(signal_tx);
+        engine.signal_rx = signal_rx;
+        engine
+    }
+
+    /// 测试用：读信号镜像（验证信号真的走了一圈 emit → 自己的队列 → drain）。
+    #[cfg(test)]
+    pub(crate) fn signal_mirror_get(&self, name: &str) -> Option<bool> {
+        self.signal_option_mirror.get(name).copied()
     }
 }
 
@@ -1246,14 +1462,77 @@ fn is_neural_predict_word(word: &str) -> bool {
 ///
 /// 来源与 [`ScriptTranslator::apply_prism_config`] 解析的完全一致：
 /// - `/translator/prisms`：`[{name, option|input_type}]` 或 `{input_type: prism}`；
+/// - `/translator/prisms: input_type`：展开顶层 `/input_type/options[].option`；
 /// - `/translator/input_types`：`{input_type: prism}`；
 /// - `/translator/simp/...`、`/translator/trad/...`（简繁变体的同一套声明）。
 ///
+/// 某个命名空间**完全没有**手写声明时，若 `build_dir` 里有部署期棱镜索引
+/// （`build/<dict>/prisms.list`），用索引里的组名补上 —— 这保证删掉 `prisms`
+/// 后，切换输入类型仍会清空已输入串，与手写清单的行为一致。索引缺失/过期时
+/// 不补，回退到旧行为。
+///
 /// 这些名字既是 `translator` 读取的 context switch，也是 `key_binder` 要
 /// `toggle:` 的开关 —— 两处必须用同一份清单，所以只在这里定义一次。
-fn collect_input_type_options(config: &serde_json::Value) -> Vec<String> {
+pub(crate) fn collect_input_type_options(
+    config: &serde_json::Value,
+    build_dir: Option<&std::path::Path>,
+) -> Vec<String> {
+    let prism_index = build_dir.and_then(|dir| {
+        let dict_name = config.pointer("/translator/dict")?.as_str()?;
+        crate::gear::dict::prism_index::read_index(dir, dict_name)
+    });
+    // 顶层 `input_types` 是权威清单：`enabled` 决定**集合**（未列的不该有产物），
+    // `options` 只决定**顺序与文案**。两种情况都先按 options 排序，再把 options
+    // 没提到、但确实启用的名字按字母序补在后面。
+    // 2026-11-13：单数 `input_type` 与复数 `input_types` 都认（见
+    // `dict_compiler::input_types_node`）；数据迁移期两边都能跑。
+    if let Some(node) = crate::gear::dict::dict_compiler::input_types_node(config) {
+        let order = crate::gear::translator::translator::input_type_option_names(node);
+        let enabled = match crate::gear::dict::dict_compiler::input_types_enabled(config) {
+            Some(enabled) => enabled,
+            None => prism_index
+                .as_ref()
+                .map(|entries| entries.iter().map(|entry| entry.group.clone()).collect())
+                .unwrap_or_default(),
+        };
+        let mut options: Vec<String> = Vec::new();
+        for name in &order {
+            if enabled.iter().any(|item| item == name) {
+                push_input_type_option(&mut options, name);
+            }
+        }
+        let mut rest: Vec<String> = enabled
+            .into_iter()
+            .filter(|name| !options.iter().any(|item| item == name))
+            .collect();
+        rest.sort();
+        for name in &rest {
+            push_input_type_option(&mut options, name);
+        }
+        return options;
+    }
+    const PREFIXES: [&str; 3] = ["/translator", "/translator/simp", "/translator/trad"];
+    // 任何命名空间只要写了手写名单，就完全按写的来（旧 schema 行为不变）；
+    // 全部没有声明时才用部署索引补全。
+    let declared_any = PREFIXES.iter().any(|prefix| {
+        config
+            .pointer(&format!("{prefix}/prisms"))
+            .is_some()
+            || config
+                .pointer(&format!("{prefix}/input_types"))
+                .and_then(serde_json::Value::as_object)
+                .is_some()
+    });
+    if !declared_any {
+        return prism_index
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| entry.group)
+            .collect();
+    }
+
     let mut options: Vec<String> = Vec::new();
-    for prefix in ["/translator", "/translator/simp", "/translator/trad"] {
+    for prefix in PREFIXES {
         if let Some(prisms) = config.pointer(&format!("{prefix}/prisms")) {
             match prisms {
                 serde_json::Value::Array(items) => {
@@ -1270,6 +1549,19 @@ fn collect_input_type_options(config: &serde_json::Value) -> Vec<String> {
                 serde_json::Value::Object(map) => {
                     for name in map.keys() {
                         push_input_type_option(&mut options, name);
+                    }
+                }
+                serde_json::Value::String(reference)
+                    if reference.trim() == "input_types" && prism_index.is_some() =>
+                {
+                    if let Some(node) =
+                        crate::gear::dict::dict_compiler::input_types_node(config)
+                    {
+                        for name in
+                            crate::gear::translator::translator::input_type_option_names(node)
+                        {
+                            push_input_type_option(&mut options, &name);
+                        }
                     }
                 }
                 _ => {}
@@ -1296,7 +1588,7 @@ fn push_input_type_option(options: &mut Vec<String>, name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::gear::key_binder::KeyBinder;
+    use crate::gear::processor::key_binder::KeyBinder;
     use serde_json::json;
 
     /// 空引擎 + 给定配置树 + 一个真的 `key_binder`（切换动作必须经过处理器链，
@@ -1304,7 +1596,7 @@ mod tests {
     fn engine_with_key_binder(config: serde_json::Value) -> Engine {
         let mut engine = Engine::empty_for_test();
         engine.schema = Schema::from_config_for_test(config);
-        engine.input_type_options = collect_input_type_options(&engine.schema.config);
+        engine.input_type_options = collect_input_type_options(&engine.schema.config, None);
         let binder = KeyBinder::new(&engine.schema.config);
         engine.processors.push(ComponentEntry::new(
             Box::new(binder) as Box<dyn Processor + Send + Sync>,
@@ -1343,9 +1635,137 @@ mod tests {
             }
         });
         assert_eq!(
-            collect_input_type_options(&config),
+            collect_input_type_options(&config, None),
             vec!["ziranma", "flypy", "full"]
         );
+    }
+
+    #[test]
+    fn set_option_reacts_via_signal_queue_changed_gates_clear() {
+        // 输入：组字中（input="nihao"）+ `ziranma` 是输入类型开关。
+        // 期望：首次 set_option(true)（镜像 false → true，changed）⇒ 信号槽反应清空组字；
+        //       再设同值（镜像已是 true，changed=false）⇒ 组字保留 —— changed 由信号槽
+        //       用镜像推算（Qt 槽"旧值比对新值"），set_option 本体不再直接调 clear。
+        let mut engine = Engine::empty_for_test();
+        engine.input_type_options = vec!["ziranma".into()];
+        engine.context.input = "nihao".into();
+
+        engine.set_option("ziranma", true);
+        assert_eq!(
+            engine.context.input, "",
+            "changed 的输入类型开关应经信号反应清空组字（nihao → 空）"
+        );
+        assert_eq!(
+            engine.signal_mirror_get("ziranma"),
+            Some(true),
+            "镜像应记录信号槽已反应过的值"
+        );
+
+        engine.context.input = "nihao".into();
+        engine.set_option("ziranma", true);
+        assert_eq!(engine.context.input, "nihao", "同值重复设置（changed=false）不应清空组字");
+    }
+
+    #[test]
+    fn set_option_signals_do_not_cross_engines() {
+        // 两个引擎都挂在全局总线上：A 的 set_option 只进 A 自己的镜像，
+        // B 不得收到（session_id 过滤 = Qt 对象亲和隔离）。
+        let mut a = Engine::empty_for_test();
+        let mut b = Engine::empty_for_test();
+        a.set_option("ascii_mode", true);
+        assert_eq!(
+            a.signal_mirror_get("ascii_mode"),
+            Some(true),
+            "A 应消费自己发出的 OptionChanged"
+        );
+        assert_eq!(
+            b.signal_mirror_get("ascii_mode"),
+            None,
+            "B 不应收到 A 的信号"
+        );
+        b.set_option("ascii_mode", true);
+        assert_eq!(b.signal_mirror_get("ascii_mode"), Some(true), "B 自己设开关才轮到 B 的镜像");
+    }
+
+    #[test]
+    fn collect_input_type_options_falls_back_to_prism_index() {
+        let build =
+            std::env::temp_dir().join(format!("librime-input-types-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&build);
+        let dir = crate::gear::dict::prism_index::dict_dir(&build, "pinyin");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pinyin.zrm.prism.bin"), "x").unwrap();
+        crate::gear::dict::prism_index::write_index(&build, "pinyin", &["zrm".to_string()])
+            .expect("write index");
+
+        // 完全没有手写声明 → 用索引里的组名。
+        let bare = json!({"translator": {"dict": "pinyin"}});
+        assert_eq!(
+            collect_input_type_options(&bare, Some(&build)),
+            vec!["zrm"]
+        );
+        // 有手写声明 → 只按写的来，索引不参与。
+        let explicit = json!({
+            "translator": {
+                "dict": "pinyin",
+                "prisms": [{"name": "pinyin.flypy", "option": "flypy"}]
+            }
+        });
+        assert_eq!(
+            collect_input_type_options(&explicit, Some(&build)),
+            vec!["flypy"]
+        );
+        let _ = std::fs::remove_dir_all(&build);
+    }
+
+    #[test]
+    fn collect_input_type_options_honours_input_types_enabled_and_order() {
+        let config = json!({
+            "translator": {"dict": "pinyin"},
+            "input_types": {
+                "enabled": ["zrm", "flypy"],
+                "reset": "zrm",
+                "options": [
+                    {"option": "pinyin", "label": "全拼"},
+                    {"option": "flypy", "label": "小鹤双拼"},
+                    {"option": "zrm", "label": "自然码"},
+                    {"option": "sogou", "label": "搜狗双拼"}
+                ]
+            }
+        });
+        // 集合由 `enabled` 决定，顺序由 `options` 决定；未启用的 pinyin/sogou 不出现。
+        assert_eq!(
+            collect_input_type_options(&config, None),
+            vec!["flypy", "zrm"]
+        );
+        // `enabled` 里有、`options` 没提到的名字按字母序补在后面。
+        let mut config2 = config.clone();
+        config2["input_types"]["enabled"] = json!(["zrm", "terra"]);
+        assert_eq!(
+            collect_input_type_options(&config2, None),
+            vec!["zrm", "terra"]
+        );
+        // 不写 `enabled`：集合回退到部署索引，顺序仍按 `options`。
+        let build = std::env::temp_dir().join(format!(
+            "librime-input-types-order-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&build);
+        let dir = crate::gear::dict::prism_index::dict_dir(&build, "pinyin");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pinyin.zrm.prism.bin"), "x").unwrap();
+        crate::gear::dict::prism_index::write_index(&build, "pinyin", &["zrm".to_string()])
+            .expect("write index");
+        let mut config3 = config.clone();
+        config3["input_types"]
+            .as_object_mut()
+            .unwrap()
+            .remove("enabled");
+        assert_eq!(
+            collect_input_type_options(&config3, Some(&build)),
+            vec!["zrm"]
+        );
+        let _ = std::fs::remove_dir_all(&build);
     }
 
     #[test]
@@ -1403,6 +1823,31 @@ mod tests {
         engine.set_option("ziranma", true);
         assert_eq!(engine.context.input, "");
         assert!(!engine.context.is_composing());
+    }
+
+    #[test]
+    fn select_input_type_switches_exclusively() {
+        let mut engine = engine_with_key_binder(multi_input_config());
+        // 先同时打开两个输入类型开关（模拟越权/重复切换留下的脏状态）。
+        engine.set_option("ziranma", true);
+        engine.set_option("full", true);
+        assert!(engine.context.get_option("ziranma"));
+        assert!(engine.context.get_option("full"));
+
+        // 切到 flypy：必须互斥 —— 目标开、其余全部关。
+        engine.select_input_type("flypy");
+        assert!(engine.context.get_option("flypy"), "目标类型应打开");
+        assert!(!engine.context.get_option("ziranma"), "其余类型必须互斥关闭");
+        assert!(!engine.context.get_option("full"), "其余类型必须互斥关闭");
+
+        // 越权类型名：忽略，不改变任何开关状态。
+        let before = engine.context.get_option("flypy");
+        engine.select_input_type("nonexistent");
+        assert_eq!(
+            engine.context.get_option("flypy"),
+            before,
+            "越权类型名不应改变状态"
+        );
     }
 
     /// 2026-11-09：总开关关掉后联想条必须是空表 —— 神经结果和 n-gram 回退都不许出。

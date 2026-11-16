@@ -1,6 +1,6 @@
 //! eassy 汉字前缀树基准：构建耗时 / 内存 / 精确查 / 前缀查。
 
-use librime_next::dict::eassy_matcher::EassyIndex;
+use librime_next::gear::dict::eassy_matcher::EassyIndex;
 use std::path::Path;
 use std::time::Instant;
 

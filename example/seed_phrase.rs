@@ -9,10 +9,10 @@
 //!
 //! 注意：userdb 被活引擎占用时 LevelDB 会锁；运行前先停掉 Weasel-Next 相关进程。
 
-use librime_next::dict::db::Db;
-use librime_next::dict::level_db::LevelDb;
-use librime_next::dict::user_dictionary::UserDictionary;
-use librime_next::dict::vocabulary::DictEntry;
+use librime_next::gear::dict::db::Db;
+use librime_next::gear::dict::level_db::LevelDb;
+use librime_next::gear::dict::user_dictionary::UserDictionary;
+use librime_next::gear::dict::vocabulary::DictEntry;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -41,7 +41,7 @@ fn main() {
     let userdb_dir = PathBuf::from(&appdata).join("Rime-Next/userdb");
 
     println!("# build_dir = {build_dir:?}  userdb_dir = {userdb_dir:?}");
-    let Some(dict) = librime_next::dict::dictionary::Dictionary::open(&build_dir, &dict_name, &prism_name)
+    let Some(dict) = librime_next::gear::dict::dictionary::Dictionary::open(&build_dir, &dict_name, &prism_name)
     else {
         eprintln!("打开词典失败：{dict_name}/{prism_name}");
         return;

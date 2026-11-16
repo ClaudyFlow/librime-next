@@ -12,10 +12,10 @@
 //! 输出列（UTF-8，LF）：`schema \t text \t simp \t commits \t dee \t tick`
 //! 同词同方案多次出现直接累加 `commits`（用户词典理论上一词一条，防御性合并）。
 
-use librime_next::dict::db::Db;
-use librime_next::dict::level_db::LevelDb;
-use librime_next::dict::opencc::Opencc;
-use librime_next::dict::user_db::UserDbValue;
+use librime_next::gear::dict::db::Db;
+use librime_next::gear::dict::level_db::LevelDb;
+use librime_next::gear::dict::opencc::Opencc;
+use librime_next::gear::dict::user_db::UserDbValue;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};

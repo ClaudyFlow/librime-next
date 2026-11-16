@@ -9,11 +9,11 @@
 #![allow(non_snake_case, dead_code)]
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::os::raw::c_double;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::engine::key_event::KeyEvent;
 use crate::engine::session::Session;
@@ -34,9 +34,21 @@ struct Global {
     staging_dir: String,
     sessions: HashMap<RimeSessionId, Session>,
     next_id: RimeSessionId,
+    /// 每个会话**最新一次**方案重建的代号 + 目标方案（见 `rime_select_schema`）。
+    ///
+    /// 语义：键在表里 = 该会话有后台重建在跑（或已受理还没跑完）。
+    /// 后台任务建好后回到这里比对代号，不一致说明期间又被切过，
+    /// 本次结果直接丢弃（避免"先受理的慢重建"覆盖"后受理的切换"）。
+    /// 目标方案用来吞掉**重复请求同一个方案**（宿主重复调用不该再重建一遍）。
+    rebuild_generation: HashMap<RimeSessionId, (u64, String)>,
+    /// 重建代号自增器。
+    next_rebuild_generation: u64,
     /// 部署器（C++ `Service::instance().deployer()`）。`deployer_initialize` 建它，
     /// `deploy` / `prebuild` / `deploy_schema` … 用它。
     deployer: Option<Deployer>,
+    /// 后台维护线程(并行部署,用户 2026-11-08):启动维护时取走 Deployer,
+    /// 线程跑完 HRRN 调度的任务后送回。JoinHandle 供 join。
+    maintenance: Option<std::thread::JoinHandle<bool>>,
 }
 
 impl Global {
@@ -84,6 +96,9 @@ fn global() -> &'static Mutex<Global> {
             staging_dir: String::new(),
             sessions: HashMap::new(),
             next_id: 1,
+            rebuild_generation: HashMap::new(),
+            next_rebuild_generation: 1,
+            maintenance: None,
             deployer: None,
         })
     })
@@ -151,6 +166,9 @@ pub struct RimeContext {
     /// 宿主可显示。数量 = predictions_len。
     pub predictions: *mut *mut c_char,
     pub predictions_len: c_int,
+    /// 菜单总候选数(2026-11-13 扩展):懒式菜单要排空流才知道;0 = 未知/无候选。
+    /// 宿主据此算底行「1 / N」页码。必须与 `vendor/librime/include/rime_api.h` 同序。
+    pub total_candidates: c_int,
 }
 
 #[repr(C)]
@@ -344,7 +362,7 @@ pub struct RimeApi {
     pub change_page: Option<unsafe extern "C" fn(RimeSessionId, Bool) -> Bool>,
     pub get_candidate_preview:
         Option<unsafe extern "C" fn(RimeSessionId, *mut RimeCandidatePreview) -> Bool>,
-    pub free_candidate_preview: Option<unsafe extern "C" fn(*mut RimeCandidatePreview)>,
+    pub free_candidate_preview: Option<unsafe extern "C" fn(*mut RimeCandidatePreview) -> Bool>,
     // ---- 三个根目录的 get/set（2026-10-25 增补，DLL 尾部扩展）。
     //      **必须置于 RimeApi 末位**：否则会挤占 `get_candidate_preview` /
     //      `free_candidate_preview` 这两位 C++ 原生函数的偏移，宿主按 C++ rime_api.h
@@ -387,6 +405,15 @@ unsafe fn cstr_free(p: *mut c_char) {
     }
 }
 
+/// `dup_string`（evo `rime_api_impl.h`）：空串返回 `nullptr`，不是空字符串。
+unsafe fn dup_string(s: &str) -> *mut c_char {
+    if s.is_empty() {
+        std::ptr::null_mut()
+    } else {
+        cstr_dup(s)
+    }
+}
+
 fn read_cstr(p: *const c_char) -> Option<String> {
     if p.is_null() {
         None
@@ -421,14 +448,61 @@ unsafe extern "C" fn rime_initialize(traits: *mut RimeTraits) {
 }
 
 unsafe extern "C" fn rime_finalize() {
-    global().lock().unwrap().sessions.clear();
+    clear_sessions(&mut global().lock().unwrap());
+    // 进程退出前摘掉 C 通知槽，避免 DLL 卸载后总线里留一个悬垂函数指针。
+    clear_notification_slot();
+    // 退出前把还没落盘的个人 n-gram / 重排头参数同步写一次
+    // （后台线程随进程退出会被直接杀掉）。
+    crate::engine::user_ngram::flush_on_exit();
+    crate::gear::neural::rerank_head::flush_on_exit();
+}
+
+/// 宿主注册的通知回调（C++ `RimeNotificationHandler`）＝ **信号总线上的一个槽**。
+///
+/// 四种消息（`schema` / `option` / `property` / `deploy`）都由
+/// [`crate::signal::emit_for`] 统一编码成官方 `(message_type, message_value)`；
+/// 这里只负责把 C 函数指针挂到总线上，不再有「只有方案切换才通知」的特例。
+/// `*mut c_void` 不是 `Send`，而信号可能从**后台重建线程**或部署线程发出，
+/// 所以上下文存成 `usize`、裸 fn 从 `Option<fn>` 里拆出来。
+/// C 槽在总线里的句柄；`0` = 未注册。重复注册先摘旧槽，`None` = 只摘不装。
+static NOTIFY_SLOT: Mutex<u64> = Mutex::new(0);
+
+fn clear_notification_slot() {
+    let mut slot = NOTIFY_SLOT.lock().unwrap_or_else(|err| err.into_inner());
+    if *slot != 0 {
+        crate::signal::disconnect(*slot);
+        *slot = 0;
+    }
 }
 
 unsafe extern "C" fn rime_set_notification_handler(
-    _handler: RimeNotificationHandler,
-    _ctx: *mut c_void,
+    handler: RimeNotificationHandler,
+    ctx: *mut c_void,
 ) {
-    // MVP：通知回调暂不转发
+    clear_notification_slot();
+    let Some(func) = handler else { return };
+    let ctx = ctx as usize;
+    let id = crate::signal::connect(Arc::new(
+        move |note: &crate::signal::Notification| {
+            let Ok(message_type) = CString::new(note.message_type()) else {
+                return;
+            };
+            let Ok(message_value) = CString::new(note.message_value()) else {
+                return;
+            };
+            // SAFETY: `ctx` / `func` 的生命周期由注册方保证；两个字符串在本次调用期间存活。
+            // 槽只做非阻塞投递（Engine 侧是 `try_send`），不取引擎锁、不做 I/O。
+            unsafe {
+                func(
+                    ctx as *mut c_void,
+                    note.session_id,
+                    message_type.as_ptr(),
+                    message_value.as_ptr(),
+                )
+            };
+        },
+    ));
+    *NOTIFY_SLOT.lock().unwrap_or_else(|err| err.into_inner()) = id;
 }
 
 // ----------------------------------------------------------------- 部署（deployer）
@@ -544,23 +618,35 @@ unsafe extern "C" fn rime_sync_user_data() -> Bool {
 /// `RimeStartMaintenance(full_check)`。
 unsafe extern "C" fn rime_start_maintenance(full_check: Bool) -> Bool {
     let mut g = global().lock().unwrap();
-    match g.deployer.as_mut() {
-        Some(d) => d.start_maintenance(full_check != 0) as Bool,
-        None => 0,
-    }
+    // 并行部署(用户 2026-11-08):维护挪进后台线程,HRRN 调度在线程里跑,
+    // 打字不再被部署阻塞。Deployer 被取走 ⇒ 维护模式自然生效。
+    let Some(d) = g.deployer.take() else { return 0 };
+    let handle = std::thread::spawn(move || {
+        let mut d = d;
+        let ok = d.start_maintenance(full_check != 0);
+        // 跑完把 Deployer 送回全局(会话恢复创建能力)
+        let mut g = global().lock().unwrap();
+        g.deployer = Some(d);
+        ok
+    });
+    g.maintenance = Some(handle);
+    1
 }
 
 /// `RimeIsMaintenanceMode()`。
 unsafe extern "C" fn rime_is_maintenance_mode() -> Bool {
     let g = global().lock().unwrap();
-    match g.deployer.as_ref() {
-        Some(d) => d.is_maintenance_mode() as Bool,
-        None => 0,
-    }
+    // Deployer 不在全局 = 后台维护线程正持有它 ⇒ 维护模式。
+    (g.deployer.is_none() && g.maintenance.is_some()) as Bool
 }
 
 /// `RimeJoinMaintenanceThread()` —— 我们的部署是同步执行的，没有工作线程可 join。
-unsafe extern "C" fn rime_join_maintenance_thread() {}
+unsafe extern "C" fn rime_join_maintenance_thread() {
+    let mut g = global().lock().unwrap();
+    if let Some(handle) = g.maintenance.take() {
+        let _ = handle.join();
+    }
+}
 
 unsafe extern "C" fn rime_create_session() -> RimeSessionId {
     let mut g = global().lock().unwrap();
@@ -568,12 +654,29 @@ unsafe extern "C" fn rime_create_session() -> RimeSessionId {
     g.next_id += 1;
     let build_dir = g.build_dir();
     let roots = g.data_roots();
+    // 2026-11-10：分段计时。线上「rime.lua 开始加载之后引擎静默 N 秒」的时刻正好
+    // 落在建会话里，所以把这里的三个阶段也打点（默认关闭，开关见 switch_trace）。
+    crate::engine::switch_trace::begin_rebuild();
+    let t_rescore = std::time::Instant::now();
     // 神经重排(进程级单例):数据根里有 safetensors 模型才启用。
-    crate::engine::gear::rescore::init_from_data_roots(&roots);
+    crate::gear::filter::rescore::init_from_data_roots(&roots);
+    crate::engine::switch_trace::done("session:rescore 初始化", Some(t_rescore));
+    let t_eassy = std::time::Instant::now();
     // eassy（细胞词库）运行时索引：后台建 trie，未就绪/失败都不影响输入。
-    crate::dict::eassy_matcher::init_from_data_roots(&roots);
+    crate::gear::dict::eassy_matcher::init_from_data_roots(&roots);
+    crate::engine::switch_trace::done("session:eassy 启动(后台)", Some(t_eassy));
     let default_schema = default_schema_id(&g);
-    let session = Session::create_with_roots(&build_dir, &default_schema, &roots);
+    crate::engine::switch_trace::note(&format!(
+        "session:默认方案 {default_schema} @ {}",
+        build_dir.display()
+    ));
+    let mut session = Session::create_with_roots(&build_dir, &default_schema, &roots);
+    // 信号归属：这个会话发出的 option / property 通知都带 `id`。
+    session.bind_signal_session(id);
+    // 交互式切方案也走后台重建：`Engine::apply_schema` 只登记请求，由
+    // `rime_process_key` 放锁后派发（见 `request_session_rebuild`）。不打开这个
+    // 开关的话，Ctrl+` 选完方案的那一键会卡在全局锁里同步重建整个引擎。
+    session.set_async_rebuild(rebuild_async_enabled());
     g.sessions.insert(id, session);
     id
 }
@@ -584,37 +687,141 @@ fn crate_schema_manifest_rel() -> std::path::PathBuf {
         .join(crate::lever::paths::SCHEMA_MANIFEST)
 }
 
+/// 用户 `schema.yaml` 的 `schemas` 勾选集合（内部状态）。
+///
+/// 取消勾选 `pinyin` 只从这里移除父 id；子方案条目仍留在文件里。
+/// 用户根有非空清单时不再看共享根那份出厂清单。
+fn selected_schema_ids(g: &Global) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for dir in [&g.user_data_dir, &g.shared_data_dir] {
+        if dir.is_empty() {
+            continue;
+        }
+        let path = PathBuf::from(dir).join(crate_schema_manifest_rel());
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let ids = extract_schema_list_ids(&text);
+            if !ids.is_empty() {
+                out.extend(ids);
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// 真正不部署 / 不进菜单的 id：显式 `disabled.yaml` ∪ 父未选压住的子方案。
+fn excluded_schema_ids(g: &Global) -> BTreeSet<String> {
+    let mut out = disabled_ids(g);
+    let selected = selected_schema_ids(g);
+    if selected.is_empty() {
+        return out;
+    }
+    let user = PathBuf::from(&g.user_data_dir);
+    let shared = if g.shared_data_dir.is_empty() {
+        user.clone()
+    } else {
+        PathBuf::from(&g.shared_data_dir)
+    };
+    let parents = crate::lever::schema_disabled::scan_parents(&shared, &user);
+    out.extend(crate::lever::schema_disabled::blocked_children_by_unselected_parents(
+        &selected, &parents,
+    ));
+    out
+}
+
 fn default_schema_id(g: &Global) -> String {
-    // 取 schema/schema.yaml（点名制）/ default.yaml 里第一个方案；退化到 "luna_pinyin"
-    let candidates = [
-        g.shared_data_dir.clone(),
-        g.user_data_dir.clone(),
-    ];
-    for dir in candidates.iter().filter(|d| !d.is_empty()) {
-        let manifest = crate_schema_manifest_rel();
-        for name in [manifest.as_path(), Path::new("default.yaml"), Path::new("schema/default.yaml")] {
-            let p = PathBuf::from(dir).join(name);
-            if let Ok(text) = std::fs::read_to_string(&p) {
-                if let Some(id) = extract_first_schema_id(&text) {
-                    return id;
+    // 2026-11-11 修正：用户取消勾选 pinyin 时，active 仍原样留在 schema.yaml，
+    // 但 pinyin 不在勾选集合里，新会话只在**内存**里退到第一个可用的已勾选方案。
+    // 不是把 pinyin 写进 disabled.yaml —— 那样父方案也灰掉，就没法重新勾回来了。
+    let selected = selected_schema_ids(g);
+    let excluded = excluded_schema_ids(g);
+    let mut candidates: Vec<String> = Vec::new();
+
+    // 用户 schema.yaml 优先：active 只有在仍被勾选时才可用，其余按 schemas 顺序。
+    if !g.user_data_dir.is_empty() {
+        let path = PathBuf::from(&g.user_data_dir).join(crate_schema_manifest_rel());
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Some(active) = extract_active_id(&text) {
+                if selected.is_empty() || selected.contains(&active) {
+                    push_unique(&mut candidates, active);
+                }
+            }
+            for id in extract_schema_list_ids(&text) {
+                if selected.is_empty() || selected.contains(&id) {
+                    push_unique(&mut candidates, id);
                 }
             }
         }
     }
-    "luna_pinyin".to_string()
+    // 其余文件只补充仍在勾选集合里的 id（保留首次运行 / 老版本兜底顺序）。
+    for dir in [g.shared_data_dir.clone(), g.user_data_dir.clone()] {
+        if dir.is_empty() {
+            continue;
+        }
+        for name in [Path::new("default.yaml"), Path::new("schema/default.yaml")] {
+            let path = PathBuf::from(&dir).join(name);
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                for id in extract_schema_list_ids(&text) {
+                    if selected.is_empty() || selected.contains(&id) {
+                        push_unique(&mut candidates, id);
+                    }
+                }
+            }
+        }
+    }
+    for id in &candidates {
+        if !excluded.contains(id) {
+            return id.clone();
+        }
+    }
+    // 全被压住：宁可仍用第一候选（输入不中断），也不在磁盘上改 active。
+    candidates
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "luna_pinyin".to_string())
 }
 
-/// 从 `schema/schema.yaml` 的 `active:` / `schemas:`，或 `default.yaml` 的 `schema_list` 取方案 id。
+/// 当前**显式**禁用集合（用户目录的 disabled.yaml；组按 schema.parent 展开）。
+/// 父方案未勾选自动压住的子方案不写在这里，由 [`excluded_schema_ids`] 合并。
+fn disabled_ids(g: &Global) -> BTreeSet<String> {
+    if g.user_data_dir.is_empty() {
+        return BTreeSet::new();
+    }
+    let user = PathBuf::from(&g.user_data_dir);
+    let shared = if g.shared_data_dir.is_empty() {
+        user.clone()
+    } else {
+        PathBuf::from(&g.shared_data_dir)
+    };
+    crate::lever::schema_disabled::effective_disabled_ids(&user, &shared)
+}
+
+/// 从 `schema/schema.yaml` 的 `active:` / `schemas:`，或 `default.yaml` 的 `schema_list`
+/// 取**全部候选 id**，顺序即优先级。
 ///
 /// 顺序：**`active:` 优先**（那是"当前方案"，新会话一建出来就该是它），
-/// 没有 `active` 才退到清单第一条（首次运行、还没定过当前方案时）。
+/// 其后是清单里的每一项（首次运行、或 active 被禁用时按这个顺序回退）。
 ///
 /// ⚠️ 2026-10-29：原来只看清单第一条，而 `schema.yaml` 的清单是按 id 排序的
 /// （第一条是 `cangjie.5`），于是每个新会话先落在**仓颉**上；靠 Engine 侧再
 /// `select_schema(active)` 纠正 —— 而那条路当时又是坏的（见 `Engine/src/librime/api.rs`
 /// 漏装 `select_schema`），结果"设置里选的方案不生效"。两道修一起才对。
-fn extract_first_schema_id(text: &str) -> Option<String> {
-    // ① `active: <id>`（schema.yaml 的当前方案）
+///
+/// 2026-11-11：返回的**候选序列**让「active 被禁用」能退到清单里下一个未禁用方案，
+/// 而不是只看第一个就 return。
+fn extract_schema_id_candidates(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(id) = extract_active_id(text) {
+        push_unique(&mut out, id);
+    }
+    for id in extract_schema_list_ids(text) {
+        push_unique(&mut out, id);
+    }
+    out
+}
+
+/// 只取 `active: <id>` 这一行（注释不算），供「active 仍被勾选吗」判断。
+fn extract_active_id(text: &str) -> Option<String> {
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('#') {
@@ -622,36 +829,50 @@ fn extract_first_schema_id(text: &str) -> Option<String> {
         }
         if let Some(rest) = trimmed.strip_prefix("active:") {
             let id = rest.trim().trim_matches(['"', '\''].as_ref()).trim();
-            if !id.is_empty() {
-                return Some(id.to_string());
-            }
+            return (!id.is_empty()).then(|| id.to_string());
         }
     }
-    // ② 清单第一条：`schema_list:` 后的 `- schema: xxx` 或 `schemas:` 后的 `- xxx`
-    let mut lines = text.lines().peekable();
+    None
+}
+
+/// 只取 `schema_list:` / `schemas:` 里的 id，**不含 active**。
+/// 顺序即优先级；`default.yaml` 用 `- schema: xxx`，`schema.yaml` 用 `- xxx`。
+fn extract_schema_list_ids(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
     let mut in_list = false;
-    for line in lines.by_ref() {
+    for line in text.lines() {
         let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
         if trimmed.starts_with("schema_list:") || trimmed.starts_with("schemas:") {
             in_list = true;
             continue;
         }
         if in_list {
             if trimmed.starts_with('-') {
-                // `- schema: xxx` 或 `- xxx`
                 let body = trimmed.trim_start_matches('-').trim();
                 if let Some(rest) = body.strip_prefix("schema:") {
-                    return Some(rest.trim().to_string());
+                    push_unique(&mut out, rest.trim().to_string());
+                } else if !body.is_empty() && !body.contains(':') {
+                    push_unique(&mut out, body.to_string());
                 }
-                if !body.is_empty() && !body.contains(':') {
-                    return Some(body.to_string());
-                }
-            } else if !trimmed.starts_with('-') && !trimmed.is_empty() {
+            } else if !trimmed.is_empty() {
                 break;
             }
         }
     }
-    None
+    out
+}
+
+fn push_unique(out: &mut Vec<String>, id: String) {
+    if !id.is_empty() && !out.contains(&id) {
+        out.push(id);
+    }
+}
+
+fn extract_first_schema_id(text: &str) -> Option<String> {
+    extract_schema_id_candidates(text).into_iter().next()
 }
 
 unsafe extern "C" fn rime_find_session(id: RimeSessionId) -> Bool {
@@ -659,21 +880,54 @@ unsafe extern "C" fn rime_find_session(id: RimeSessionId) -> Bool {
 }
 
 unsafe extern "C" fn rime_destroy_session(id: RimeSessionId) -> Bool {
-    global().lock().unwrap().sessions.remove(&id).is_some() as Bool
+    remove_session(&mut global().lock().unwrap(), id).is_some() as Bool
 }
 
 unsafe extern "C" fn rime_cleanup_stale_sessions() {}
 unsafe extern "C" fn rime_cleanup_all_sessions() {
-    global().lock().unwrap().sessions.clear();
+    clear_sessions(&mut global().lock().unwrap());
+}
+
+/// 清空全部会话，同时丢掉它们的后台重建代号（否则迟到的重建结果会空转一圈）。
+fn clear_sessions(g: &mut Global) {
+    g.sessions.clear();
+    g.rebuild_generation.clear();
+}
+
+/// 销毁单个会话：先撤掉重建代号，让在跑的后台任务建完直接作废。
+fn remove_session(g: &mut Global, id: RimeSessionId) -> Option<Session> {
+    g.rebuild_generation.remove(&id);
+    g.sessions.remove(&id)
+}
+
+/// 是否走「后台重建 + 原子换入」。
+///
+/// `RIME_REBUILD_SYNC=1` 时**整体**退回历史同步行为：`rime_select_schema` 与
+/// 交互式切换（`Engine::apply_schema`）一起回退，方便线上 A/B 与一键回滚。
+fn rebuild_async_enabled() -> bool {
+    std::env::var_os("RIME_REBUILD_SYNC").is_none()
 }
 
 unsafe extern "C" fn rime_process_key(id: RimeSessionId, keycode: c_int, mask: c_int) -> Bool {
-    let mut g = global().lock().unwrap();
-    if let Some(s) = g.sessions.get_mut(&id) {
-        s.process_key(keycode as u32, mask as u32) as Bool
-    } else {
-        0
+    // 交互式切方案（Ctrl+` / F4 菜单）的处理分两段：
+    // ① 本键只跑到 `Engine::apply_schema`，它把目标方案登记进 `pending_rebuild`
+    //    就返回 —— 这一键不进重建；
+    // ② 锁一放掉，才把请求交给重建线程（与 `rime_select_schema` 同一个队列）。
+    // 这样切换那一刻的按键、以及重建窗口里的按键，都不会排在全局锁后面。
+    let (eaten, pending) = {
+        let mut g = global().lock().unwrap();
+        match g.sessions.get_mut(&id) {
+            Some(s) => {
+                let eaten = s.process_key(keycode as u32, mask as u32) as Bool;
+                (eaten, s.take_pending_rebuild())
+            }
+            None => return 0,
+        }
+    }; // ← 锁在这里放掉
+    if let Some(sid) = pending {
+        request_session_rebuild(id, &sid);
     }
+    eaten
 }
 
 unsafe extern "C" fn rime_commit_composition(id: RimeSessionId) -> Bool {
@@ -793,9 +1047,41 @@ unsafe extern "C" fn rime_get_context(id: RimeSessionId, ctx: *mut RimeContext) 
     (*ctx).menu.page_no = page_no as c_int;
     (*ctx).menu.is_last_page = is_last_flag as c_int;
     (*ctx).menu.highlighted_candidate_index = highlight;
-    (*ctx).menu.select_keys = cstr_dup("123456789");
-    (*ctx).commit_text_preview = std::ptr::null_mut();
+    // 「菜单键」：schema 的 `menu/alternative_select_keys`；方案没写就沿用旧行为。
+    // evo `rime_api_impl.h:263-268` 只拷 schema 的值，空则留 null；这里保留
+    // "123456789" 兜底，宿主（Weasel）一直依赖它画数字标签。
+    let schema = session.engine.as_ref().map(|engine| &engine.schema);
+    let select_keys = schema
+        .map(|schema| schema.select_keys.as_str())
+        .filter(|keys| !keys.is_empty())
+        .unwrap_or("123456789");
+    (*ctx).menu.select_keys = cstr_dup(select_keys);
+
+    // 上屏预览（`rime_api_impl.h:230-236`）：组合非空且预览非空才填。
+    (*ctx).commit_text_preview = if comp.empty() {
+        std::ptr::null_mut()
+    } else {
+        dup_string(&comp.get_commit_text())
+    };
+
+    // 菜单备选标签（`rime_api_impl.h:269-280`）：`menu/alternative_select_labels`
+    // 长度必须够一页，分配 `page_size` 个 `char*`（**不带** NULL 结尾，与 C++ 一致）。
     (*ctx).select_labels = std::ptr::null_mut();
+    let label_count = page_size.max(0) as usize;
+    if label_count > 0 {
+        if let Some(labels) = schema
+            .and_then(|schema| schema.config.pointer("/menu/alternative_select_labels"))
+            .and_then(|value| value.as_array())
+            .filter(|labels| labels.len() >= label_count)
+        {
+            let arr: Vec<*mut c_char> = labels
+                .iter()
+                .take(label_count)
+                .map(|label| cstr_dup(label.as_str().unwrap_or("")))
+                .collect();
+            (*ctx).select_labels = Box::into_raw(arr.into_boxed_slice()) as *mut *mut c_char;
+        }
+    }
     // 预测:无组字时才有意义(有组字时清空,避免和候选混淆)。
     //
     // ⚠️ 2026-11-03 事故:`predictions` / `predictions_len` 是本工程**扩展**的字段,
@@ -811,6 +1097,18 @@ unsafe extern "C" fn rime_get_context(id: RimeSessionId, ctx: *mut RimeContext) 
     // 现在按约定减掉 `data_size` 自己那 4 字节。
     let required = std::mem::size_of::<RimeContext>() - std::mem::size_of::<c_int>();
     let extended = (*ctx).data_size as usize >= required;
+    // 总候选数（本工程扩展字段 `total_candidates`，2026-11-13「方案②」加）：
+    // 菜单是**懒式**的（`Menu::prepare` 按需物化），`menu.num_candidates` 只是当前页
+    // 条数、`is_last_page` 也只在最后一页能反推总页数 ⇒ 想要「1 / N」页码必须排空流。
+    // 代价实测（2026-11-13 探针）：`a`=11 条/1µs，`ni`=185/690µs，`jie`=1033/4567µs。
+    // 无菜单（空组字 / 联想条 `predictions` / 纯预编辑）时为 0 ⇒ 宿主当「总数未知」。
+    // 老宿主不声明这块内存就一个字节都不写（越界写会 0xc0000005，见 11-03 事故）。
+    if extended {
+        (*ctx).total_candidates = menu
+            .as_ref()
+            .map(|m| m.prepare(usize::MAX))
+            .unwrap_or(0) as c_int;
+    }
     if !extended {
         // 老宿主:没有这两个字段,别写(写了就是越界)。
     } else if g
@@ -859,6 +1157,23 @@ unsafe extern "C" fn rime_free_context(ctx: *mut RimeContext) {
         (*ctx).menu.candidates = std::ptr::null_mut();
     }
     cstr_free((*ctx).commit_text_preview);
+    (*ctx).commit_text_preview = std::ptr::null_mut();
+    // `select_labels` 是 `new char*[page_size]`，**没有** NULL 结尾，长度只能从
+    // `menu.page_size` 取（evo `rime_api_impl.h:297-303`）。
+    if !(*ctx).select_labels.is_null() {
+        let count = (*ctx).menu.page_size.max(0) as usize;
+        if count > 0 {
+            let arr = std::slice::from_raw_parts_mut((*ctx).select_labels, count);
+            for label in arr.iter_mut() {
+                cstr_free(*label);
+            }
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                (*ctx).select_labels,
+                count,
+            )));
+        }
+        (*ctx).select_labels = std::ptr::null_mut();
+    }
     // 同上:`predictions*` 是扩展字段 —— 宿主结构不够大时**连读都不能读**（读到的是别人的栈/堆）。
     // 门槛口径同 `rime_get_context`：`data_size` = sizeof(结构) - sizeof(data_size)。
     if (*ctx).data_size as usize
@@ -1022,6 +1337,15 @@ fn collect_schema_list(g: &Global) -> Vec<(String, String)> {
             }
         }
     }
+    // 2026-11-11 修正：不是把 pinyin 写进 disabled.yaml，而是用户取消勾选父方案。
+    // 有用户勾选清单时，宿主菜单只暴露仍被勾选的 id（出厂 default.yaml 里的
+    // pinyin 不会漏进来），再剔除显式禁用与父未选压住的子方案。
+    let selected = selected_schema_ids(g);
+    if !selected.is_empty() {
+        out.retain(|(id, _)| selected.contains(id));
+    }
+    let excluded = excluded_schema_ids(g);
+    out.retain(|(id, _)| !excluded.contains(id));
     if out.is_empty() {
         out.push(("luna_pinyin".to_string(), "Luna Pinyin".to_string()));
     }
@@ -1095,22 +1419,164 @@ unsafe extern "C" fn rime_get_current_schema(
 
 unsafe extern "C" fn rime_select_schema(id: RimeSessionId, schema_id: *const c_char) -> Bool {
     let Some(sid) = read_cstr(schema_id) else { return 0 };
-    let mut g = global().lock().unwrap();
-    let build_dir = g.build_dir();
-    let roots = g.data_roots();
-    if let Some(s) = g.sessions.get_mut(&id) {
-        let fresh = Session::create_with_roots(&build_dir, &sid, &roots);
-        // 方案文件缺失/编译产物不全时 `Session` 的 engine 是 None。这里**不能**直接换掉
-        // 原会话：换了之后这个会话对任何按键都返回"没吃掉、没候选"，用户看到的就是
+    request_session_rebuild(id, &sid)
+}
+
+/// 方案切换的**唯一**派发点：C API 选方案与交互式切换共用一条队列。
+///
+/// 两个调用方：
+/// - [`rime_select_schema`]：宿主直接选方案（TIP/Engine 的 `select_schema`）；
+/// - [`rime_process_key`] / [`rime_simulate_key_sequence`]：**交互式**切换。
+///   `switcher`/`key_binder` 只调 `Engine::request_schema` 登记，`Engine::process_key`
+///   在处理器链跑完后调 `Engine::apply_schema`，后者（`async_rebuild == true` 时）
+///   只把目标方案留在 `Session::take_pending_rebuild()` 里；按键放锁后由宿主交到这里。
+///
+/// 共用同一个 `Global.rebuild_generation`（会话 id → 代号 + 目标方案）：
+/// 同一会话同一方案已在重建时直接吞掉 ⇒ **两个入口不会并发重建同一方案**；
+/// 新目标会让上一个任务的结果按代号作废（后到者赢）。
+///
+/// 2026-11-10：**异步重建 + 原子换入**。
+///
+/// 旧实现：在 `global()` 锁里跑 `Session::create_with_roots()`，整个重建
+/// （建词典 / prism / 重绑码表 / aux / lua）期间所有客户端按键排在全局锁后面，
+/// 用户侧表现就是"打几个拼音突然卡住、然后候选窗才爆出来"。
+///
+/// 语义（三条，别改坏）：
+/// 1) 本函数只登记请求并**立刻返回 1 = 已受理**；重建在常驻后台线程上跑
+///    （见 `engine::session_rebuild`），不持有全局锁。
+/// 2) 重建期间按键继续进**旧会话**（旧引擎是只读快照，新方案的状态不会混进来），
+///    所以不会出现"半新半旧"的组合串。
+/// 3) 建好之后在全局锁里原子换入，临界区只有一次 `HashMap::insert`。换入时
+///    **旧组合串不迁移**（两套方案码表/分词不同，迁移必然错位），只搬运
+///    "已确认但宿主还没取走"的待提交文本；旧引擎在锁外析构（mmap/leveldb 释放慢）。
+///
+/// 返回值仍是 Bool：1 = 受理（生效可能稍后），0 = 会话不存在/参数非法/后台线程不可用
+/// 且同步重建也失败。旧调用方（Engine）只在 0 时告警，语义兼容。
+fn request_session_rebuild(id: RimeSessionId, sid: &str) -> Bool {
+    let (build_dir, roots, generation) = {
+        let mut g = global().lock().unwrap();
+        let Some(current) = g.sessions.get(&id) else {
+            return 0;
+        };
+        // 已经在这个方案上（宿主启动时对齐 `active:`、或用户重复点选）：不必重建。
+        if current.engine.is_some() && current.schema_id() == Some(sid) {
+            return 1;
+        }
+        // 已经有一个"切到同一个方案"的后台任务在跑：重复请求直接吞掉。
+        if let Some((_, pending)) = g.rebuild_generation.get(&id) {
+            if pending == sid {
+                return 1;
+            }
+        }
+        let build_dir = g.build_dir();
+        let roots = g.data_roots();
+        let generation = g.next_rebuild_generation;
+        g.next_rebuild_generation += 1;
+        g.rebuild_generation.insert(id, (generation, sid.to_string()));
+        (build_dir, roots, generation)
+    }; // ← 锁在这里放掉：从这里到换入之间，按键照常进旧会话
+    let sid = sid.to_string();
+
+    let job: crate::engine::session_rebuild::Job = Box::new(move || {
+        // 重建失败（含 panic）也要把"重建中"标记摘掉，否则这个会话以后每次切到
+        // 同一方案都会被当成"已经有一个在跑"而永远不再重建。
+        let rebuilt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Session::create_with_roots(&build_dir, &sid, &roots)
+        }));
+        let mut fresh = match rebuilt {
+            Ok(fresh) => fresh,
+            Err(_) => {
+                // panic 在哪一步都可能发生，锁可能已经中毒；用 poisoning 容忍的取法。
+                let mut g = match global().lock() {
+                    Ok(g) => g,
+                    Err(err) => err.into_inner(),
+                };
+                if g.rebuild_generation.get(&id).map(|(g0, _)| *g0) == Some(generation) {
+                    g.rebuild_generation.remove(&id);
+                }
+                eprintln!("[session-rebuild] 方案 `{sid}` 重建 panic，保留旧会话");
+                return;
+            }
+        };
+        let mut g = global().lock().unwrap();
+        // 期间又被切过一次（代号变了）或会话已销毁：本次结果作废。
+        if g.rebuild_generation.get(&id).map(|(g0, _)| *g0) != Some(generation) {
+            return;
+        }
+        g.rebuild_generation.remove(&id);
+        // 方案文件缺失/编译产物不全时 engine 是 None。**不能**换掉原会话：
+        // 换了之后这个会话对任何按键都返回"没吃掉、没候选"，用户看到的就是
         // "输入法突然哑了"（2026-10-29 的教训：选择必须是原子的"成功才换"）。
         if fresh.engine.is_none() {
-            return 0;
+            eprintln!("[session-rebuild] 方案 `{sid}` 重建失败，保留旧会话");
+            return;
         }
-        *s = fresh;
-        1
-    } else {
-        0
+        // 换入后要写 `user.yaml`（"上次用的方案"），路径得在借用 `old` 之前取。
+        let user_dir = if g.user_data_dir.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(g.user_data_dir.clone()))
+        };
+        let Some(old) = g.sessions.get_mut(&id) else {
+            return;
+        };
+        // 旧组合串丢弃（跨方案不可迁移）；把已确认未取走的提交文本搬过去。
+        let discarded = old.context().map(|c| c.input.clone()).unwrap_or_default();
+        // 交互式切换的两枚"吞掉宿主重放键"标记要跟着换入：物理按键的重放可能正好
+        // 落在换入之后（旧引擎还没来得及消费），丢了就会"换方案时数字/空格上屏"。
+        let (swallow_space, swallow_digit) = old
+            .engine
+            .as_ref()
+            .map(|e| (e.swallow_next_space, e.swallow_next_digit))
+            .unwrap_or((false, false));
+        fresh.transfer_pending_commit(old);
+        // 新会话是 `Session::create_with_roots` 的产物，默认同步语义；必须重新打开
+        // 异步开关，否则下一次交互式切换会退回"按键里同步重建"。
+        fresh.set_async_rebuild(rebuild_async_enabled());
+        // 换入的新会话要重新绑一次会话号，否则后续 option 通知会落到 0。
+        fresh.bind_signal_session(id);
+        if let Some(engine) = fresh.engine.as_mut() {
+            engine.swallow_next_space = swallow_space;
+            engine.swallow_next_digit = swallow_digit;
+        }
+        let Some(old) = g.sessions.insert(id, fresh) else {
+            return;
+        };
+        // 锁外析构旧引擎：mmap / leveldb 句柄释放可能要几毫秒，别占着全局锁。
+        drop(g);
+        // 换入即"当前方案已变更"：写 user.yaml（菜单排序/下次启动靠它），并让宿主
+        // 在下一次 `get_current_schema` / `get_context` / `get_status` 看到新方案、
+        // 空 preedit —— 那三个入口都直接读换进来的这个会话，不需要额外通知。
+        crate::gear::processor::switcher::record_active_schema(user_dir.as_deref(), &sid);
+        drop(old);
+        // 换入完成 → 由信号总线统一通知宿主（`("schema", "schema_id/<sid>")`）。
+        // 宿主要在**按键之外**推一帧给 TIP，否则界面上会一直挂着旧方案的 preedit。
+        // 发射在全局锁之外，槽只做投递，不阻塞按键。
+        crate::signal::emit_for(
+            id,
+            crate::signal::Signal::SchemaChanged {
+                schema_id: sid.clone(),
+            },
+        );
+        if discarded.is_empty() {
+            eprintln!(
+                "[session-rebuild] 换入 `{sid}`（新方案已生效，宿主下次读 status/context 即可看到）"
+            );
+        } else {
+            eprintln!(
+                "[session-rebuild] 换入 `{sid}` 时丢弃旧组合串 `{discarded}`（跨方案不迁移）"
+            );
+        }
+    });
+
+    // 后台线程起不来时退回同步重建（旧行为），至少不把这次切换丢掉。
+    // `RIME_REBUILD_SYNC=1` 也可以强制走同步：线上 A/B 或需要一键回退旧行为时用。
+    if !rebuild_async_enabled() {
+        job();
+    } else if let Err(job) = crate::engine::session_rebuild::dispatch(job) {
+        job();
     }
+    1
 }
 
 unsafe extern "C" fn rime_get_input(id: RimeSessionId) -> *const c_char {
@@ -1160,9 +1626,29 @@ unsafe extern "C" fn rime_select_candidate(id: RimeSessionId, index: usize) -> B
 }
 
 unsafe extern "C" fn rime_select_candidate_on_current_page(id: RimeSessionId, index: usize) -> Bool {
-    // 本实现里 `get_context` 始终渲染第 0 页（`Menu::page(page_size, 0)`），
-    // 因此「当前页内下标」与「全局下标」一致，直接转发。
-    rime_select_candidate(id, index)
+    // 2026-11-08 修：旧注释说「get_context 始终渲染第 0 页，页内=全局」，
+    // 但 2026-10-31 起 get_context 已改为**按高亮所在页**导出候选（修逗号翻页）。
+    // 渲染器/主题传来的下标因此是「页内相对」，必须先换算成全局下标，
+    // 否则第 2 页点第 1 条会选中第 1 页的第 1 条（C++ 同名 API 同为页内相对语义）。
+    let mut g = global().lock().unwrap();
+    let page_start = {
+        let Some(s) = g.sessions.get(&id) else {
+            return 0;
+        };
+        let Some(c) = s.context() else {
+            return 0;
+        };
+        let page_size = c.page_size.max(1) as usize;
+        // 渲染器只可能送页内下标；越界（≥页容量）拒绝，防误选
+        if index >= page_size {
+            return 0;
+        }
+        c.highlight_index() / page_size * page_size
+    };
+    if let Some(s) = g.sessions.get_mut(&id) {
+        return s.choose(page_start + index).is_some() as Bool;
+    }
+    0
 }
 
 unsafe extern "C" fn rime_change_page(id: RimeSessionId, backward: Bool) -> Bool {
@@ -1267,16 +1753,27 @@ unsafe extern "C" fn rime_simulate_key_sequence(id: RimeSessionId, sequence: *co
     let Some(seq) = read_cstr(sequence) else { return 0 };
     let mut ok = true;
     for token in seq.split_whitespace() {
-        match KeyEvent::parse(token) {
-            Some(key) => {
-                let mut g = global().lock().unwrap();
-                if let Some(s) = g.sessions.get_mut(&id) {
-                    if !s.process_key(key.keycode, key.modifier) {
-                        ok = false;
-                    }
+        let Some(key) = KeyEvent::parse(token) else {
+            ok = false;
+            continue;
+        };
+        // 每个键处理完就放锁；方案切换请求（若有）在锁外派发 —— 与真实按键同一条路。
+        let (eaten, pending) = {
+            let mut g = global().lock().unwrap();
+            match g.sessions.get_mut(&id) {
+                Some(s) => {
+                    let eaten = s.process_key(key.keycode, key.modifier);
+                    (eaten, s.take_pending_rebuild())
                 }
+                // 会话不存在：与原行为一致（不改 `ok`，因为没有键被处理）
+                None => (true, None),
             }
-            None => ok = false,
+        };
+        if let Some(sid) = pending {
+            request_session_rebuild(id, &sid);
+        }
+        if !eaten {
+            ok = false;
         }
     }
     ok as Bool
@@ -1428,6 +1925,55 @@ unsafe extern "C" fn stub_true() -> Bool {
     1
 }
 
+/// `RimeGetCandidatePreview`（evo `rime_api_impl.h:1051-1065`）。
+///
+/// 返回 `False` 的条件与 C++ 一致：结构体指针/`data_size` 不合法、会话不存在、
+/// 或者预览的 `selected_text` 为空（`fill_candidate_preview` 的判定）。
+unsafe extern "C" fn rime_get_candidate_preview(
+    id: RimeSessionId,
+    preview: *mut RimeCandidatePreview,
+) -> Bool {
+    if preview.is_null() || (*preview).data_size <= 0 {
+        return 0;
+    }
+    // `RIME_STRUCT_CLEAR`：先把三个输出字段清零，失败时宿主不会读到脏指针。
+    (*preview).text_before_selection = std::ptr::null_mut();
+    (*preview).selected_text = std::ptr::null_mut();
+    (*preview).text_after_selection = std::ptr::null_mut();
+
+    let g = global().lock().unwrap();
+    let Some(session) = g.sessions.get(&id) else {
+        return 0;
+    };
+    let Some(context) = session.context() else {
+        return 0;
+    };
+    let value = context
+        .composition
+        .get_candidate_preview(&context.input);
+    if value.selected_text.is_empty() {
+        return 0;
+    }
+    (*preview).text_before_selection = dup_string(&value.text_before_selection);
+    (*preview).selected_text = dup_string(&value.selected_text);
+    (*preview).text_after_selection = dup_string(&value.text_after_selection);
+    1
+}
+
+/// `RimeFreeCandidatePreview`（evo `rime_api_impl.h:1067-1075`）。
+unsafe extern "C" fn rime_free_candidate_preview(preview: *mut RimeCandidatePreview) -> Bool {
+    if preview.is_null() {
+        return 0;
+    }
+    cstr_free((*preview).text_before_selection);
+    cstr_free((*preview).selected_text);
+    cstr_free((*preview).text_after_selection);
+    (*preview).text_before_selection = std::ptr::null_mut();
+    (*preview).selected_text = std::ptr::null_mut();
+    (*preview).text_after_selection = std::ptr::null_mut();
+    1
+}
+
 // ----------------------------------------------------------------- RimeApi 单例
 
 fn build_api() -> RimeApi {
@@ -1540,8 +2086,8 @@ fn build_api() -> RimeApi {
         set_program_dir: Some(rime_set_program_dir),
         set_shared_data_dir: Some(rime_set_shared_data_dir),
         set_user_data_dir: Some(rime_set_user_data_dir),
-        get_candidate_preview: None,
-        free_candidate_preview: None,
+        get_candidate_preview: Some(rime_get_candidate_preview),
+        free_candidate_preview: Some(rime_free_candidate_preview),
     }
 }
 
@@ -1603,6 +2149,169 @@ mod host_smoke {
         // 注释里的 active 不算数
         let commented = "# active: stroke\nschemas:\n  - pinyin.terra\n";
         assert_eq!(extract_first_schema_id(commented).as_deref(), Some("pinyin.terra"));
+
+        // 2026-11-11：active 被组禁用时，候选序列要能继续往下退。
+        let disabled = "active: pinyin.zrm\nschemas:\n  - pinyin\n  - wubi86\n  - liangfen\n";
+        assert_eq!(
+            extract_schema_id_candidates(disabled),
+            vec![
+                "pinyin.zrm".to_string(),
+                "pinyin".to_string(),
+                "wubi86".to_string(),
+                "liangfen".to_string()
+            ],
+            "输入 active=pinyin.zrm + 4 项清单应产出 4 个候选（去重），供禁用过滤逐个跳过"
+        );
+    }
+
+    #[test]
+    fn disabled_group_skips_active_without_rewriting_manifest() {
+        let sandbox = Sandbox(
+            std::env::temp_dir().join(format!("rime-disabled-capi-{}", std::process::id())),
+        );
+        let _ = std::fs::remove_dir_all(&sandbox.0);
+        let shared = sandbox.0.join("shared");
+        let user = sandbox.0.join("user");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::create_dir_all(user.join("schema")).unwrap();
+        let manifest = "# 方案信息\nactive: pinyin.zrm\nschemas:\n  - pinyin\n  - pinyin.zrm\n  - wubi86\n  - liangfen\n";
+        let manifest_path = user.join("schema").join(crate::lever::paths::SCHEMA_MANIFEST);
+        std::fs::write(&manifest_path, manifest).unwrap();
+        // 让 `groups: [pinyin]` 能按 parent: 展开到 active 的 pinyin.zrm
+        let child_dir = user.join("schema").join("pinyin").join("zrm");
+        std::fs::create_dir_all(&child_dir).unwrap();
+        std::fs::write(
+            child_dir.join("pinyin.zrm.schema.yaml"),
+            "schema:\n  schema_id: pinyin.zrm\n  name: 自然码\n  parent: pinyin\n",
+        )
+        .unwrap();
+        std::fs::write(
+            user.join("schema").join(crate::lever::paths::DISABLED_SCHEMAS_FILE),
+            "groups:\n  - pinyin\nschemas: []\n",
+        )
+        .unwrap();
+
+        let g = Global {
+            shared_data_dir: shared.to_string_lossy().into_owned(),
+            user_data_dir: user.to_string_lossy().into_owned(),
+            program_dir: String::new(),
+            prebuilt_data_dir: String::new(),
+            staging_dir: String::new(),
+            sessions: HashMap::new(),
+            next_id: 1,
+            rebuild_generation: HashMap::new(),
+            next_rebuild_generation: 1,
+            deployer: None,
+            maintenance: None,
+        };
+        assert_eq!(
+            default_schema_id(&g),
+            "wubi86",
+            "active=pinyin.zrm 落在禁用组内：运行时只退到清单里第一个未禁用方案"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&manifest_path).unwrap(),
+            manifest,
+            "禁用绝不能改 schema.yaml：active 与 4 项 schemas 必须逐字节原样"
+        );
+        let items = collect_schema_list(&g);
+        let ids: Vec<&str> = items.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["wubi86", "liangfen"],
+            "宿主方案列表同样不能出现被禁用的 pinyin / pinyin.zrm"
+        );
+    }
+
+    #[test]
+    fn unchecked_parent_blocks_children_but_can_be_rechecked() {
+        let sandbox = Sandbox(
+            std::env::temp_dir().join(format!("rime-unchecked-capi-{}", std::process::id())),
+        );
+        let _ = std::fs::remove_dir_all(&sandbox.0);
+        let shared = sandbox.0.join("shared");
+        let user = sandbox.0.join("user");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::create_dir_all(user.join("schema/pinyin/luna")).unwrap();
+        std::fs::create_dir_all(user.join("schema/pinyin/zrm")).unwrap();
+        // 出厂 default.yaml 仍列着 pinyin 与全部子方案，不能让它漏进宿主菜单。
+        std::fs::write(
+            shared.join("default.yaml"),
+            "schema_list:\n  - schema: pinyin\n  - schema: pinyin.luna\n  - schema: pinyin.zrm\n  - schema: cangjie.5\n  - schema: stroke\n",
+        )
+        .unwrap();
+        for (leaf, name) in [("luna", "明月"), ("zrm", "自然码")] {
+            std::fs::write(
+                user
+                    .join("schema/pinyin")
+                    .join(leaf)
+                    .join(format!("pinyin.{leaf}.schema.yaml")),
+                format!("schema:\n  schema_id: pinyin.{leaf}\n  name: {name}\n  parent: pinyin\n"),
+            )
+            .unwrap();
+        }
+        let manifest_path = user.join("schema").join(crate::lever::paths::SCHEMA_MANIFEST);
+        let disabled_path = user.join("schema").join(crate::lever::paths::DISABLED_SCHEMAS_FILE);
+        let unchecked =
+            "active: pinyin\nschemas:\n  - pinyin.luna\n  - pinyin.zrm\n  - cangjie.5\n  - stroke\n";
+        std::fs::write(&manifest_path, unchecked).unwrap();
+        std::fs::write(&disabled_path, "groups: []\nschemas: []\n").unwrap();
+
+        let g = Global {
+            shared_data_dir: shared.to_string_lossy().into_owned(),
+            user_data_dir: user.to_string_lossy().into_owned(),
+            program_dir: String::new(),
+            prebuilt_data_dir: String::new(),
+            staging_dir: String::new(),
+            sessions: HashMap::new(),
+            next_id: 1,
+            rebuild_generation: HashMap::new(),
+            next_rebuild_generation: 1,
+            deployer: None,
+            maintenance: None,
+        };
+        assert_eq!(
+            default_schema_id(&g),
+            "cangjie.5",
+            "active=pinyin 只是没被勾选：内存回退到第一个可部署方案，不改源文件"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&manifest_path).unwrap(),
+            unchecked,
+            "父未选绝不能改 schema.yaml 的 active / schemas"
+        );
+        let items = collect_schema_list(&g);
+        let ids: Vec<&str> = items.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["cangjie.5", "stroke"],
+            "宿主菜单不能出现未勾选的 pinyin，也不能出现被父未选压住的子方案"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&disabled_path).unwrap(),
+            "groups: []\nschemas: []\n",
+            "父未选不能写进 disabled.yaml，否则父方案自己也回不来了"
+        );
+
+        let rechecked =
+            "active: pinyin\nschemas:\n  - pinyin\n  - pinyin.luna\n  - pinyin.zrm\n  - cangjie.5\n  - stroke\n";
+        std::fs::write(&manifest_path, rechecked).unwrap();
+        assert_eq!(
+            default_schema_id(&g),
+            "pinyin",
+            "重新勾选 pinyin 后 active 立即恢复成当前方案"
+        );
+        let items_again = collect_schema_list(&g);
+        let ids_again: Vec<&str> = items_again.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            ids_again,
+            vec!["pinyin", "pinyin.luna", "pinyin.zrm", "cangjie.5", "stroke"],
+            "重新勾选父方案后子方案全部恢复，不需要删 build"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&disabled_path).unwrap(),
+            "groups: []\nschemas: []\n"
+        );
     }
 
     /// 宿主机上有没有按新键（`translator/dict`）部署的产物。
@@ -1674,7 +2383,7 @@ mod host_smoke {
         // 拷 schema 源(reload 用)
         let src_schema = format!("{real_user}/schema");
         copy_dir_contents(std::path::Path::new(&src_schema), &sandbox.join("schema"));
-        let shared = CString::new("C:/Program Files/Rime-Next/Weasel-Next-0.18.4/data").unwrap();
+        let shared = CString::new("C:/Program Files/Rime-Next/Weasel-Next/data").unwrap();
         let user = CString::new(sandbox.to_string_lossy().as_bytes()).unwrap();
         let app = CString::new("rime.weasel-next").unwrap();
 
@@ -1702,9 +2411,19 @@ mod host_smoke {
                 assert!(consumed != 0, "按键 {ch} 应被消费");
             }
             let mut ctx: RimeContext = std::mem::zeroed();
+            // 宿主约定：`data_size` = sizeof(结构) - sizeof(data_size)（= `RIME_STRUCT_INIT`）。
+            // 保持 0 等于自称「老宿主」，本工程扩展字段（预测 / total_candidates）一个都不会写。
+            ctx.data_size =
+                (std::mem::size_of::<RimeContext>() - std::mem::size_of::<c_int>()) as c_int;
             let ok = rime_get_context(id, &mut ctx);
             assert!(ok != 0, "应能取得上下文");
             let n = ctx.menu.num_candidates as usize;
+            // 「1 / N」页码的数据源：懒式菜单必须排空流才有总数（`num_candidates` 只是本页条数）。
+            let total = ctx.total_candidates;
+            assert!(
+                total > 0 && total as usize >= n,
+                "宿主声明 data_size 后应拿到总候选数（total={total}, page={n}）"
+            );
             let mut texts = Vec::new();
             if n > 0 && !ctx.menu.candidates.is_null() {
                 let arr = std::slice::from_raw_parts(ctx.menu.candidates, n);
@@ -1715,7 +2434,7 @@ mod host_smoke {
                 }
             }
             rime_free_context(&mut ctx);
-            eprintln!("HOST-PATH candidates (n={n}): {texts:?}");
+            eprintln!("HOST-PATH candidates (n={n}, total={total}): {texts:?}");
             assert!(
                 !texts.is_empty(),
                 "宿主路径下应产出候选；若为空，多半是 build_dir 解析到了程序目录（那里没有 .bin）"

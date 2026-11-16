@@ -1,9 +1,9 @@
 //! `src/rime/candidate.{h,cc}`：候选词条 + 候选页。
 
-use crate::dict::vocabulary::DictEntry;
+use crate::gear::dict::vocabulary::DictEntry;
 
 /// 一条候选（对照 C++ `Candidate` / `SimpleCandidate`）。
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Candidate {
     /// 识别类型（如 `"pinyin"`, `"table"`），由 translator 填。
     pub kind: String,
@@ -38,6 +38,29 @@ pub struct Candidate {
     /// 没有音节结构的候选（标点、单独字符兜底）留空 —— 空表示
     /// 「不知道音节边界」，`partial_commit` 会因此放行给其它处理器。
     pub spans: Vec<usize>,
+    /// 线性重排头的学习轨迹（同一候选组共享一份）。
+    ///
+    /// 只有神经重排命中/提交过 batch 的候选才有；提交时由
+    /// [`crate::engine::context::Context::collect_commit_elements`] 取走，
+    /// 用来构造「选中下标」样本。`None` = 这一层没参与（完全回退）。
+    pub rerank: Option<crate::gear::neural::rerank_head::RerankRef>,
+}
+
+impl PartialEq for Candidate {
+    /// 比较除 `rerank` 外的全部字段：轨迹是旁路元数据，不该影响
+    /// 「两条候选是否相同」的既有语义（测试/去重都在用）。
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.start == other.start
+            && self.end == other.end
+            && self.quality == other.quality
+            && self.text == other.text
+            && self.comment == other.comment
+            && self.preedit == other.preedit
+            && self.components == other.components
+            && self.entry == other.entry
+            && self.spans == other.spans
+    }
 }
 
 impl Candidate {
@@ -53,6 +76,7 @@ impl Candidate {
             components: Vec::new(),
             entry: None,
             spans: Vec::new(),
+            rerank: None,
         }
     }
 

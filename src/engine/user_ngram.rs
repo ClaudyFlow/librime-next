@@ -98,6 +98,20 @@ impl UserNgram {
     /// `learn_words` 要求 ≥2 个词，直接喂就会静默不学（2026-11-01 用户报
     /// "打过十几遍还是不在首选"就是这个原因）。
     pub fn learn_commit(&mut self, words: &[String]) {
+        self.learn_commit_incremental(words);
+    }
+
+    /// [`Self::learn_commit`] 的增量实现：只数本次新形成的转移。
+    ///
+    /// 旧实现把「最近 4 个词」整窗重学，同一个 bigram/trigram 会在后续几次
+    /// 提交里被反复 +1（打 4 个词后计数约为真实转移次数的数倍），而线性头
+    /// 与 `bonus` 都直接读这些计数。这里改成：窗口仍然带上下文，
+    /// 但只统计**末词落在本次新增词上**的转移，每条转移每次提交只记一次。
+    fn learn_commit_incremental(&mut self, words: &[String]) {
+        let old_len = self.recent.len();
+        let mut combined: Vec<String> =
+            Vec::with_capacity(old_len.saturating_add(words.len()));
+        combined.extend(self.recent.iter().cloned());
         for word in words {
             if word.is_empty() {
                 continue;
@@ -107,14 +121,69 @@ impl UserNgram {
             let entry = self.unigram.entry(word.clone()).or_default();
             entry.count = entry.count.saturating_add(1);
             entry.last_used = self.clock;
-            self.recent.push(word.clone());
-            if self.recent.len() > 4 {
-                self.recent.remove(0);
-            }
+            combined.push(word.clone());
         }
         self.dirty += 1;
-        let window = self.recent.clone();
-        self.learn_words(&window);
+        self.learn_transitions_since(&combined, old_len);
+        let keep_from = combined.len().saturating_sub(4);
+        self.recent = combined.split_off(keep_from);
+    }
+
+    /// 只统计「末词下标 ≥ `new_start`」的二元/三元转移。
+    ///
+    /// `words` = 旧窗口 + 本次新词；`new_start` = 旧窗口长度。
+    /// 每条转移的末词若是新词，就在这次提交里记一次；下一轮它变成旧词后
+    /// 不会再被重复计数。
+    fn learn_transitions_since(&mut self, words: &[String], new_start: usize) {
+        if words.len() < 2 {
+            return;
+        }
+        for window in 2..=3 {
+            if words.len() < window {
+                continue;
+            }
+            for start in 0..=words.len() - window {
+                if start + window - 1 < new_start {
+                    continue;
+                }
+                self.clock += 1;
+                match window {
+                    2 => {
+                        let key = (words[start].clone(), words[start + 1].clone());
+                        let entry = self.bigram.entry(key).or_default();
+                        entry.count = entry.count.saturating_add(1);
+                        entry.last_used = self.clock;
+                    }
+                    _ => {
+                        let key = (
+                            words[start].clone(),
+                            words[start + 1].clone(),
+                            words[start + 2].clone(),
+                        );
+                        let entry = self.trigram.entry(key).or_default();
+                        entry.count = entry.count.saturating_add(1);
+                        entry.last_used = self.clock;
+                    }
+                }
+            }
+        }
+        self.evict_if_needed();
+    }
+
+    /// 线性重排头用的三项计数：`(unigram, bigram(prev→candidate), trigram)`。
+    pub fn counts_for(
+        &self,
+        before_last: Option<&str>,
+        prev: Option<&str>,
+        candidate: &str,
+    ) -> (u32, u32, u32) {
+        let unigram = self.unigram_count(candidate);
+        let bigram = prev.map_or(0, |prev| self.bigram_count(prev, candidate));
+        let trigram = match (before_last, prev) {
+            (Some(first), Some(prev)) => self.trigram_count(first, prev, candidate),
+            _ => 0,
+        };
+        (unigram, bigram, trigram)
     }
 
     /// 用户删词：从统计里抹掉，并拉黑（打错一次就永远别再冒头）。
@@ -140,32 +209,31 @@ impl UserNgram {
     }
 
     /// 落盘（TSV：`b<TAB>词1<TAB>词2<TAB>次数` / `t<TAB>词1<TAB>词2<TAB>词3<TAB>次数`）。
+    ///
+    /// 2026-11-09：按键路径不再调用它（见 [`request_flush`]）；只剩退出时同步落盘。
     pub fn save(&mut self, path: &std::path::Path) -> std::io::Result<()> {
-        use std::io::Write as _;
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let mut out = String::new();
-        for word in &self.blocked {
-            out.push_str(&format!("x	{word}
-"));
-        }
-        for (word, entry) in &self.unigram {
-            out.push_str(&format!("u	{word}	{}
-", entry.count));
-        }
-        for ((first, second), entry) in &self.bigram {
-            out.push_str(&format!("b	{first}	{second}	{}
-", entry.count));
-        }
-        for ((a, b, c), entry) in &self.trigram {
-            out.push_str(&format!("t	{a}	{b}	{c}	{}
-", entry.count));
-        }
-        let mut file = std::fs::File::create(path)?;
-        file.write_all(out.as_bytes())?;
+        let text = self.to_tsv();
+        write_atomic(path, &text)?;
         self.dirty = 0;
         Ok(())
+    }
+
+    /// 把整表格式化成 TSV 文本（纯内存，不碰磁盘；后台落盘线程用）。
+    fn to_tsv(&self) -> String {
+        let mut out = String::new();
+        for word in &self.blocked {
+            out.push_str(&format!("x\t{word}\n"));
+        }
+        for (word, entry) in &self.unigram {
+            out.push_str(&format!("u\t{word}\t{}\n", entry.count));
+        }
+        for ((first, second), entry) in &self.bigram {
+            out.push_str(&format!("b\t{first}\t{second}\t{}\n", entry.count));
+        }
+        for ((a, b, c), entry) in &self.trigram {
+            out.push_str(&format!("t\t{a}\t{b}\t{c}\t{}\n", entry.count));
+        }
+        out
     }
 
     /// 读盘；文件不存在时静默返回。
@@ -546,6 +614,141 @@ pub fn store_path() -> std::path::PathBuf {
         .join("user_ngram.tsv")
 }
 
+/// 后台落盘信号：按键线程只 `notify_one`，磁盘 I/O 全在 worker 线程。
+struct FlushSignal {
+    pending: bool,
+    seq: u64,
+}
+
+fn flush_signal() -> &'static (std::sync::Mutex<FlushSignal>, std::sync::Condvar) {
+    static SIGNAL: std::sync::OnceLock<(std::sync::Mutex<FlushSignal>, std::sync::Condvar)> =
+        std::sync::OnceLock::new();
+    SIGNAL.get_or_init(|| {
+        (
+            std::sync::Mutex::new(FlushSignal { pending: false, seq: 0 }),
+            std::sync::Condvar::new(),
+        )
+    })
+}
+
+/// 请求后台落盘：按键路径唯一该调用的落盘入口（只改标记 + `notify_one`）。
+pub fn request_flush() {
+    ensure_flush_worker();
+    let (lock, cond) = flush_signal();
+    if let Ok(mut signal) = lock.lock() {
+        signal.pending = true;
+        signal.seq = crate::engine::stage_trace::current();
+        cond.notify_one();
+    }
+}
+
+fn ensure_flush_worker() {
+    static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    STARTED.get_or_init(|| {
+        let _ = std::thread::Builder::new()
+            .name("user-ngram-flush".into())
+            .spawn(flush_loop);
+    });
+}
+
+/// 后台落盘循环：请求立刻写；没有请求时最多等 [`IDLE_FLUSH`](5s) 也检查一次 dirty，
+/// 保证"空闲/定时"都会最终落盘；失败则重新挂起并按 1s→30s 退避重试。
+fn flush_loop() {
+    const IDLE_FLUSH: std::time::Duration = std::time::Duration::from_secs(5);
+    let mut retry = std::time::Duration::from_secs(1);
+    loop {
+        let seq = {
+            let (lock, cond) = flush_signal();
+            let Ok(mut signal) = lock.lock() else {
+                std::thread::sleep(IDLE_FLUSH);
+                continue;
+            };
+            if !signal.pending {
+                let Ok((guard, _)) = cond.wait_timeout(signal, IDLE_FLUSH) else {
+                    std::thread::sleep(IDLE_FLUSH);
+                    continue;
+                };
+                signal = guard;
+            }
+            // 有请求：用请求携带的 seq（和触发它的那次提交对齐）；
+            // 空闲超时：用当前 seq。取完立刻清掉，避免下一次定时落盘复用旧 id。
+            let seq = if signal.pending {
+                signal.seq
+            } else {
+                crate::engine::stage_trace::current()
+            };
+            signal.pending = false;
+            signal.seq = 0;
+            seq
+        };
+        match flush_once(seq) {
+            Ok(true) => retry = std::time::Duration::from_secs(1),
+            Ok(false) => {}
+            Err(_) => {
+                let (lock, cond) = flush_signal();
+                if let Ok(mut signal) = lock.lock() {
+                    signal.pending = true;
+                    cond.notify_one();
+                }
+                std::thread::sleep(retry);
+                retry = (retry * 2).min(std::time::Duration::from_secs(30));
+            }
+        }
+    }
+}
+
+/// 落一次盘：锁内只做内存快照（`to_tsv`），写文件在锁外。
+///
+/// 返回 `Ok(false)` 表示当前没有脏数据、无需写盘；`Err` 由调用方重试。
+fn flush_once(seq: u64) -> std::io::Result<bool> {
+    let start = std::time::Instant::now();
+    let (text, dirty) = {
+        let Ok(ngram) = global().lock() else {
+            return Ok(false);
+        };
+        if ngram.dirty == 0 {
+            return Ok(false);
+        }
+        (ngram.to_tsv(), ngram.dirty)
+    };
+    write_atomic(&store_path(), &text)?;
+    if let Ok(mut ngram) = global().lock() {
+        // 只扣掉本次快照覆盖的批次数；期间新学的保持 dirty，等下一轮再写。
+        ngram.dirty = ngram.dirty.saturating_sub(dirty);
+    }
+    crate::engine::stage_trace::emit(seq, "ngram_flush", start.elapsed().as_micros());
+    Ok(true)
+}
+
+/// 先写临时文件再改名，避免"写一半"把正式文件截断（崩溃最多丢最近一批）。
+///
+/// 重排头的参数文件也走这一份（`pub(crate)` 是为了不复制第二套原子写）。
+pub(crate) fn write_atomic(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "user_ngram.tsv".to_string());
+    let tmp = path.with_file_name(format!("{name}.tmp-{}", std::process::id()));
+    let result = (|| {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(text.as_bytes())?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// 引擎 finalize / 进程退出：同步落一次（失败不重试，最坏丢最近一批）。
+pub fn flush_on_exit() {
+    let _ = flush_once(crate::engine::stage_trace::current());
+}
+
 /// 候选生成期的快速判定：这个词被用户删过吗？
 ///
 /// 独立的 lock scope（不能和 `bonus` 的锁重入），命中即跳过该候选。
@@ -563,13 +766,21 @@ pub fn is_blocked_global(word: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 学一次提交并适时落盘。
+/// 学一次提交并适时请求后台落盘（按键路径不碰磁盘）。
 pub fn learn_and_maybe_flush(words: &[String]) {
-    if let Ok(mut ngram) = global().lock() {
+    // 第一次学词就把后台线程拉起来：这样即便提交数还没到 10（未触发
+    // `request_flush`），空闲 5s 的定时落盘也会生效，崩溃丢得更少。
+    ensure_flush_worker();
+    let flush = {
+        let Ok(mut ngram) = global().lock() else {
+            return;
+        };
         ngram.learn_commit(words);
-        if ngram.should_flush() {
-            let _ = ngram.save(&store_path());
-        }
+        ngram.should_flush()
+    };
+    // 锁已释放再通知，避免和后台线程的（signal → global）顺序交叉成死锁。
+    if flush {
+        request_flush();
     }
 }
 
@@ -603,6 +814,20 @@ pub fn predictions_for_context(context: &crate::engine::context::Context) -> Vec
         ),
         Err(_) => Vec::new(),
     }
+}
+
+/// 线性重排头的特征读取入口：一次拿齐三项计数（锁只取一次）。
+///
+/// 供 `rerank_head` 在候选打分/学习时复用，语义与 [`UserNgram::counts_for`] 一致。
+pub fn counts(
+    before_last: Option<&str>,
+    prev: Option<&str>,
+    candidate: &str,
+) -> (u32, u32, u32) {
+    global()
+        .lock()
+        .map(|ngram| ngram.counts_for(before_last, prev, candidate))
+        .unwrap_or((0, 0, 0))
 }
 
 /// 默认加成权重（`translator/ngram_weight` 配置化之前先取 1.0）。
@@ -651,5 +876,28 @@ mod wiring_tests {
         // 引擎在每次提交时只喂本轮的词——同批重喂才递增(与青简语义一致)。
         ngram.learn_words(&["天气".to_string(), "很好".to_string()]);
         assert_eq!(ngram.bigram_count("天气", "很好"), 2);
+    }
+
+    /// `learn_commit` 带上下文窗口，但**只数新增转移**：同一个 bigram
+    /// 不会在后续几次提交里被反复 +1（线性头的特征依赖这一点）。
+    #[test]
+    fn learn_commit_counts_each_transition_once() {
+        let mut ngram = UserNgram::new();
+        let feed = |ngram: &mut UserNgram, word: &str| ngram.learn_commit(&[word.to_string()]);
+        feed(&mut ngram, "你");
+        feed(&mut ngram, "好");
+        assert_eq!(ngram.bigram_count("你", "好"), 1);
+        assert_eq!(ngram.unigram_count("你"), 1);
+        // 第三个词：只新增 (好→吗) 与 (你,好,吗)，(你→好) 不再重记。
+        feed(&mut ngram, "吗");
+        assert_eq!(ngram.bigram_count("你", "好"), 1, "旧 bigram 被整窗重学了");
+        assert_eq!(ngram.bigram_count("好", "吗"), 1);
+        assert_eq!(ngram.trigram_count("你", "好", "吗"), 1);
+        // 第四个词：(好,吗) 与 (你,好,吗) 都不再重记。
+        feed(&mut ngram, "啊");
+        assert_eq!(ngram.bigram_count("好", "吗"), 1);
+        assert_eq!(ngram.trigram_count("你", "好", "吗"), 1);
+        assert_eq!(ngram.trigram_count("好", "吗", "啊"), 1);
+        assert_eq!(ngram.unigram_count("啊"), 1);
     }
 }

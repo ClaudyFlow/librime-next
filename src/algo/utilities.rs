@@ -72,7 +72,10 @@ impl ChecksumComputer {
     }
 
     /// `utilities.cc:45-47`：逐段喂字节。
-    fn process_bytes(&mut self, bytes: &[u8]) {
+    ///
+    /// 公开给 `dict_compiler` 的 pack 指纹用：pack 名必须参与 CRC，
+    /// 否则 `[A, B]` 改成 `[A]` 时剩余内容哈希恰好相同，会漏掉这次变更。
+    pub fn process_bytes(&mut self, bytes: &[u8]) {
         for &b in bytes {
             self.rem = (self.rem >> 8) ^ CRC32_TABLE[((self.rem ^ b as u32) & 0xFF) as usize];
         }

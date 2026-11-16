@@ -66,6 +66,10 @@ pub struct SpellingProperties {
     pub(super) tips: String,
     /// 是否为纠错拼写
     pub(super) is_correction: bool,
+    /// 是否由辅助码规则（`aux/...`）声明。对应 evo `spelling.h` 的 `auxiliary`
+    /// 位：只由 `Auxiliary` 规则置位，`Compose` / `Update` 都是**或**语义，
+    /// 一旦为真不会被打回 false。
+    pub(super) auxiliary: bool,
 }
 
 impl SpellingProperties {
@@ -91,6 +95,8 @@ impl SpellingProperties {
         if delta.is_correction {
             self.is_correction = true;
         }
+        // 輔助碼標記（`spelling.cc:16`）: 或语义, 只置位不清零
+        self.auxiliary = self.auxiliary || delta.auxiliary;
         if !delta.tips.is_empty() {
             self.tips = delta.tips.clone();
         }
@@ -115,8 +121,18 @@ impl SpellingProperties {
         if other.credibility > self.credibility {
             self.credibility = other.credibility;
         }
+        // 輔助碼標記（`spelling.cc:34`）: 或语义
+        self.auxiliary = self.auxiliary || other.auxiliary;
         // 提示是針對其中一個拼寫來源的, 可能對合併後的拼寫不適用
         self.tips.clear();
+    }
+
+    /// `spelling.h` 的 `auxiliary` 位 —— **只读**访问器。
+    ///
+    /// 字段本身保持 `pub(super)`（只有 algo 层能写）；`dict/auxiliary_db` 的编译侧
+    /// 要判定「这条派生拼写是否由 `aux` 规则声明」。
+    pub fn is_auxiliary(&self) -> bool {
+        self.auxiliary
     }
 
     /// `spelling.h:26` 的 `size_t end_pos;` —— **只读**访问器。

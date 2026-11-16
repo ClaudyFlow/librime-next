@@ -20,7 +20,7 @@
 //! 这里用「sleep 200ms + 手动 compose」模拟宿主的下一次按键。
 
 use librime_next::engine::Session;
-use librime_next::engine::gear::rescore;
+use librime_next::gear::filter::rescore;
 use std::path::PathBuf;
 use std::time::Instant;
 

@@ -10,7 +10,7 @@
 //! cargo run --release --example neural_bench
 //! ```
 
-use librime_next::engine::gear::neural;
+use librime_next::gear::neural;
 use std::time::Instant;
 
 fn bench_model(name: &str, path: &str) {

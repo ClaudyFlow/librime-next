@@ -111,6 +111,9 @@ fn main() {
             None => 0,
         };
         println!("  候选数 {count}");
+        if let Some(segment) = engine.context.composition.segmentation.segments.last() {
+            println!("  选中索引 {}", segment.selected_index);
+        }
         if let Some(text) = engine.context.commit_text.as_ref() {
             println!("  提交文本 {text:?}");
         }

@@ -3,8 +3,8 @@
 //!
 //! 对照 C++ librime：同样喂 "nihao"，应能在候选里拿到「你好」并提交。
 
-use librime_next::dict::dictionary::Dictionary;
-use librime_next::engine::gear::charset_filter::is_extended_cjk;
+use librime_next::gear::dict::dictionary::Dictionary;
+use librime_next::gear::filter::charset_filter::is_extended_cjk;
 use librime_next::engine::{SelectResult, Session};
 use std::path::{Path, PathBuf};
 
@@ -129,8 +129,8 @@ fn engine_loads_luna_pinyin_simp() {
 
 #[test]
 fn debug_translate() {
-    use librime_next::dict::prism::Prism;
-    use librime_next::dict::table::Table;
+    use librime_next::gear::dict::prism::Prism;
+    use librime_next::gear::dict::table::Table;
     let dir = build_dir();
     let tp = dir.join("luna_pinyin.table.bin");
     let pp = dir.join("luna_pinyin_simp.prism.bin");
@@ -168,8 +168,8 @@ fn debug_translate() {
 
 #[test]
 fn debug_spelling_map() {
-    use librime_next::dict::prism::Prism;
-    use librime_next::dict::table::Table;
+    use librime_next::gear::dict::prism::Prism;
+    use librime_next::gear::dict::table::Table;
     let dir = build_dir();
     let table = Table::open(dir.join("luna_pinyin.table.bin")).expect("table");
     let prism = Prism::open(dir.join("luna_pinyin_simp.prism.bin")).expect("prism");
@@ -206,7 +206,7 @@ fn debug_spelling_map() {
     // Direct table lookup with the real syllable ids
     let ni_id = syl.id_of("ni").unwrap();
     let hao_id = syl.id_of("hao").unwrap();
-    let code = librime_next::dict::vocabulary::Code::from_slice(&[ni_id, hao_id]);
+    let code = librime_next::gear::dict::vocabulary::Code::from_slice(&[ni_id, hao_id]);
     let mut acc = table.query_phrases(&code);
     println!("query_phrases([ni={ni_id}, hao={hao_id}]) ->");
     while !acc.exhausted() {
@@ -216,7 +216,7 @@ fn debug_spelling_map() {
         acc.next();
     }
     // single ni
-    let code1 = librime_next::dict::vocabulary::Code::from_slice(&[ni_id]);
+    let code1 = librime_next::gear::dict::vocabulary::Code::from_slice(&[ni_id]);
     let mut acc1 = table.query_phrases(&code1);
     println!("query_phrases([ni={ni_id}]) ->");
     let mut cnt = 0;
@@ -913,8 +913,8 @@ fn legacy_grammar_config_is_ignored() {
 
 #[test]
 fn user_dict_learns_committed_phrase() {
-    use librime_next::dict::db::Db;
-    use librime_next::dict::level_db::LevelDb;
+    use librime_next::gear::dict::db::Db;
+    use librime_next::gear::dict::level_db::LevelDb;
 
     let user_dir = fresh_user_dir("learn");
     let build = build_dir();
@@ -955,7 +955,7 @@ fn user_dict_learns_committed_phrase() {
         }
         panic!("userdb 里没有「ni hao \t你好」，实际内容：{keys:?}");
     });
-    let value = librime_next::dict::user_db::UserDbValue::unpack(&raw).expect("值应可解析");
+    let value = librime_next::gear::dict::user_db::UserDbValue::unpack(&raw).expect("值应可解析");
     assert_eq!(value.commits, 1, "学过一次 commits 应为 1，实际值 {raw:?}");
     assert!(value.tick >= 1, "tick 应被推进，实际值 {raw:?}");
     assert!(db.close());
@@ -995,8 +995,8 @@ fn user_dict_learns_committed_phrase() {
 /// 默认 `enable_user_dict` 为 true：没在方案里写配置也必须学词。
 #[test]
 fn user_dict_is_enabled_by_default() {
-    use librime_next::dict::db::Db;
-    use librime_next::dict::level_db::LevelDb;
+    use librime_next::gear::dict::db::Db;
+    use librime_next::gear::dict::level_db::LevelDb;
 
     let user_dir = fresh_user_dir("enabled_default");
     let build = build_dir();
@@ -1042,8 +1042,8 @@ fn candidate_list(session: &mut Session) -> Vec<librime_next::engine::Candidate>
 /// 前缀扫，而不是音节图上的 DFS。
 #[test]
 fn table_translator_wubi86_learns_committed_word() {
-    use librime_next::dict::db::Db;
-    use librime_next::dict::level_db::LevelDb;
+    use librime_next::gear::dict::db::Db;
+    use librime_next::gear::dict::level_db::LevelDb;
 
     let user_dir = fresh_user_dir("wubi_learn");
     let build = build_dir();
@@ -1090,7 +1090,7 @@ fn table_translator_wubi86_learns_committed_word() {
         .iter()
         .find(|(key, _)| key.ends_with("\t你"))
         .unwrap_or_else(|| panic!("userdb 里没有学到「你」，实际内容：{keys:?}"));
-    let value = librime_next::dict::user_db::UserDbValue::unpack(raw).expect("值应可解析");
+    let value = librime_next::gear::dict::user_db::UserDbValue::unpack(raw).expect("值应可解析");
     assert_eq!(value.commits, 1, "学过一次 commits 应为 1，实际值 {raw:?}");
     assert!(db.close());
 
@@ -1223,9 +1223,9 @@ fn reverse_lookup_does_not_claim_plain_segments() {
 /// 反查过滤器：给候选补上"反查码"注释（出厂 0 引用，这里单独验证行为）。
 #[test]
 fn reverse_lookup_filter_fills_codes() {
-    use librime_next::engine::gear::filter::Filter;
-    use librime_next::engine::gear::reverse_lookup_filter::ReverseLookupFilter;
-    use librime_next::engine::gear::translation::{Translation, VecTranslation};
+    use librime_next::gear::filter::filter::Filter;
+    use librime_next::gear::filter::reverse_lookup_filter::ReverseLookupFilter;
+    use librime_next::gear::translator::translation::{Translation, VecTranslation};
     use librime_next::engine::Candidate;
     use serde_json::json;
 
@@ -2114,7 +2114,7 @@ fn neural_rescore_lands_and_recomposes() {
         eprintln!("skip: 没有神经模型({}),从 chinese-ime-lm model-v1 下载", model.display());
         return;
     }
-    use librime_next::engine::gear::rescore;
+    use librime_next::gear::filter::rescore;
     let build = build_dir();
     let user_dir = fresh_user_dir("neural");
     let roots = vec![user_dir.clone(), build.clone()];
@@ -2188,7 +2188,7 @@ fn space_commits_highlighted_prefix_and_keeps_rest_composing() {
 /// 更关键:整句候选上屏(带 components)也要逐词学,而不是学成一个 6 字长词。
 #[test]
 fn sentence_commit_learns_component_pairs() {
-    use librime_next::engine::gear::rescore;
+    use librime_next::gear::filter::rescore;
     // 触发全局(测试里 init 由 c_api 做;这里手动置空表即可——global() 惰性创建)
     let build = build_dir();
     let user_dir = fresh_user_dir("ngram");

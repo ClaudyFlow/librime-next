@@ -94,7 +94,7 @@ fn main() {
     }
 
     // ③ 走宿主那条路：sleep → poll_rescore_landing（有落地才 compose）。
-    librime_next::engine::gear::rescore::init_from_data_roots(&roots);
+    librime_next::gear::filter::rescore::init_from_data_roots(&roots);
     for i in 1..=rounds {
         std::thread::sleep(std::time::Duration::from_millis(300));
         s.poll_rescore_landing();

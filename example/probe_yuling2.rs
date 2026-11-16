@@ -1,7 +1,7 @@
 //! 宇浩系词典查询链路探针:get_value → spelling_syllable_id → query_phrases,
 //! 以及 import_tables 展开的编码提取(与 all_schemas_e2e 同逻辑)。
-use librime_next::dict::dictionary::Dictionary;
-use librime_next::dict::vocabulary::Code;
+use librime_next::gear::dict::dictionary::Dictionary;
+use librime_next::gear::dict::vocabulary::Code;
 use std::path::PathBuf;
 
 fn collect_codes(path: &PathBuf, codes: &mut Vec<String>, limit: usize) {
@@ -30,7 +30,7 @@ fn main() {
     let shared = PathBuf::from(r"C:\Program Files\Weasel-Next\Rime-Next");
     let build = user.join("build");
     let dict = Dictionary::open(&build, "yuling", "yuling").expect("词典应打开");
-    let source = librime_next::dict::dict_compiler::classified_dict_source(&user, &shared, "yuling")
+    let source = librime_next::gear::dict::dict_compiler::classified_dict_source(&user, &shared, "yuling")
         .expect("词典源应找到");
     println!("词典源: {}", source.display());
 
@@ -54,7 +54,7 @@ fn main() {
                     continue;
                 }
                 let Some(name) = line.trim().strip_prefix("- ") else { continue };
-                match librime_next::dict::dict_compiler::classified_dict_source(&user, &shared, name.trim()) {
+                match librime_next::gear::dict::dict_compiler::classified_dict_source(&user, &shared, name.trim()) {
                     Some(src) => {
                         println!("import {name} -> {}", src.display());
                         collect_codes(&src, &mut codes, 5);

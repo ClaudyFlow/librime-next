@@ -33,19 +33,31 @@ pub struct Context {
     pub committed_prefix: String,
     /// 已确认前缀对应的**音节编码**。逐音节确认时 `committed_prefix` 只留文本，
     /// 编码不留就永远拼不出整词（整词学不成 ⇒ 打几遍也不进首选）。
-    pub committed_code: Vec<crate::dict::vocabulary::SyllableId>,
+    pub committed_code: Vec<crate::gear::dict::vocabulary::SyllableId>,
     /// 待提交文本（`commit()` 产生，`Session` 取走）。
     pub commit_text: Option<String>,
     /// 每页候选数（来自 schema `menu/page_size`，供 c_api 读）。
     pub page_size: usize,
     pub options: HashMap<String, bool>,
     pub properties: HashMap<String, String>,
+    /// 对外信号的会话归属（C++ 里由 `Service::Session` 的 `message_sink` 连接闭包
+    /// 捕获 `session_id`；Rust 把这个号放在 Context 上，`set_option` / `set_property`
+    /// 发射信号时带上）。`0` = 未绑定（独立引擎 / 单元测试）。
+    /// ⚠️ 只用于通知归属，不参与任何输入/候选逻辑。
+    pub signal_session_id: usize,
     /// 本次提交里选中的词条（C++ `CommitEntry::elements`）。
     ///
     /// `commit()` / 整段 `select()` 会把它填上，[`crate::engine::runtime::Engine::apply_commit`]
     /// 取走并分发给各 translator 学词。放在 `Context` 里而不是直接回调 Engine，
     /// 是因为 processor（editor）只拿得到 `&mut Context`。
-    pub pending_commit_elements: Vec<crate::dict::vocabulary::DictEntry>,
+    pub pending_commit_elements: Vec<crate::gear::dict::vocabulary::DictEntry>,
+    /// 本次提交里**神经重排组**的学习样本（选中下标 + 特征轨迹）。
+    ///
+    /// 和 `pending_commit_elements` 同一条传递方式：提交瞬间在
+    /// [`Self::collect_commit_elements`] 里从选中的 `Candidate` 上取，
+    /// [`crate::engine::runtime::Engine::apply_commit`] 取走并喂给
+    /// `rerank_head`。不引入全局可变状态。
+    pub pending_rerank_samples: Vec<crate::gear::neural::rerank_head::RerankSample>,
     /// 预测候选(2026-11-01):上次提交后给的"下一个词",
     /// 供宿主在无组字状态显示(上屏后联想)。2026-11-08 起优先双神经模型
     /// (联想条 4 条 = key2 + desk2),神经不可用时回退个人 n-gram。
@@ -164,6 +176,10 @@ impl Context {
         self.partial_history.clear();
         self.composition.segmentation.segments.clear();
         self.composition.segmentation.input.clear();
+        // 2026-11-09：联想条是「上一次提交」留下的状态。清组字 / 切方案 /
+        // 换输入类型时不清它，新组合里就还挂着一排过期联想词。
+        // `apply_commit` 设置 predictions 之后不调 `clear()`，所以不误伤联想条。
+        self.predictions.clear();
     }
 
     /// C++ `Context::AbortComposition()`：`Clear()` + 发 `abort` 通知。
@@ -318,8 +334,9 @@ impl Context {
         if let Some(text) = text {
             if let Ok(mut ngram) = crate::engine::user_ngram::global().lock() {
                 ngram.penalize(&text);
-                let _ = ngram.save(&crate::engine::user_ngram::store_path());
             }
+            // 删词也走后台落盘：黑名单立即在内存生效，磁盘写入不阻塞按键。
+            crate::engine::user_ngram::request_flush();
         }
         let Some(seg) = self.composition.back_mut() else {
             return false;
@@ -451,11 +468,13 @@ impl Context {
             return false;
         }
         let text = self.get_commit_text();
-        // 2026-11-01：**上屏就学**（原来 learn_commit 从没被调用过 ⇒ 用户打十几遍也不进首选）。
-        // 一次提交常常只有一个词，交给 learn_commit 带上最近窗口凑二元组。
-        if !text.is_empty() {
-            crate::engine::user_ngram::learn_and_maybe_flush(&[text.clone()]);
-        }
+        // 2026-11-09：n-gram **只学一次**。
+        //
+        // 旧实现这里学一遍（整段提交文本），`Engine::apply_commit` 又从
+        // 提交历史末条学一遍，同一次上屏的 unigram/bigram 被记两次；
+        // 线性重排头把计数当特征，重复计数会直接放大特征。
+        // 统一交给 `apply_commit`：它按「有词条 = 菜单选择」过滤，且只吃
+        // 提交历史里的中文文本（原始编码/标点不进表）。
         self.collect_commit_elements();
         // 逐段拼出来的整段 → 额外把**整段**按整段音节学成一个词组。
         //
@@ -499,9 +518,9 @@ impl Context {
         if syllables.is_empty() {
             return;
         }
-        let mut entry = crate::dict::vocabulary::DictEntry {
+        let mut entry = crate::gear::dict::vocabulary::DictEntry {
             text: text.to_string(),
-            code: crate::dict::vocabulary::Code::from_slice(&syllables),
+            code: crate::gear::dict::vocabulary::Code::from_slice(&syllables),
             ..Default::default()
         };
         // **用户造词**：给这次临时拼出来的整串定个初始权重。
@@ -527,7 +546,7 @@ impl Context {
             return None;
         }
         let context = self.commit_history.latest_text();
-        let score = crate::engine::gear::rescore::score_text(&context, text)?;
+        let score = crate::gear::filter::rescore::score_text(&context, text)?;
         Some(((score / chars as f64) + 12.0).clamp(1.0, 12.0))
     }
 
@@ -552,12 +571,19 @@ impl Context {
     /// `Engine::ApplyCommit` 播给每个 translator 的 `Memorize`。
     pub fn collect_commit_elements(&mut self) {
         let mut elements = Vec::new();
+        let mut rerank_samples = Vec::new();
         for segment in &self.composition.segmentation.segments {
             if let Some(candidate) = segment
                 .menu
                 .as_ref()
                 .and_then(|menu| menu.candidate_at(segment.selected_index))
             {
+                // 选中下标已经在候选上（`RerankRef.index`），这里只做搬运。
+                if let Some(sample) =
+                    crate::gear::neural::rerank_head::sample_from_candidate(&candidate)
+                {
+                    rerank_samples.push(sample);
+                }
                 // 整句候选:分词成分逐词进学习管道(n-gram 需要词粒度;
                 // 整句作为一个词条只会学出垃圾长词)。成分没有 code,
                 // 用户词典的 update_entry 会跳过它,不受影响。
@@ -571,7 +597,7 @@ impl Context {
                         }
                     }
                     for text in &candidate.components {
-                        elements.push(crate::dict::vocabulary::DictEntry {
+                        elements.push(crate::gear::dict::vocabulary::DictEntry {
                             text: text.clone(),
                             ..Default::default()
                         });
@@ -584,11 +610,19 @@ impl Context {
             }
         }
         self.pending_commit_elements = elements;
+        self.pending_rerank_samples.append(&mut rerank_samples);
     }
 
     /// 取走待学词的词条（`Engine::apply_commit` 用）。
-    pub fn take_commit_elements(&mut self) -> Vec<crate::dict::vocabulary::DictEntry> {
+    pub fn take_commit_elements(&mut self) -> Vec<crate::gear::dict::vocabulary::DictEntry> {
         std::mem::take(&mut self.pending_commit_elements)
+    }
+
+    /// 取走本次提交的重排样本（`Engine::apply_commit` 用）。
+    pub fn take_rerank_samples(
+        &mut self,
+    ) -> Vec<crate::gear::neural::rerank_head::RerankSample> {
+        std::mem::take(&mut self.pending_rerank_samples)
     }
 
     /// C++ `engine_->sink()(text)`：不经组合**直接**把一段文本送进提交管道。
@@ -658,16 +692,44 @@ impl Context {
 
     // ---- options / properties ----
 
+    /// `Context::set_option`：写入状态后发一条 `option` 信号。
+    ///
+    /// 对齐 C++ `Context::set_option` → `option_update_notifier` →
+    /// `Engine::OnOptionUpdate` → `message_sink_("option", msg)`。Rust 版把中间两层
+    /// 折叠成一次 `emit_for`：组件条件刷新仍由调用方（`Engine::set_option`）直接做，
+    /// 信号**只负责告诉宿主发生了什么**，不改变任何同步语义。
     pub fn set_option(&mut self, name: &str, value: bool) {
         self.options.insert(name.to_string(), value);
+        // 打字热路径每次按键会多次调这里：没订阅者时连 Signal 都不构造。
+        if crate::signal::subscriber_count() == 0 {
+            return;
+        }
+        crate::signal::emit_for(
+            self.signal_session_id,
+            crate::signal::Signal::OptionChanged {
+                name: name.to_string(),
+                on: value,
+            },
+        );
     }
 
     pub fn get_option(&self, name: &str) -> bool {
         *self.options.get(name).unwrap_or(&false)
     }
 
+    /// `Context::set_property`：写入状态后发一条 `property` 信号（官方值 `name=value`）。
     pub fn set_property(&mut self, name: &str, value: &str) {
         self.properties.insert(name.to_string(), value.to_string());
+        if crate::signal::subscriber_count() == 0 {
+            return;
+        }
+        crate::signal::emit_for(
+            self.signal_session_id,
+            crate::signal::Signal::PropertyChanged {
+                name: name.to_string(),
+                value: value.to_string(),
+            },
+        );
     }
 
     pub fn get_property(&self, name: &str) -> String {
@@ -693,7 +755,7 @@ mod tests {
     use super::*;
     use crate::engine::candidate::Candidate;
     use crate::engine::commit_history::CommitRecord;
-    use crate::engine::gear::translation::VecTranslation;
+    use crate::gear::translator::translation::VecTranslation;
     use crate::engine::menu::Menu;
     use crate::engine::segmentation::Segment;
 
@@ -745,5 +807,19 @@ mod tests {
         assert_eq!(ctx.pre_commit_context, "");
         assert_eq!(ctx.commit_history.latest_text(), "好");
         assert_eq!(ctx.commit_history.len(), 1);
+    }
+
+    /// 2026-11-09：清组字 / 切方案时必须连带清掉联想条，否则新组合里
+    /// 还挂着上一次提交留下的一排过期联想词。
+    #[test]
+    fn clear_also_drops_stale_predictions() {
+        let mut ctx = Context::new();
+        ctx.input = "nihao".to_string();
+        ctx.caret_pos = 5;
+        ctx.predictions = vec!["你好".into(), "像是".into()];
+        ctx.clear();
+        assert!(ctx.predictions.is_empty(), "联想条是上一帧的残留态");
+        assert!(ctx.input.is_empty());
+        assert_eq!(ctx.caret_pos, 0);
     }
 }

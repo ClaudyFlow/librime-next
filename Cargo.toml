@@ -46,6 +46,10 @@ name = "pinyin_typing"
 path = "test/pinyin_typing.rs"
 
 [[test]]
+name = "unified_pinyin_e2e"
+path = "test/unified_pinyin_e2e.rs"
+
+[[test]]
 name = "algebra_real_rules"
 path = "test/algebra_real_rules.rs"
 
@@ -70,12 +74,20 @@ name = "lever_deploy"
 path = "test/lever_deploy.rs"
 
 [[test]]
+name = "parallel_deploy"
+path = "test/parallel_deploy.rs"
+
+[[test]]
 name = "schema_manifest_generate"
 path = "test/schema_manifest_generate.rs"
 
 [[test]]
 name = "rime_next_dialect"
 path = "test/rime_next_dialect.rs"
+
+[[test]]
+name = "switch_async"
+path = "test/switch_async.rs"
 
 [[example]]
 name = "eassy_match_bench"
@@ -84,6 +96,10 @@ path = "example/eassy_match_bench.rs"
 [[example]]
 name = "algo_real"
 path = "example/algo_real.rs"
+
+[[example]]
+name = "probe_algebra"
+path = "example/probe_algebra.rs"
 
 [[example]]
 name = "deploy_diff"
@@ -104,6 +120,11 @@ path = "example/probe_variants.rs"
 [[example]]
 name = "probe_compile"
 path = "example/probe_compile.rs"
+
+# 一次性工具：重生成 test/e2e/build 的旧格式词典 fixture（字符串表切 DAT 后需要）
+[[example]]
+name = "regen_fixture"
+path = "example/regen_fixture.rs"
 
 [[example]]
 name = "probe_simp"
@@ -141,6 +162,10 @@ path = "example/seed_phrase.rs"
 name = "deploy_real"
 path = "example/deploy_real.rs"
 
+[[example]]
+name = "bench_predict_breakdown"
+path = "example/bench_predict_breakdown.rs"
+
 
 
 [[example]]
@@ -175,7 +200,21 @@ path = "example/probe_sp_step.rs"
 name = "deploy_live"
 path = "example/deploy_live.rs"
 
+[[example]]
+name = "probe_rebuild_stages"
+path = "example/probe_rebuild_stages.rs"
+
 [dependencies]
+# 2026-11-10：抄 CloudInputMethodEditor 的依赖选型——热路径 HashMap 显式用
+# foldhash（目标仓注释：SipHash 一次查表几十纳秒，单字母简拼一键查几万次）。
+# ⚠️ 只换纯查找用途的 HashMap；BTreeMap 的字典序是 user_dict 双流合并游标
+# 与 RecognizerPatterns 优先级的依赖，绝不能换。
+foldhash = "0.2"
+# 2026-11-10：上屏联想的单次 forward 是 8 层 × 4 个矩阵乘，单核只能跑到点积峰值的
+# 一半左右。这里用 rayon 的**固定小线程池**（见 `neural/model.rs::worker_pool`）
+# 把每个矩阵乘按输出列切开，不新建线程、不引入全局线程池（池大小封顶 6）。
+# rayon 本来就在工作区依赖图里（image 链路），不是新引入的传递依赖。
+rayon = "1"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 # `preserve_order`：把 `serde_json::Value::Object` 的后备映射从 `BTreeMap` 换成
@@ -229,6 +268,11 @@ path = "test/mmap_verify.rs"
 name = "reverse_lookup_scheme"
 path = "test/reverse_lookup_scheme.rs"
 
+# 「librime 全部信号化」端到端回归：事件源 → 总线 → C ABI 编码（2026-11-14）。
+[[test]]
+name = "signal"
+path = "test/signal.rs"
+
 [[example]]
 name = "probe_schema"
 path = "example/probe_schema.rs"
@@ -246,6 +290,15 @@ path = "example/probe_rescore_ab.rs"
 [[example]]
 name = "probe_candidates"
 path = "example/probe_candidates.rs"
+
+# 临时探针（2026-11-13）：量「物化全量候选」耗时，判断底行「1 / N」页码能否实时算。
+[[example]]
+name = "probe_menu_total"
+path = "example/probe_menu_total.rs"
+
+[[example]]
+name = "probe_input_types"
+path = "example/probe_input_types.rs"
 
 # 神经模型冒烟测试(2026-10-31):加载 safetensors、打分、重排、计时。
 [[example]]
@@ -301,3 +354,123 @@ path = "example/probe_comma_period.rs"
 [[example]]
 name = "probe_predict_repeat"
 path = "example/probe_predict_repeat.rs"
+
+# 切方案耗时探针(2026-11-08):量 Schema::open / 完整装配 / apply_schema，
+# 定位「选方案那一键 > TIP 180ms 预算 ⇒ 数字/空格上屏」的慢点。
+[[example]]
+name = "probe_schema_switch"
+path = "example/probe_schema_switch.rs"
+
+# 虎整句切完方案头几个字母很卡的探针(2026-11-08 19:3x 用户反馈):
+# 量 apply_schema 之后逐键耗时，验证 lua 懒加载（ensure_lexicon）假设。
+[[example]]
+name = "probe_tiger_switch_keys"
+path = "example/probe_tiger_switch_keys.rs"
+
+# 提交路径分段探针(2026-11-08):拆开上屏联想条同步预测的 score / key / desk / 串行 / 并行。
+[[example]]
+name = "probe_commit_stages"
+path = "example/probe_commit_stages.rs"
+
+# 离线会话压测(2026-11-08):在 temp 副本上连打 300 次上屏，找周期性提交尖峰。
+[[example]]
+name = "probe_session_commit"
+path = "example/probe_session_commit.rs"
+
+# 跨提交前缀缓存复用的可行性验证(2026-11-08):连续提交一串不同的词，
+# 打印每次的 context，统计"上一次上下文 + 追加"到底命中几次。
+[[example]]
+name = "probe_context_append"
+path = "example/probe_context_append.rs"
+
+# 引擎内部分段计时采集(2026-11-08):连打一串词/上屏/翻页，把 process_key
+# 拆成 处理器链/音节切分/查词装配/神经重排/上屏学词 写入 stage-trace.csv。
+[[example]]
+name = "probe_stage_timings"
+path = "example/probe_stage_timings.rs"
+
+# 词条迭代器量化探针(2026-11-10):真词库上量「单字母补全 / 空码全量 / 双字母补全」
+# 的 lookup_words + collect_entries 每键耗时，判定 librime#1268 在本机是否为热点。
+[[example]]
+name = "bench_dict_iterator"
+path = "example/bench_dict_iterator.rs"
+
+# ---------------------------------------------------------------------------
+# 2026-11-16 结构整理：examples/（cargo 约定复数目录，自动发现、绕过了登记规则）
+# 并入 example/，恢复"单一 example 目录 + 逐个手写登记"的口径。
+# ---------------------------------------------------------------------------
+
+# OpenCC Bcel 文件格式逆向 + eassy 双数组回写（2026-11-15）。
+[[example]]
+name = "bcel2eassy"
+path = "example/bcel2eassy.rs"
+
+# 双模型对照基准：神经整句 vs 词典直查（2026-11-15）。
+[[example]]
+name = "bench_dual_model"
+path = "example/bench_dual_model.rs"
+
+# 组件装配层级核查：registry 声明 vs gear 目录实际文件（2026-11-15）。
+[[example]]
+name = "hierarchy_check"
+path = "example/hierarchy_check.rs"
+
+# 活体探针：连真机 IME 的运行时 userdb（2026-11-15）。
+[[example]]
+name = "live_probe"
+path = "example/live_probe.rs"
+
+# speller 前缀分组行为核查（2026-11-15）。
+[[example]]
+name = "prefix_group_check"
+path = "example/prefix_group_check.rs"
+
+# 提交延迟采样：process_key → commit 各阶段耗时分布（2026-11-15）。
+[[example]]
+name = "probe_commit_latency"
+path = "example/probe_commit_latency.rs"
+
+# 简繁/字符集过滤器 subtype 全枚举输出（2026-11-15）。
+[[example]]
+name = "probe_evo_subtypes"
+path = "example/probe_evo_subtypes.rs"
+
+# 词组家族端到端：连打整句验证 family 缓存（2026-11-15）。
+[[example]]
+name = "probe_family_e2e"
+path = "example/probe_family_e2e.rs"
+
+# 多输入法（多方案）端到端回归（2026-11-15）。
+[[example]]
+name = "probe_multi_input_e2e"
+path = "example/probe_multi_input_e2e.rs"
+
+# prism/table 二进制格式抽查：头部魔数 + 条目数对拍（2026-11-15）。
+[[example]]
+name = "probe_prism_table"
+path = "example/probe_prism_table.rs"
+
+# 空格键上屏行为核查（2026-11-15）。
+[[example]]
+name = "probe_space_commit"
+path = "example/probe_space_commit.rs"
+
+# 方案选单数字键选号路径核查（2026-11-15）。
+[[example]]
+name = "probe_switcher_digit"
+path = "example/probe_switcher_digit.rs"
+
+# 五笔/老虎方案延迟采样（2026-11-15）。
+[[example]]
+name = "probe_tiger_latency"
+path = "example/probe_tiger_latency.rs"
+
+# rime_format 全指令发射报告（2026-11-15）。
+[[example]]
+name = "rime_format_report"
+path = "example/rime_format_report.rs"
+
+# userdb 合并/导入工具：多设备快照归一（2026-11-15）。
+[[example]]
+name = "userdb_merge"
+path = "example/userdb_merge.rs"

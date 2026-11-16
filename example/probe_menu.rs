@@ -3,7 +3,7 @@
 //!
 //! 用法:`cargo run --example probe_menu -- <build_dir> <user_root> <shared_root>`
 
-use librime_next::engine::schema::Schema;
+use librime_next::gear::schema::Schema;
 use librime_next::engine::Session;
 use std::path::PathBuf;
 

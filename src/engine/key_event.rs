@@ -60,6 +60,16 @@ pub const K_SUPER_MASK: u32 = 1 << 26;
 pub const K_HYPER_MASK: u32 = 1 << 27;
 /// `kMetaMask`。
 pub const K_META_MASK: u32 = 1 << 28;
+/// **Rime-Next 私有位**：OS 按键自动重复（auto-repeat）。
+///
+/// C++ `RimeModifier` 没有这一位；宿主 `Engine/src/librime/mod.rs::process_key`
+/// 从 Windows `lParam` 的 `KF_REPEAT`（低 DWORD 的 bit30）映射到这里（bit29，
+/// 与 C++ 已占用的 0..28 / 30 都不冲突）。它只是**状态标记**，不是绑定用修饰键：
+/// `KeyEvent` 的相等比较会忽略它，`repr()` 也不输出它。
+///
+/// 用途：菜单的方向键被 OS 以每秒约 30 次重复投递时，switcher 只认第一次
+/// 按下，重复帧直接吞掉 —— 否则高亮飞速掠过中间方案（用户 2026-11-08 报障）。
+pub const K_REPEAT_MASK: u32 = 1 << 29;
 /// `kReleaseMask`（按键抬起）。
 pub const K_RELEASE_MASK: u32 = 1 << 30;
 /// `kModifierMask` —— C++ 里 `repr()` 只看这些位。
@@ -147,11 +157,21 @@ pub const XK_8: u32 = 0x0038;
 /// `XK_9`。
 pub const XK_9: u32 = 0x0039;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct KeyEvent {
     pub keycode: u32,
     pub modifier: u32,
 }
+
+/// 绑定匹配只看「键 + 真正的修饰键」；`K_REPEAT_MASK` 是自动重复状态位，
+/// 不能让长按产生的重复帧在 `hotkey == key` / `is_hotkey` 比较里失配。
+impl PartialEq for KeyEvent {
+    fn eq(&self, other: &Self) -> bool {
+        self.keycode == other.keycode
+            && (self.modifier & !K_REPEAT_MASK) == (other.modifier & !K_REPEAT_MASK)
+    }
+}
+impl Eq for KeyEvent {}
 
 impl KeyEvent {
     pub fn new(keycode: u32, modifier: u32) -> Self {
@@ -176,6 +196,10 @@ impl KeyEvent {
     }
     pub fn release(&self) -> bool {
         self.modifier & K_RELEASE_MASK != 0
+    }
+    /// 这一帧是否由 OS 自动重复产生（非首次按下）。
+    pub fn repeat(&self) -> bool {
+        self.modifier & K_REPEAT_MASK != 0
     }
 
     /// 是否是一个「可打印字符」按键（无 ctrl/alt/super 修饰）。
@@ -415,6 +439,24 @@ mod tests {
         assert_eq!(KeyEvent::new(XK_RETURN, 0).printable_char(), None);
         // 数字与 ASCII 同值
         assert_eq!(KeyEvent::new(XK_1, 0).printable_char(), Some('1'));
+    }
+
+    #[test]
+    fn repeat_bit_is_a_status_flag_not_a_binding_modifier() {
+        let pressed = KeyEvent::new(XK_DOWN, 0);
+        let repeated = KeyEvent::new(XK_DOWN, K_REPEAT_MASK);
+        assert!(repeated.repeat());
+        assert!(!pressed.repeat());
+        // 绑定匹配必须忽略自动重复位，否则长按方向键的重复帧匹配不到热键
+        assert_eq!(pressed, repeated);
+        // 但不能把它当修饰键输出（C++ repr 里没有 Repeat 这个名字）
+        assert_eq!(repeated.repr(), pressed.repr());
+        assert_eq!(repeated.printable_char(), pressed.printable_char());
+        // 与真正修饰键同时存在时，比较仍只看修饰键
+        assert_eq!(
+            KeyEvent::new(XK_DOWN, K_SHIFT_MASK),
+            KeyEvent::new(XK_DOWN, K_SHIFT_MASK | K_REPEAT_MASK)
+        );
     }
 
     #[test]

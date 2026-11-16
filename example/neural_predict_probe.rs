@@ -6,7 +6,7 @@
 
 use std::time::Instant;
 
-use librime_next::engine::gear::neural::{predict_extensions, PredictOptions, SentenceModel};
+use librime_next::gear::neural::{predict_extensions, PredictOptions, SentenceModel};
 
 fn main() {
     let candidates = [

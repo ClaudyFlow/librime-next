@@ -53,8 +53,8 @@ pub mod utilities;
 
 pub use algebra::{Projection, Script};
 pub use calculus::{
-    Abbreviation, Calculation, Calculus, Correction, Derivation, Erasion, Factory, Fuzzing,
-    K_ABBREVIATION_PENALTY, K_CORRECTION_PENALTY, K_FUZZY_SPELLING_PENALTY, Reorder,
+    Abbreviation, Auxiliary, Calculation, Calculus, Correction, Derivation, Erasion, Factory,
+    Fuzzing, K_ABBREVIATION_PENALTY, K_CORRECTION_PENALTY, K_FUZZY_SPELLING_PENALTY, Reorder,
     Transformation, Transliteration,
 };
 pub use dynamics::{formula_d, formula_p};

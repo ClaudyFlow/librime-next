@@ -88,6 +88,13 @@ pub const OPENCC_DIR: &str = "opencc";
 /// 那条 TOML 分支在 lrn 里没有移植。
 pub const SCHEMA_MANIFEST: &str = "schema.yaml";
 
+/// `schema/` 下的**独立禁用状态**文件（2026-11-11）。
+///
+/// 与 `SCHEMA_MANIFEST` 完全正交：`schema.yaml` 的 `active` / `schemas` 是内部状态，
+/// 一个字都不删；这里只记「不部署 / 不进菜单」。组禁用写在 `groups:`，逐项禁用写在
+/// `schemas:`，由 `lever::schema_disabled` 读出来过滤编译清单。
+pub const DISABLED_SCHEMAS_FILE: &str = "disabled.yaml";
+
 /// Weasel-Next 的部署布局（`setup.cc` 里 `RimeTraits` 的四个目录 + `Deployer` 的几个字段）。
 ///
 /// **三个根路径（程序文件夹 / 共享数据目录 / 用户文件夹）由宿主经 API 注入**，

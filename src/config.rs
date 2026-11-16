@@ -68,6 +68,8 @@ pub mod data;
 mod emit;
 pub(super) mod load;
 mod plugins;
+/// `# Rime <Kind>` 魔数头识别 + 方案/词典格式自动检测（通用工具，读纯文本不碰加载器）。
+pub mod rime_format;
 mod resource;
 mod types;
 

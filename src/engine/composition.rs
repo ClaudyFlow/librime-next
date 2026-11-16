@@ -17,6 +17,17 @@ pub struct Preedit {
 
 pub const NPOS: usize = usize::MAX;
 
+/// 候选预览（对照 evo `Composition::CandidatePreview`，`composition.h:21-44`）。
+///
+/// 三段的划分以「当前活动段的选中候选」为界：候选之前已选定的文本、候选本身、
+/// 候选之后尚未转换的输入。C API 的 `RimeCandidatePreview` 直接映射这三项。
+#[derive(Clone, Debug, Default)]
+pub struct CandidatePreview {
+    pub text_before_selection: String,
+    pub selected_text: String,
+    pub text_after_selection: String,
+}
+
 /// 组合串（对照 C++ `Composition`）。
 #[derive(Clone, Debug, Default)]
 pub struct Composition {
@@ -181,6 +192,65 @@ impl Composition {
             result.push_str(&input[end..]);
         }
         result
+    }
+
+    /// `GetCandidatePreview(full_input)`（evo `composition.cc:194-241`）。
+    ///
+    /// `input_` 是截到光标的串；`full_input` 用来还原光标之后的字符。与
+    /// [`Self::get_commit_text`] 的差别：
+    ///
+    /// * 只看「最后一个非空段」（rime 会在光标处补一个空段）；
+    /// * 未选定段直接用 `input_` 的原文切片，**不做** `phony` 跳过；
+    /// * 分成 before / selected / after 三段，候选跨段时 after 以候选的 `end` 为界。
+    pub fn get_candidate_preview(&self, full_input: &str) -> CandidatePreview {
+        let input = self.segmentation.input.as_str();
+        let source = if full_input.is_empty() {
+            input
+        } else {
+            full_input
+        };
+        let mut preview = CandidatePreview::default();
+        if self.empty() {
+            preview.selected_text = source.to_string();
+            return preview;
+        }
+
+        let segs = &self.segmentation.segments;
+        let mut active = segs.len() - 1;
+        while active > 0 && segs[active].start >= segs[active].end {
+            active -= 1;
+        }
+
+        // 活动段之前的：已选定的用候选文本，否则用原文切片
+        for seg in &segs[..active] {
+            if let Some(cand) = seg.get_selected_candidate() {
+                preview.text_before_selection.push_str(&cand.text);
+            } else {
+                let lo = seg.start.min(input.len());
+                let hi = seg.end.min(input.len()).max(lo);
+                preview.text_before_selection.push_str(&input[lo..hi]);
+            }
+        }
+
+        // 活动段：候选文本优先，且以候选的 end 作为「选中到哪里」
+        let current = &segs[active];
+        let mut candidate_end_pos = current.end;
+        if let Some(cand) = current.get_selected_candidate() {
+            if !cand.text.is_empty() {
+                preview.selected_text.push_str(&cand.text);
+                candidate_end_pos = cand.end;
+            }
+        }
+        if preview.selected_text.is_empty() {
+            let lo = current.start.min(input.len());
+            let hi = current.end.min(input.len()).max(lo);
+            preview.selected_text.push_str(&input[lo..hi]);
+        }
+
+        if source.len() > candidate_end_pos {
+            preview.text_after_selection = source[candidate_end_pos..].to_string();
+        }
+        preview
     }
 
     /// `GetScriptText`：与 `GetCommitText` 类似，但未选定段用高亮候选的 preedit。

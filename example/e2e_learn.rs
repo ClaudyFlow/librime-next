@@ -54,8 +54,8 @@ fn top_q(s: &Session, n: usize) -> Vec<String> {
 }
 
 fn dump_userdb(dir: &PathBuf) -> Vec<String> {
-    use librime_next::dict::db::{Db, DbAccessor};
-    use librime_next::dict::level_db::LevelDb;
+    use librime_next::gear::dict::db::{Db, DbAccessor};
+    use librime_next::gear::dict::level_db::LevelDb;
     let db = LevelDb::shared_user_db(dir, "pinyin");
     if !db.loaded() && !db.open() {
         return vec!["<无法打开 userdb>".into()];

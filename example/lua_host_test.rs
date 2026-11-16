@@ -3,7 +3,7 @@
 //! 用法：`cargo run --example lua_host_test -- <数据根> [组件名] [输入]`
 //! 默认数据根是仓库旁的 `.tmp_qiaoma/shared`、组件 `number_translator`、输入 `R123`。
 
-use librime_next::engine::gear::lua::LuaHost;
+use librime_next::gear::lua::LuaHost;
 use std::path::PathBuf;
 
 fn main() {

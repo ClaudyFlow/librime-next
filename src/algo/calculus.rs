@@ -173,6 +173,8 @@ impl Calculus {
         c.register("derive", parse_derivation);
         c.register("fuzz", parse_fuzzing);
         c.register("abbrev", parse_abbreviation);
+        // evo `calculus.cc:18-30` 的注册表里 `aux` 与 `abbrev` 相邻。
+        c.register("aux", parse_auxiliary);
         c.register("reorder", parse_reorder);
         c
     }
@@ -610,6 +612,69 @@ impl Calculation for Abbreviation {
 }
 
 // ---------------------------------------------------------------------------
+// aux/x/X/[abbrev]  —— 辅助码（evo `calculus.cc:377-403`）
+// ---------------------------------------------------------------------------
+
+/// 辅助码规则。对应 evo `calculus.h` 的 `class Auxiliary : public Derivation`。
+///
+/// 与 `derive` 只有两点不同，且都**不能**靠复用 [`Derivation::transform`] 实现：
+///
+/// 1. 匹配用 `regex_search`（串里任意位置），不是整串替换；
+/// 2. 命中后**直接赋值**，即使替换结果与原串相同也算应用成功 —— 这样
+///    `aux|^([a-z])([a-z])$|$1$2|`（码原样保留）也能声明成辅助码。
+pub struct Auxiliary {
+    inner: Derivation,
+    abbreviation: bool,
+}
+
+fn parse_auxiliary(args: &[String]) -> Result<Box<dyn Calculation + Send + Sync>, RuleError> {
+    // `calculus.cc:377-386`
+    if args.len() < 3 || args[1].is_empty() {
+        return Err(RuleError::invalid(
+            "`aux` 需要 2 个参数（模式/替换串），且模式不能为空",
+        ));
+    }
+    let pattern = compile_pattern(&args[1])?;
+    check_replacement(&args[2])?;
+    Ok(Box::new(Auxiliary {
+        inner: Derivation {
+            pattern,
+            replacement: args[2].clone(),
+        },
+        abbreviation: args.len() > 3 && args[3] == "abbrev",
+    }))
+}
+
+impl Calculation for Auxiliary {
+    fn name(&self) -> &'static str {
+        "aux"
+    }
+
+    /// `calculus.cc:388-403`
+    fn apply(&mut self, spelling: &mut Spelling) -> bool {
+        if spelling.str.is_empty() || !self.inner.pattern.is_match(&spelling.str) {
+            return false;
+        }
+        // 命中即赋值：替换串与原串相同也要留下 `auxiliary` 声明。
+        spelling.str = self
+            .inner
+            .pattern
+            .replace_all(&spelling.str, &self.inner.replacement);
+        spelling.properties.auxiliary = true;
+        if self.abbreviation {
+            spelling.properties.r#type = SpellingType::Abbreviation;
+            spelling.properties.credibility += K_ABBREVIATION_PENALTY;
+        }
+        true
+    }
+
+    /// `calculus.h:85-90`：与 `derive` 同族，原拼写保留。
+    fn deletion(&self) -> bool {
+        false
+    }
+}
+
+// ---------------------------------------------------------------------------
 // derive/x/X/correction  —— 纠错（`calculus.cc:249-256`）
 // ---------------------------------------------------------------------------
 
@@ -830,6 +895,13 @@ pub mod regex {
                 // 运行期错误（回溯超限等）：保守当"没匹配"，与 C++ 侧规则被跳过一致。
                 Ok(None) | Err(_) => false,
             }
+        }
+
+        /// 串里**任意位置**命中即可（对应 `boost::regex_search`，evo `aux` 规则用）。
+        ///
+        /// 运行期错误同样保守当"没匹配"，不让 panic 穿过输入法进程。
+        pub fn is_match(&self, text: &str) -> bool {
+            self.inner.is_match(text).unwrap_or(false)
         }
 
         /// 替换**全部**匹配（对应 `boost::regex_replace` 的默认行为）。

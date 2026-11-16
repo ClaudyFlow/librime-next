@@ -3,7 +3,7 @@
 //! 2026-11-03：样本从 `.gram`（octagram 语法模型已整体移除）换成
 //! `build/` 下最大的几本 `.bin` 词典——mmap 的价值本来就在大文件上，
 //! 换成词典不影响这条测试要守的东西（映射视图与直接读盘逐字节相同）。
-use librime_next::dict::mapped_file::MappedFile;
+use librime_next::gear::dict::mapped_file::MappedFile;
 
 fn collect_bins(dir: &std::path::Path, out: &mut Vec<(u64, std::path::PathBuf)>) {
     let Ok(entries) = std::fs::read_dir(dir) else {

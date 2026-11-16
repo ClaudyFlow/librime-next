@@ -38,8 +38,8 @@ fn top(s: &Session, n: usize) -> Vec<String> {
 
 /// 通过**进程级共享句柄**读库 —— 会话还活着时也能读（证明拿的是同一个实例）。
 fn dump(dir: &Path, name: &str) -> Vec<String> {
-    use librime_next::dict::db::{Db, DbAccessor};
-    use librime_next::dict::level_db::LevelDb;
+    use librime_next::gear::dict::db::{Db, DbAccessor};
+    use librime_next::gear::dict::level_db::LevelDb;
     let db = LevelDb::shared_user_db(dir, name);
     if !db.loaded() && !db.open() {
         return vec!["<无法打开 userdb>".into()];

@@ -1,8 +1,13 @@
 // 快速对比两个 prism.bin 的结构标量，判断「功能等价」还是「拼写集合不同」。
-// 用法：cargo run --example prism_info <a.prism.bin> <b.prism.bin>
-use librime_next::dict::prism::Prism;
+// 用法：
+//   cargo run --example prism_info <a.prism.bin> <b.prism.bin>
+//   cargo run --example prism_info <prism.bin> <自定义检索键>...
+// 不传检索键时用一组固定抽样；传了就只查这些键（用来找双拼/注音的真实编码）。
+use librime_next::gear::dict::prism::Prism;
 
-fn info(path: &str) {
+const DEFAULT_KEYS: [&str; 8] = ["nihao", "ni", "hao", "zhong", "guo", "wo", "de", "a"];
+
+fn info(path: &str, keys: &[String]) {
     let mut prism = match Prism::open(path) {
         Ok(p) => p,
         Err(e) => {
@@ -20,11 +25,32 @@ fn info(path: &str) {
     println!("  max_key_length  = {}", prism.max_key_length());
     println!("  dict_checksum   = {:#010x}", prism.dict_file_checksum());
     println!("  schema_checksum = {:#010x}", prism.schema_file_checksum());
-    // 抽样几个输入，看 common_prefix_search 返回的 spelling 数量
-    for s in ["nihao", "ni", "hao", "zhong", "guo", "wo", "de", "a"] {
+    let show = |s: &str| {
         let m = prism.common_prefix_search(s);
         let ids: Vec<_> = m.iter().map(|x| x.value).collect();
         println!("  search('{s}') -> spelling_ids={ids:?}");
+        match prism.get_value(s) {
+            Some(id) => {
+                let syllable_id = prism
+                    .query_spelling(id)
+                    .descriptor()
+                    .map(|d| d.syllable_id)
+                    .unwrap_or(-1);
+                println!(
+                    "  exact('{s}') -> id=Some({id}) syllable_id={syllable_id}"
+                );
+            }
+            None => println!("  exact('{s}') -> id=None"),
+        }
+    };
+    if keys.is_empty() {
+        for s in DEFAULT_KEYS {
+            show(s);
+        }
+    } else {
+        for s in keys {
+            show(s);
+        }
     }
     // 若拼写数 > 1800，dump 1792..1800 的额外拼写性质（确认是否 correction）
     if prism.array_size() > 1800 {
@@ -44,8 +70,11 @@ fn info(path: &str) {
 }
 
 fn main() {
-    for p in std::env::args().skip(1) {
-        info(&p);
-        println!();
-    }
+    let mut args = std::env::args().skip(1);
+    let Some(path) = args.next() else {
+        eprintln!("用法: prism_info <prism.bin> [检索键...]");
+        return;
+    };
+    let keys: Vec<String> = args.collect();
+    info(&path, &keys);
 }

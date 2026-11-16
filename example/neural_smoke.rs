@@ -4,7 +4,7 @@
 //! cargo run --release --example neural_smoke -- [模型路径]
 //! ```
 
-use librime_next::engine::gear::neural;
+use librime_next::gear::neural;
 use std::time::Instant;
 
 fn main() {

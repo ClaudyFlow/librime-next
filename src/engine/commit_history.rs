@@ -237,7 +237,7 @@ mod tests {
     use super::*;
     use crate::engine::candidate::Candidate;
     use crate::engine::composition::Composition;
-    use crate::engine::gear::translation::VecTranslation;
+    use crate::gear::translator::translation::VecTranslation;
     use crate::engine::menu::Menu;
     use crate::engine::segmentation::Segment;
 

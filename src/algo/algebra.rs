@@ -190,7 +190,7 @@ impl Projection {
     ///
     /// 对 C++ `Projection::Load(config->GetList(path))`：**节点不存在不算错误**
     /// （C++ 的 `GetList` 返回空指针，`Load` 直接返回 false，投影保持空）。
-    /// 所以调用方应像 [`crate::engine::gear::translator_options`] 那样用
+    /// 所以调用方应像 [`crate::gear::translator_options`] 那样用
     /// `.unwrap_or_default()` 兜住——没有 `preedit_format` 是常态，不是错误。
     pub fn from_config_path(tree: &Value, path: &str) -> Result<Self, String> {
         let mut node = tree;

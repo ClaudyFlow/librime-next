@@ -533,7 +533,7 @@ impl TableEncoder {
     /// `EncodePhrase` 的"自带收集方"版本（`encoder.cc:236-245` 的语义 + 显式 collector）。
     ///
     /// `self` 只需要 `&`：编码规则、tail anchor、exclude patterns 都是只读的。
-    /// 这让 [`crate::engine::gear::unity_table_encoder::UnityTableEncoder`] 能把
+    /// 这让 [`crate::gear::translator::unity_table_encoder::UnityTableEncoder`] 能把
     /// 自己的两个字段（反查表 + 用户词典）同时借进来当收集方。
     pub fn encode_phrase_with(
         &self,
@@ -553,8 +553,8 @@ impl TableEncoder {
 
 /// `TableEncoder` + 一个绑定好的收集方 = C++ 的 `new TableEncoder(this)`。
 ///
-/// 只有词典编译期（[`crate::dict::entry_collector`]）需要这种"绑死收集方"的形态；
-/// 引擎侧的 [`crate::engine::gear::unity_table_encoder::UnityTableEncoder`]
+/// 只有词典编译期（[`crate::gear::dict::entry_collector`]）需要这种"绑死收集方"的形态；
+/// 引擎侧的 [`crate::gear::translator::unity_table_encoder::UnityTableEncoder`]
 /// 走 [`TableEncoder::encode_phrase_with`]，每次调用现拼收集方。
 ///
 /// 这个类型**不是** `Send`/`Sync`（收集方往往是 `Rc<RefCell<..>>`），

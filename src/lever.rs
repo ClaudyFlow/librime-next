@@ -30,11 +30,15 @@
 #![allow(dead_code)]
 
 pub mod admit;
-// pub mod compile_graph; // 并行部署:编译错未修完,下个班次继续
+pub mod banker;
+// pub mod compile_graph; // 并行部署:已被 parallel_deploy 取代(银行家资源池)
+pub mod auxiliary_compiler;
 pub mod deployer;
 pub mod deployment_tasks;
+pub mod parallel_deploy;
 pub mod paths;
 pub mod scan;
+pub mod schema_disabled;
 pub mod schema_list;
 pub mod tree;
 pub mod user_dict_manager;

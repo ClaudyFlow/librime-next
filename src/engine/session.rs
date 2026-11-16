@@ -33,6 +33,17 @@ impl Session {
         }
     }
 
+    /// 绑定 C API 的会话号，供 `Context` 发 `option` / `property` 信号时带上。
+    ///
+    /// 等价于 C++ `Service::Session` 构造时把 `session_id` 捕获进
+    /// `engine_->message_sink().connect(...)`：信号归属跟着会话走，不靠线程局部状态。
+    /// 后台重建换入的新会话也要重新绑一次（见 `c_api::request_session_rebuild`）。
+    pub fn bind_signal_session(&mut self, id: usize) {
+        if let Some(engine) = self.engine.as_mut() {
+            engine.context.signal_session_id = id;
+        }
+    }
+
     /// 处理一次按键（keycode + mask）。返回是否被消费；待提交文本经 `take_commit` 取走。
     pub fn process_key(&mut self, keycode: u32, mask: u32) -> bool {
         let key = KeyEvent::new(keycode, mask);
@@ -96,6 +107,17 @@ impl Session {
         self.commit_text.take()
     }
 
+    /// 切方案换入新会话时，把**已经确认、但宿主还没取走**的待提交文本搬过去。
+    ///
+    /// 只搬 `commit_text`：这段文本是旧方案下已经上屏的内容，与码表无关。
+    /// **组合串（preedit）不搬** —— 两套方案的码表/分词不同，把旧组合塞进新会话
+    /// 必然出现"组合串错位"（输入码和候选对不上），所以换入时直接丢弃旧组合。
+    pub fn transfer_pending_commit(&mut self, old: &mut Session) {
+        if self.commit_text.is_none() {
+            self.commit_text = old.commit_text.take();
+        }
+    }
+
     /// 选择第 `idx` 个候选，并在「只确认前缀」时重排组合 —— 等价于 speller 的数字键路径
     /// （`gears/speller.cc` 里 `XK_1..XK_9` 命中 `Context::ConfirmCurrentSelection` 后，
     /// 若未整段提交则重新 `Engine::Compose`）。返回选择结果，待提交文本经 [`Self::take_commit`]。
@@ -133,5 +155,20 @@ impl Session {
 
     pub fn schema_id(&self) -> Option<&str> {
         self.engine.as_ref().map(|e| e.schema_id())
+    }
+
+    /// 打开/关闭"切方案交给宿主异步重建"（见 [`Engine::apply_schema`]）。
+    ///
+    /// 只有**持有会话表**的调用方（C API）才该打开：重建结果的换入必须在
+    /// `Global.sessions` 上做，`Session` 自己换不了自己。
+    pub fn set_async_rebuild(&mut self, on: bool) {
+        if let Some(engine) = &mut self.engine {
+            engine.set_async_rebuild(on);
+        }
+    }
+
+    /// 取走引擎登记的异步切换请求（宿主在**放锁之后**交给重建线程）。
+    pub fn take_pending_rebuild(&mut self) -> Option<String> {
+        self.engine.as_mut().and_then(|e| e.take_pending_rebuild())
     }
 }

@@ -32,9 +32,11 @@
 pub mod algo;
 pub mod c_api;
 pub mod config;
-pub mod dict;
 pub mod engine;
+pub mod gear;
 pub mod lever;
+/// 统一对外信号层（C++ `Messenger` + `Service::Notify` 的 Rust 版）。
+pub mod signal;
 
 /// 读一份 YAML 成树。
 ///

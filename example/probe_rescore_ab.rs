@@ -13,7 +13,7 @@
 //! 结果落地后要再 compose 一次才换序。探针用 `poll_rescore_landing()` 触发这一轮，
 //! 与宿主读上下文前的动作一致（见 `Session::poll_rescore_landing`）。
 
-use librime_next::engine::gear::rescore;
+use librime_next::gear::filter::rescore;
 use librime_next::engine::Session;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};

@@ -7,9 +7,9 @@
 //! 例（看拼音方案的学词）：
 //!   cargo run --release --example probe_userdb -- "$APPDATA/Rime-Next/userdb" pinyin 40
 
-use librime_next::dict::db::{Db, DbAccessor};
-use librime_next::dict::level_db::LevelDb;
-use librime_next::dict::user_db::UserDbValue;
+use librime_next::gear::dict::db::{Db, DbAccessor};
+use librime_next::gear::dict::level_db::LevelDb;
+use librime_next::gear::dict::user_db::UserDbValue;
 use std::path::PathBuf;
 
 fn main() {

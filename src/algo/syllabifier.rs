@@ -59,6 +59,10 @@ pub struct EdgeProperties {
     base: SpellingProperties,
     /// 切分歧義編碼段的起始位置（`syllabifier.h:28`）
     ambiguous_source_positions: BTreeSet<usize>,
+    /// 这条边携带的**辅助码允许字集**（evo `syllabifier.h:31`
+    /// `auxiliary_chars`）。`None` = 普通音节边；`Some` = direct aux 边，
+    /// 词典查询后要按它逐字收敛候选（见 `translator::aux_allows`）。
+    auxiliary_chars: Option<BTreeSet<char>>,
 }
 
 impl EdgeProperties {
@@ -67,7 +71,16 @@ impl EdgeProperties {
         Self {
             base,
             ambiguous_source_positions: BTreeSet::new(),
+            auxiliary_chars: None,
         }
+    }
+
+    /// `syllabifier.h:31` 的 `auxiliary_chars`：direct aux 边允许的字集。
+    ///
+    /// 普通音节边返回 `None`；`Some(set)` 表示这条边由"基音节 + 辅助码"
+    /// 合成，候选文本对应深度的字必须在 `set` 里。
+    pub fn auxiliary_chars(&self) -> Option<&BTreeSet<char>> {
+        self.auxiliary_chars.as_ref()
     }
 
     /// `syllabifier.h:26` 的 `end_pos`（这条边在输入串里的结束位置）。
@@ -196,6 +209,59 @@ impl SyllableGraph {
             .push(EdgeProperties::from_properties(properties));
         true
     }
+
+    /// 登记一条 **direct aux 边**（evo `syllabifier.cc:173-198` 的注入）。
+    ///
+    /// 与 [`Self::add_edge`] 的区别：边属性多带一份 `allowed_chars`，供查询侧
+    /// 逐字收敛候选。`spelling_type` / `credibility` 由基音节与辅助码合成
+    /// （调用方即 `AuxiliaryMatcher::lookup` 的产物）。
+    ///
+    /// 返回 `false` = 同一个 `(start, end, syllable_id)` 已存在；此时 `edges`
+    /// 会覆盖成最新一条，`indices` 仍追加一份（与 evo 的 `alternatives` 语义接近）。
+    pub fn add_aux_edge(
+        &mut self,
+        start: usize,
+        end: usize,
+        syllable_id: SyllableId,
+        spelling_type: SpellingType,
+        credibility: f64,
+        allowed_chars: BTreeSet<char>,
+    ) -> bool {
+        let mut properties = SpellingProperties {
+            r#type: spelling_type,
+            credibility,
+            ..Default::default()
+        };
+        properties.end_pos = end;
+        let mut edge = EdgeProperties::from_properties(properties);
+        edge.auxiliary_chars = Some(allowed_chars);
+        let spellings = self
+            .edges
+            .entry(start)
+            .or_default()
+            .entry(end)
+            .or_default();
+        let inserted = spellings.insert(syllable_id, edge.clone()).is_none();
+        self.indices
+            .entry(start)
+            .or_default()
+            .entry(syllable_id)
+            .or_default()
+            .push(edge);
+        inserted
+    }
+
+    /// 图里是否存在 direct aux 边（evo `graph->has_auxiliary`）。
+    ///
+    /// 查询侧据此决定要不要做逐字过滤 —— 没有 aux 边时跳过整趟 `retain`，
+    /// 普通方案的查询路径零开销。
+    pub fn has_auxiliary(&self) -> bool {
+        self.indices.values().any(|index| {
+            index
+                .values()
+                .any(|list| list.iter().any(|props| props.auxiliary_chars.is_some()))
+        })
+    }
 }
 
 /// `Prism::Match`（`dict/prism.h:74`）：`value` = 拼写 id，`length` = 键长（**字节**）。
@@ -230,6 +296,20 @@ pub trait Prism {
     /// ⚠️ 没有拼写表时 C++ 的 accessor **不空**：它把拼写 id 自己当音节 id 返回，
     /// 属性全是默认值。这里必须一样。
     fn query_spelling(&self, spelling_id: SyllableId) -> Vec<SpellingDescriptor>;
+
+    /// R-04 邻键纠错旁路：在 trie 上按"原字符 / 邻键"双分支做 BFS。
+    ///
+    /// 默认实现返回空 —— 只有能逐字符遍历底层 trie 的实现（目前是
+    /// [`crate::gear::dict::prism::Prism`]）才 override；不支持的 `Prism` 因此**静默不纠**，
+    /// 不会改变任何既有候选行为。
+    fn near_search(
+        &self,
+        _input: &str,
+        _max_substitutions: usize,
+        _limit: usize,
+    ) -> Vec<(SyllableId, String)> {
+        Vec::new()
+    }
 }
 
 /// 纯内存 `Prism`：行为对齐 `Prism::Build(syllabary[, script])`（`dict/prism.cc:138-260`）。
@@ -358,24 +438,24 @@ impl Prism for InMemoryPrism {
     }
 }
 
-/// 把真实的 [`crate::dict::prism::Prism`]（`.prism.bin` 映射）适配到切分器要的
+/// 把真实的 [`crate::gear::dict::prism::Prism`]（`.prism.bin` 映射）适配到切分器要的
 /// [`Prism`] 接口。
 ///
 /// C++ 里只有一个 `Prism` 类；Rust 这边因为 `dict` 依赖 `algo`（不能反过来），
 /// 切分器只能声明一个只含 5 个方法的小 trait。真实实现由这里补上 ——
 /// 放在 `algo` 模块内是为了能写 `SpellingProperties` 的 `pub(super)` 字段
 /// （`end_pos` / `tips` / `is_correction`），dict 层写不进去。
-impl Prism for crate::dict::prism::Prism {
+impl Prism for crate::gear::dict::prism::Prism {
     fn max_key_length(&self) -> usize {
-        crate::dict::prism::Prism::max_key_length(self)
+        crate::gear::dict::prism::Prism::max_key_length(self)
     }
 
     fn get_value(&self, key: &str) -> Option<SyllableId> {
-        crate::dict::prism::Prism::get_value(self, key)
+        crate::gear::dict::prism::Prism::get_value(self, key)
     }
 
     fn common_prefix_search(&self, key: &str) -> Vec<PrismMatch> {
-        crate::dict::prism::Prism::common_prefix_search(self, key)
+        crate::gear::dict::prism::Prism::common_prefix_search(self, key)
             .into_iter()
             .map(|m| PrismMatch {
                 value: m.value,
@@ -385,7 +465,7 @@ impl Prism for crate::dict::prism::Prism {
     }
 
     fn expand_search(&self, key: &str, limit: usize) -> Vec<PrismMatch> {
-        crate::dict::prism::Prism::expand_search(self, key, limit)
+        crate::gear::dict::prism::Prism::expand_search(self, key, limit)
             .into_iter()
             .map(|m| PrismMatch {
                 value: m.value,
@@ -395,7 +475,7 @@ impl Prism for crate::dict::prism::Prism {
     }
 
     fn query_spelling(&self, spelling_id: SyllableId) -> Vec<SpellingDescriptor> {
-        let mut accessor = crate::dict::prism::Prism::query_spelling(self, spelling_id);
+        let mut accessor = crate::gear::dict::prism::Prism::query_spelling(self, spelling_id);
         let mut out = Vec::new();
         while !accessor.exhausted() {
             let mut properties = SpellingProperties::default();
@@ -414,6 +494,21 @@ impl Prism for crate::dict::prism::Prism {
             out.push((spelling_id, SpellingProperties::default()));
         }
         out
+    }
+
+    /// R-04：把 BFS 交给 [`crate::gear::dict::near_corrector`]，这里只做转发。
+    fn near_search(
+        &self,
+        input: &str,
+        max_substitutions: usize,
+        limit: usize,
+    ) -> Vec<(SyllableId, String)> {
+        crate::gear::dict::near_corrector::search(
+            crate::gear::dict::prism::Prism::trie(self),
+            input,
+            max_substitutions,
+            limit,
+        )
     }
 }
 

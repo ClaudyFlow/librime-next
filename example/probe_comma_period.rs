@@ -21,6 +21,9 @@ use librime_next::engine::runtime::Engine;
 /// (方案 id, 触发候选的编码)。前半是点号命名（恒等式系列文件夹，新产物），
 /// 后半是旧扁平/下划线命名（对照，看旧 Page_Up/Page_Down 是否真的不动）。
 const CASES: &[(&str, &str)] = &[
+    // 虎整句（lua 方案）：2026-11-08 报障「逗号/句号不能移候选、逗号上屏第一候选」，
+    // 用来验证 lua processor 放行逗号句号后引擎 ⓪ 段的行为。
+    ("tiger_sentence", "zhhbi"),
     ("cangjie.5", "a"),
     ("double_pinyin.ziranma", "nihao"),
     ("pinyin.luna", "nihao"),
