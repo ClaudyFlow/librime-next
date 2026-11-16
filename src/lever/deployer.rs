@@ -551,10 +551,19 @@ impl Deployer {
     /// Server 部署成功后把它并进 `user.yaml` 的 `weasel_next` 哈希段。
     pub fn deploy_workspace(&mut self) -> bool {
         let arrival_ms = wall_now_ms();
+        // deploy 主路径此前只走 `run_task` 链（绕过 [`Self::run`]），四类对外信号里
+        // Deploy 一条都不发——CLI/宿主挂在总线上的槽收不到部署进度。这里补齐
+        // Start/Success/Failure 广播，语义与 `run()` 一致；短路逻辑保持原样。
+        crate::signal::emit_deploy(crate::signal::DeployPhase::Start);
         let ok = self.run_task(DeploymentTask::InstallationUpdate)
             && self.run_task(DeploymentTask::WorkspaceUpdate)
             && self.run_task(DeploymentTask::UserDictUpgrade)
             && self.run_task(DeploymentTask::CleanupTrash);
+        crate::signal::emit_deploy(if ok {
+            crate::signal::DeployPhase::Success
+        } else {
+            crate::signal::DeployPhase::Failure
+        });
         let finished_ms = wall_now_ms();
         let hash = crate::lever::tree::checksum(
             &self.user_data_dir.join("schema").join("schema.yaml"),

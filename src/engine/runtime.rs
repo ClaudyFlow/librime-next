@@ -864,6 +864,17 @@ impl Engine {
                 let t_record = std::time::Instant::now();
                 switcher::record_active_schema(self.user_dir.as_deref(), schema_id);
                 trace_schema_ms(&format!("record_active_schema({schema_id})"), t_record);
+                // 切换成功 → 对外广播（`("schema", "schema_id/<sid>")`）。引擎内部
+                // 仍走直接调用；信号只负责"对外发生了什么"——宿主/CLI/测试挂一个
+                // `signal::connect` 槽即可感知换方案，不需要持有引擎引用。
+                // 异步重建路径的换入通知由 `c_api` 的会话换入线程发（见 `c_api.rs`），
+                // 两条路互不重叠：后台任务创建的是**新引擎**，不走本函数。
+                crate::signal::emit_for(
+                    self.context.signal_session_id,
+                    crate::signal::Signal::SchemaChanged {
+                        schema_id: schema_id.to_string(),
+                    },
+                );
                 true
             }
             None => {
@@ -1685,6 +1696,47 @@ mod tests {
         );
         b.set_option("ascii_mode", true);
         assert_eq!(b.signal_mirror_get("ascii_mode"), Some(true), "B 自己设开关才轮到 B 的镜像");
+    }
+
+    #[test]
+    fn apply_schema_emits_schema_changed_on_the_bus() {
+        // 输入：真夹具 build 目录 + 总线上挂一个直接槽收集通知。
+        // 期望：apply_schema 成功 ⇒ 总线上出现一条**本会话**的 SchemaChanged ——
+        //       引擎对外广播换方案，订阅方不需要持有引擎引用（CLI/宿主/测试同权）。
+        //       未知方案 ⇒ 只打日志、不发信号。
+        use crate::signal::{Notification, Signal};
+        let build_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixture/build-20261023-current");
+        let mut engine = Engine::empty_for_test();
+        engine.build_dir = build_dir;
+        let session = engine.context.signal_session_id;
+
+        let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Notification>::new()));
+        let sink = got.clone();
+        let sub = crate::signal::connect(std::sync::Arc::new(move |note: &Notification| {
+            sink.lock().unwrap().push(note.clone());
+        }));
+
+        let ok = engine.apply_schema("luna_pinyin_simp");
+        assert!(ok, "夹具方案 luna_pinyin_simp 应能换入");
+        let hit = got.lock().unwrap().iter().any(|note| {
+            note.session_id == session
+                && matches!(
+                    &note.signal,
+                    Signal::SchemaChanged { schema_id } if schema_id == "luna_pinyin_simp"
+                )
+        });
+        assert!(hit, "apply_schema 应对外发 SchemaChanged，实收 {:?}", got.lock().unwrap());
+        crate::signal::disconnect(sub);
+
+        // 失败路径：换不上的 id 不产生信号。
+        let before = got.lock().unwrap().len();
+        assert!(!engine.apply_schema("no_such_schema_for_test"));
+        assert_eq!(
+            got.lock().unwrap().len(),
+            before,
+            "未知方案不应发 SchemaChanged"
+        );
     }
 
     #[test]

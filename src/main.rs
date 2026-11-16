@@ -48,10 +48,12 @@
 //! 写出的键序与手写源一致；`diff` 只比值，所以键序改变不会掩盖值语义的差异。
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use librime_next::config;
 use librime_next::lever::deployer::Deployer;
 use librime_next::load_file;
+use librime_next::signal::{self, Notification};
 
 type Tree = serde_json::Value;
 
@@ -373,8 +375,16 @@ fn deploy_cli(flags: &[String]) {
         .unwrap_or_else(|| PathBuf::from("."));
     let shared = shared.unwrap_or_else(default_shared_dir);
 
+    // 信号总线订阅演示：部署进程挂一个**直接**槽，deployer/引擎在总线上发的
+    // Deploy(Start/Success/Failure)、SchemaChanged 都会流到这里打印。
+    // 模块之间不互相引用 —— deployer 只管 emit，CLI 只管 connect。
+    let sub = signal::connect(Arc::new(|note: &Notification| {
+        println!("[signal] session={} {}", note.session_id, note.message_value());
+    }));
+
     let mut deployer = Deployer::with_data_dirs(&shared, &user);
     let ok = deployer.deploy_workspace();
+    signal::disconnect(sub);
     println!(
         "部署完成：ok={ok}（shared={}，user={}）",
         shared.display(),
