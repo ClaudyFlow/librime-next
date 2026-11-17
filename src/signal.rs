@@ -20,36 +20,27 @@
 //! * [`Signal::PropertyChanged`] —— 会话属性变化
 //! * [`Signal::Deploy`] —— 部署开始 / 成功 / 失败（`session_id = 0`）
 //!
-//! # 原子化（对齐 Qt 信号槽）
+//! # 分层
 //!
-//! 本层把 Qt 的核心能力搬过来：
-//! * **`Connection::Direct`** ↔ `Qt::DirectConnection`：发射线程同步调用槽。
-//! * **`Connection::Queued`** ↔ `Qt::QueuedConnection`：把**整条** `Notification`
-//!   原子投递到目标线程的队列，由接收线程的事件循环异步分派；发射方不被阻塞、
-//!   不被中断（要么完整入队，要么丢弃，不存在半条状态）。
-//! * **热路径零阻塞**：总线是一份 `Arc<Vec<Slot>>` 的原子快照，`emit` 只做一次
-//!   `Arc::clone`（O(1)）就离开锁，锁外遍历分发；`connect`/`disconnect` 整体替换
-//!   快照。这等价于 Qt 在 `QMetaObject::activate` 里读一份连接表的共享快照。
-//! * **发射本身线程安全**：`connect`/`disconnect`/`emit` 都可从任意线程调用，
-//!   互不死锁（emit 持有的是已 clone 的旧快照，槽里再 connect 只会换掉新快照）。
-//!
-//! Qt 的 `Auto`/`BlockingQueued` 不在此内置：`Auto` 依赖"对象线程亲和"，Rust 侧
-//! 由调用方决定用 Direct 还是 Queued；`BlockingQueued` 会阻塞发射方、对打字热路径
-//! 有害，且同线程会死锁，故不提供——需要同步语义时直接用 Direct 即可。
+//! **机制全部在 [`crate::util::Bus`]**（copy-on-write 快照、Direct/Queued 两种连接、
+//! 计数短路、锁外分发——对齐 Qt 信号槽，逐条说明见 `util.rs` 模块文档）。本模块只做
+//! 两件事：定义领域类型（[`Signal`] / [`Notification`] / [`DeployPhase`]），并把
+//! `Bus<Notification>` 组装成进程级全局单例（等价于 C++ 的全局 `Messenger`）。
+//! 对外 API（`connect` / `connect_queued` / `disconnect` / `emit_for` / `drain`）
+//! 与抽取前完全一致，调用方零改动。
 //!
 //! 设计约束：
 //! * **发射方不碰宿主状态**：只 `emit`，由订阅者决定做什么；
 //! * **多订阅者**：C ABI 的 `RimeNotificationHandler` 只是总线上一个槽，
 //!   纯 Rust 宿主/测试可以同时 `connect` 自己的槽；
 //! * **C ABI 不变**：槽把 [`Notification`] 编码成官方 `(message_type, message_value)`；
-//! * **不持锁调槽**：`emit` 先在锁内 clone 快照、锁外逐个调用/投递，槽里再
-//!   `connect` / `disconnect` 也不会死锁；
 //! * 引擎内部同步逻辑（组件条件刷新、重译）仍走原来的直接调用，信号只负责
 //!   「对外发生了什么」，不替代返回值语义。
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::OnceLock;
+use std::sync::mpsc::SyncSender;
+
+use crate::util::{self, Bus};
 
 /// 会话标识（`c_api::RimeSessionId` 的底层宽度）。`0` = 不绑定会话的全局通知（部署）。
 pub type SessionId = usize;
@@ -118,114 +109,48 @@ impl Notification {
     }
 }
 
-/// 槽：线程安全、可共享。`emit` 在锁外调用，槽里不得做阻塞 I/O。
-pub type Handler = Arc<dyn Fn(&Notification) + Send + Sync + 'static>;
+/// 槽函数类型（`Notification` 版的便捷别名，机制见 [`crate::util::Handler`]）。
+pub type Handler = util::Handler<Notification>;
 
-/// 连接类型，对齐 Qt 的 `Qt::ConnectionType`。
+/// 接收线程从自己的队列取出 `Notification` 并分派（对应 Qt 事件循环消费
+/// `QMetaCallEvent`）。返回取出的条数。
 ///
-/// `Queued` 持有 `Arc<SyncSender>`（而非裸 `Sender`）：`Sender` 不可克隆，但我们需要
-/// `Slot: Clone` 才能整体替换快照；`SyncSender` 提供 `try_send`（有界、非阻塞、满则
-/// 丢弃），正好对应 Qt 的有界事件队列语义。
-#[derive(Debug, Clone)]
-pub enum Connection {
-    /// `Qt::DirectConnection`：发射线程同步调用槽。
-    Direct,
-    /// `Qt::QueuedConnection`：把整条 `Notification` 原子投递到 `queue`，
-    /// 由接收线程的事件循环异步分派；发射方不阻塞、不被中断。
-    Queued { queue: Arc<SyncSender<Notification>> },
-}
+/// 调用方决定如何分派（按 `note.message_type()` / `note.signal` 路由到具体处理），
+/// 这与宿主现在在 C 槽里把 `note` 翻译成 `Work` 投递到引擎工作队列是同一件事。
+pub use util::drain;
 
-/// 总线里的一个连接项。需要 `Clone` 才能整体替换快照（见 [`emit_for`] 的原子快照读）。
-#[derive(Clone)]
-struct Slot {
-    id: u64,
-    connection: Connection,
-    /// 仅 `Direct` 使用；`Queued` 用空闭包占位（真正的分派在接收线程的 `drain`）。
-    handler: Handler,
-}
-
-/// 热路径零阻塞：总线是一份 `Arc<Vec<Slot>>` 的原子快照。
-/// `emit` 只 `Arc::clone` 取得共享只读快照（O(1)）后离开锁；`connect`/`disconnect`
-/// 整体复制并替换快照（连接变更不频繁，O(n) copy 可接受）。
-/// 热路径零阻塞：总线是一份 `Arc<Vec<Slot>>` 的原子快照。
-/// `emit` 只 `Arc::clone` 取得共享只读快照（O(1)）后离开锁；`connect`/`disconnect`
-/// 整体复制并替换快照（连接变更不频繁，O(n) copy 可接受）。
-///
-/// `Arc::new` 不是 const fn，不能写在 `static` 初值里，用 `OnceLock` 惰性初始化。
-static SLOTS: OnceLock<RwLock<Arc<Vec<Slot>>>> = OnceLock::new();
+/// 进程级全局总线：`Bus<Notification>` 的惰性单例（`Bus::new` 不是 const fn，
+/// 不能写在 `static` 初值里）。
+static BUS: OnceLock<Bus<Notification>> = OnceLock::new();
 #[inline]
-fn slots() -> &'static RwLock<Arc<Vec<Slot>>> {
-    SLOTS.get_or_init(|| RwLock::new(Arc::new(Vec::new())))
+fn bus() -> &'static Bus<Notification> {
+    BUS.get_or_init(Bus::new)
 }
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-/// 热路径短路：`Context::set_option` 一次按键可能调很多次，没订阅者时
-/// 连快照读都不必做。
-static SUBSCRIBER_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// 订阅一个**直接**槽（对齐 `Qt::DirectConnection`），返回可退订的句柄号。
+/// 订阅一个**直接**槽（`Qt::DirectConnection`），返回可退订的句柄号。
 pub fn connect(handler: Handler) -> u64 {
-    connect_conn(Connection::Direct, handler)
+    bus().connect(handler)
 }
 
-/// 订阅一个**原子投递**槽（对齐 `Qt::QueuedConnection`）。
-///
-/// 信号不会被同步调用，而是整条 `Notification` 原子 `try_send` 到 `queue`；
-/// 接收线程用 [`drain`] 从 `Receiver` 取出并自行分派（等价于 Qt 事件循环消费
-/// `QMetaCallEvent`）。`queue` 满则丢弃该条（与 Qt 队列满时丢弃行为一致）。
+/// 订阅一个**原子投递**槽（`Qt::QueuedConnection`）：整条 `Notification` 原子
+/// `try_send` 到 `queue`，接收线程用 [`drain`] 分派；队列满则丢弃该条。
 pub fn connect_queued(queue: SyncSender<Notification>) -> u64 {
-    connect_conn(Connection::Queued { queue: Arc::new(queue) }, Arc::new(|_| {}))
-}
-
-fn connect_conn(conn: Connection, handler: Handler) -> u64 {
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let mut guard = slots().write().unwrap_or_else(|err| err.into_inner());
-    let mut next = (**guard).clone();
-    next.push(Slot { id, connection: conn, handler });
-    *guard = Arc::new(next);
-    SUBSCRIBER_COUNT.fetch_add(1, Ordering::Release);
-    id
+    bus().connect_queued(queue)
 }
 
 /// 退订；返回是否真的摘掉了一个槽。
 pub fn disconnect(id: u64) -> bool {
-    let mut guard = slots().write().unwrap_or_else(|err| err.into_inner());
-    let before = guard.len();
-    let mut next = (**guard).clone();
-    next.retain(|slot| slot.id != id);
-    let removed = next.len() != before;
-    if removed {
-        *guard = Arc::new(next);
-        SUBSCRIBER_COUNT.fetch_sub(1, Ordering::Release);
-    }
-    removed
+    bus().disconnect(id)
 }
 
-/// 当前槽数量（诊断 / 测试用）。
+/// 当前槽数量（诊断 / 测试用；发射方用它做热路径短路）。
 pub fn subscriber_count() -> usize {
-    SUBSCRIBER_COUNT.load(Ordering::Acquire)
+    bus().subscriber_count()
 }
 
 /// 发一条带会话归属的信号。**所有事件源最终都走这里。**
-///
-/// 热路径：没订阅者直接返回；否则 O(1) clone 出共享快照、离开锁，再遍历分发——
-/// Direct 同步调用、Queued 原子投递。遍历期间任何槽 `connect`/`disconnect` 都只
-/// 影响**新**快照，本次分发看到的仍是进入 `emit` 那一刻的连接表（原子隔离）。
 pub fn emit_for(session_id: SessionId, signal: Signal) {
-    if SUBSCRIBER_COUNT.load(Ordering::Acquire) == 0 {
-        return;
-    }
-    let note = Notification { session_id, signal };
-    // O(1) 原子快照读（Arc clone），锁外遍历 —— 热路径零阻塞、不被连接变更打断。
-    let slots = Arc::clone(&*slots().read().unwrap_or_else(|err| err.into_inner()));
-    for slot in slots.iter() {
-        match &slot.connection {
-            Connection::Direct => (slot.handler)(&note),
-            Connection::Queued { queue } => {
-                // 原子投递：整条 Notification 完整入队或丢弃，不可中断。
-                let _: Result<(), TrySendError<Notification>> = queue.try_send(note.clone());
-            }
-        }
-    }
+    bus().emit(Notification { session_id, signal });
 }
 
 /// 部署通知：官方 `Service` 把 deployer 接到 `Notify(0, ...)`，没有会话号。
@@ -233,24 +158,11 @@ pub fn emit_deploy(phase: DeployPhase) {
     emit_for(0, Signal::Deploy(phase));
 }
 
-/// 接收线程从自己的队列取出 `Notification` 并分派（对应 Qt 事件循环消费
-/// `QMetaCallEvent`）。返回取出的条数。
-///
-/// 调用方决定如何分派（按 `note.message_type()` / `note.signal` 路由到具体处理），
-/// 这与宿主现在在 C 槽里把 `note` 翻译成 `Work` 投递到引擎工作队列是同一件事。
-pub fn drain(queue: &Receiver<Notification>, mut dispatch: impl FnMut(&Notification)) -> usize {
-    let mut count = 0;
-    while let Ok(note) = queue.try_recv() {
-        dispatch(&note);
-        count += 1;
-    }
-    count
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex as TestMutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex as TestMutex};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;

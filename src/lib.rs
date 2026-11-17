@@ -37,6 +37,11 @@ pub mod gear;
 pub mod lever;
 /// 统一对外信号层（C++ `Messenger` + `Service::Notify` 的 Rust 版）。
 pub mod signal;
+/// 可复用工具层：进程内信号总线（`Bus<T>`）等零业务机制。
+pub mod util;
+
+/// 通用总线的顶层入口（等价于 [`util::Bus`]）：外部 crate 自建总线时不必写全路径。
+pub use util::Bus;
 
 /// 读一份 YAML 成树。
 ///
