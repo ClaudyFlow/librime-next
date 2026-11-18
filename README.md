@@ -1,7 +1,7 @@
 # librime-next
 
 [librime](https://github.com/rime/librime) 的 **Rust 移植版** —— 目标是产出与原版
-`rime.dll` **ABI 兼容**的替代品，让现有前端（Weasel / 小狼毫 RS）无需改一行头文件
+`rime.dll` **ABI 兼容**的替代品，让现有前端（Weasel / 锈狼嚎）无需改一行头文件
 就能把引擎换成这一份。
 
 ```text
