@@ -49,7 +49,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use mlua::{Function, Lua, MultiValue, Table, Value};
+use mlua::{Function, Lua, LuaOptions, MultiValue, StdLib, Table, Value};
 
 use crate::engine::candidate::Candidate;
 use crate::engine::context::Context;
@@ -143,6 +143,10 @@ enum Command {
     /// `Context:set_property` —— 跨组件共享的组合属性（虎整句的已上屏/缓冲状态靠它）。
     SetProperty(String, String),
     PushInput(String),
+    /// 2026-11-18 顶功607：`context:commit()` —— 提交当前组字（顶功上屏）。
+    Commit,
+    /// 2026-11-18 顶功607：`context:pop_input(n)` —— 回退 n 个输入字符（空码回退）。
+    PopInput(usize),
     SetInput(String),
     ConfirmSelection,
     Select(usize),
@@ -172,6 +176,10 @@ struct Bridge {
     is_composing: Mutex<bool>,
     has_menu: Mutex<bool>,
     commit_text: Mutex<String>,
+    /// 2026-11-18 顶功607 适配：`ctx:get_selected_candidate()` 的后端。
+    /// 脚本（xmjd6_topup_processor / auto_fallback）靠它判断当前是否已有选中候选，
+    /// 决定顶功上屏 / 空码回退。每帧从 Context 快照同步。
+    selected_candidate: Mutex<Option<Candidate>>,
 }
 
 // ---------------------------------------------------------------- Lua 运行时
@@ -303,6 +311,46 @@ function __config_value(v)
     get_bool = function() return nil end,
     get_int = function() return nil end,
   }
+end
+
+-- 2026-11-18 顶功607（xmjd6）适配：rime-lua 的 UserDb 全局。
+-- 社区脚本（input_statistics 等）用 `UserDb(name, class)` 拿一个带
+-- fetch/update/erase 的键值库存统计元数据；引擎暂无 Lua 侧 userdb 桥，
+-- 这里给一份进程内内存实现：接口一致，不落盘、不吞候选。
+-- 若后续补了真桥接（native UserDb），以全局已存在为准，不覆盖。
+if type(UserDb) ~= "function" then
+  local __userdb_stores = {}
+  function UserDb(db_name, db_class)
+    local key = tostring(db_name) .. "." .. tostring(db_class or "userdb")
+    local store = __userdb_stores[key]
+    if not store then store = {}; __userdb_stores[key] = store end
+    return setmetatable({}, {
+      __index = {
+        fetch = function(_, k) return store[tostring(k)] end,
+        update = function(_, k, v) store[tostring(k)] = v; return true end,
+        erase = function(_, k) store[tostring(k)] = nil; return true end,
+        loaded = function() return true end,
+        -- 前缀扫描：db:query(prefix) → accessor:iter() 迭代 (key, value)。
+        query = function(_, prefix)
+          prefix = tostring(prefix or "")
+          local pairs_ = {}
+          for k, v in pairs(store) do
+            if k:sub(1, #prefix) == prefix then pairs_[#pairs_ + 1] = { k, v } end
+          end
+          table.sort(pairs_, function(a, b) return a[1] < b[1] end)
+          local i = 0
+          return setmetatable({}, { __index = {
+            iter = function()
+              return function()
+                i = i + 1
+                if pairs_[i] then return pairs_[i][1], pairs_[i][2] end
+              end
+            end,
+          }})
+        end,
+      },
+    })
+  end
 end
 "#;
 
@@ -463,7 +511,12 @@ impl LuaHost {
             });
         }
         let t_vm = std::time::Instant::now();
-        let lua = Lua::new();
+        // 2026-11-18 顶功607（xmjd6）适配：社区 Lua 组件（xmjd6_topup_processor /
+        // lazy_simplifier / shijian）用 `debug.getinfo(1).source` 定位脚本目录，进而
+        // 读相邻的码表 / opencc 数据。`Lua::new()` 的 ALL_SAFE 不含 debug 库，脚本
+        // init 会报 "attempt to index a nil value (global 'debug')" 而整体失效。
+        // 这里显式开 ALL（含 debug）；ffi 未启用，仍是纯 Lua 标准库，不加载 C 模块。
+        let lua = unsafe { Lua::unsafe_new_with(StdLib::ALL, LuaOptions::default()) };
         let globals = lua.globals();
         let package: Table = globals.get("package")?;
 
@@ -822,6 +875,23 @@ impl LuaHost {
                     .unwrap_or_default())
             })?,
         )?;
+        // 2026-11-18 顶功607：`context:get_selected_candidate()`。
+        // rime-lua 语义：有选中候选返回带 text/comment/type 的表，否则 nil。
+        let link = self.link.clone();
+        context.set(
+            "get_selected_candidate",
+            lua.create_function(move |lua, _this: Value| {
+                let selected = link
+                    .selected_candidate
+                    .lock()
+                    .ok()
+                    .and_then(|v| v.clone());
+                match selected {
+                    Some(cand) => candidate_table(lua, &cand, None).map(Value::Table),
+                    None => Ok(Value::Nil),
+                }
+            })?,
+        )?;
         let link = self.link.clone();
         context.set(
             "push_input",
@@ -838,6 +908,27 @@ impl LuaHost {
             lua.create_function(move |_, (_this, text): (Value, String)| {
                 if let Ok(mut queue) = link.commands.lock() {
                     queue.push(Command::SetInput(text));
+                }
+                Ok(())
+            })?,
+        )?;
+        // 2026-11-18 顶功607：`ctx:commit()` / `ctx:pop_input(n)`。
+        let link = self.link.clone();
+        context.set(
+            "commit",
+            lua.create_function(move |_, _this: Value| {
+                if let Ok(mut queue) = link.commands.lock() {
+                    queue.push(Command::Commit);
+                }
+                Ok(())
+            })?,
+        )?;
+        let link = self.link.clone();
+        context.set(
+            "pop_input",
+            lua.create_function(move |_, (_this, len): (Value, usize)| {
+                if let Ok(mut queue) = link.commands.lock() {
+                    queue.push(Command::PopInput(len));
                 }
                 Ok(())
             })?,
@@ -1058,6 +1149,9 @@ impl LuaHost {
         if let Ok(mut text) = self.link.commit_text.lock() {
             *text = ctx.commit_text.clone();
         }
+        if let Ok(mut selected) = self.link.selected_candidate.lock() {
+            *selected = ctx.selected_candidate.clone();
+        }
         let Ok(engine) = env.get::<Table>("engine") else {
             return;
         };
@@ -1143,6 +1237,16 @@ impl LuaHost {
                 Command::PushInput(text) => {
                     if let Some(engine) = engine.as_deref_mut() {
                         engine.context.push_input_str(text);
+                    }
+                }
+                Command::Commit => {
+                    if let Some(engine) = engine.as_deref_mut() {
+                        engine.context.commit();
+                    }
+                }
+                Command::PopInput(len) => {
+                    if let Some(engine) = engine.as_deref_mut() {
+                        engine.context.pop_input(*len);
                     }
                 }
                 Command::SetInput(text) => {
@@ -1367,6 +1471,8 @@ struct CtxSnapshot {
     is_composing: bool,
     has_menu: bool,
     commit_text: String,
+    /// 当前选中候选（`ctx:get_selected_candidate()` 用）。
+    selected_candidate: Option<Candidate>,
     /// `composition:back()` 对应的最后一段。
     segment: Option<SegmentView>,
     /// 提交历史条数（`commit_notifier` 靠它判断"有没有新提交"）。
@@ -1383,6 +1489,7 @@ impl CtxSnapshot {
             is_composing: ctx.is_composing(),
             has_menu: ctx.has_menu(),
             commit_text: ctx.get_commit_text(),
+            selected_candidate: ctx.get_selected_candidate(),
             segment: ctx.composition.segmentation.segments.last().map(segment_view),
             commit_len: ctx.commit_history.len(),
         }
