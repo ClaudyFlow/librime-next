@@ -786,6 +786,22 @@ impl ScriptTranslator {
                 out.push(candidate);
             }
         }
+        // 2026-11-18（juzhong → 居中㕶）：luna 代数把 zhong 派生出 zho，
+        // DFS 会沿短边 zho(end=5) 与全拼边 zhong(end=7) 招募**同一条**用户词
+        // 「居中」；collector 按 end 升序出列，短边先占据首候选。选中短边后
+        // 剩余裸尾巴 ng 进入下一场，候选「嗯; 唔; 㕶;」→ 上屏「居中㕶」。
+        // 同一文本只保留覆盖最长的一条（并列取质量高者），让整段输入一次
+        // 吃完；其余文本与跨段候选不受影响。
+        out.sort_by(|a, b| {
+            a.text.cmp(&b.text)
+                .then_with(|| b.end.cmp(&a.end))
+                .then_with(|| {
+                    b.quality
+                        .partial_cmp(&a.quality)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
+        out.dedup_by(|a, b| a.text == b.text);
         // 用户词典候选按质量降序(2026-11-01):lookup 顺序≠质量序,
         // 不排序会把高频单字顶在多字词组前面(实机:打过十几遍的词组
         // 被两个 1e12 的单字压住)。整句让位判据也依赖这里的顺序。
