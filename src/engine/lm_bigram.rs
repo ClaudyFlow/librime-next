@@ -318,7 +318,7 @@ mod tests {
 // 离线评测（第一步：证明有没有用）
 //
 // 这是**构造集 / 方向性验证**，不是真实用户分布：语料是同仓库的中文技术随笔
-// （PROGRESS.md 训练 / doc/memo.md 测试，句级去重防泄漏），同音干扰按拼音词典
+// （doc/progress-summary.md + doc/大厂输入法功能对照.md 训练 / doc/memo.md 测试，句级去重防泄漏），同音干扰按拼音词典
 // 人工替换 1–2 个字生成，5 选 1。结论只能说明"方向对不对"，不能当作上线后的
 // 准确率。
 //
@@ -744,8 +744,8 @@ mod offline_eval {
     #[test]
     fn offline_bigram_eval() {
         let root = repo_root();
-        let train_doc = root.join("PROGRESS.md");
-        let extra_doc = root.join("doc/progress-summary.md");
+        let train_doc = root.join("doc/progress-summary.md");
+        let extra_doc = root.join("doc/大厂输入法功能对照.md");
         let test_doc = root.join("doc/memo.md");
         let eassy_path = root.join("Rime-Next/eassy/default/default.eassy.yaml");
         let pinyin_path = root.join("Rime-Next/dict/pinyin/luna/pinyin.luna.dict.yaml");
@@ -755,9 +755,9 @@ mod offline_eval {
             assert!(path.is_file(), "缺评测语料：{}", path.display());
         }
 
-        let train_text = std::fs::read_to_string(&train_doc).expect("读 PROGRESS.md 失败");
+        let train_text = std::fs::read_to_string(&train_doc).expect("读 doc/progress-summary.md 失败");
         let extra_text =
-            std::fs::read_to_string(&extra_doc).expect("读 doc/progress-summary.md 失败");
+            std::fs::read_to_string(&extra_doc).expect("读 doc/大厂输入法功能对照.md 失败");
         let test_text = std::fs::read_to_string(&test_doc).expect("读 memo.md 失败");
         // 训练 = 两份文档的句子并集（跨文档也去重）。
         let mut train = extract_sentences(&train_text);
@@ -897,7 +897,7 @@ mod offline_eval {
         let (sentences, tokens) = lm.corpus_size();
         println!("\n=== bigram LM 离线评测（构造集，方向性验证） ===");
         println!(
-            "训练：PROGRESS.md + doc/progress-summary.md {} 句 / {} 字符；bigram 词表 {} 字 / trie 节点 {}",
+            "训练：doc/progress-summary.md + doc/大厂输入法功能对照.md {} 句 / {} 字符；bigram 词表 {} 字 / trie 节点 {}",
             sentences,
             tokens,
             lm.vocab_size(),

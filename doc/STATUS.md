@@ -60,7 +60,7 @@
 
 测试基线（2026-10-31 懒菜单 v3 迁移后复核）：`cargo test --release -p librime-next --lib` →
 **530 passed / 0 failed**（6.33s）。此前测试仍按急切菜单写法，`--lib` 有 **57 个编译错**、
-闸门实际是哑的；已全部迁移到流式 `Translation` / 懒 `Menu` API（见 `PROGRESS.md` 六·二十七）。
+闸门实际是哑的；已全部迁移到流式 `Translation` / 懒 `Menu` API。
 集成侧（lever / engine e2e / key_order / algebra）本轮**未重跑**，计数沿用旧记录。
 
 ---
